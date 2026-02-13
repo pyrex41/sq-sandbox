@@ -1,4 +1,4 @@
-# Squash Sandbox v3
+# Squash Sandbox
 
 Composable sandboxes from stacked squashfs layers. The PorteuX pattern,
 distro-agnostic. Dual backend: chroot (default) or Firecracker microVM.

@@ -100,6 +100,7 @@ json_response() {
         401) printf 'Status: 401 Unauthorized\r\n' ;;
         404) printf 'Status: 404 Not Found\r\n' ;;
         409) printf 'Status: 409 Conflict\r\n' ;;
+        415) printf 'Status: 415 Unsupported Media Type\r\n' ;;
         500) printf 'Status: 500 Internal Server Error\r\n' ;;
     esac
     printf 'Content-Type: application/json\r\n\r\n'
@@ -213,7 +214,7 @@ _mount_overlay() {
     local lower=$(_lowerdir "$id")
     [ -z "$lower" ] && return 1
     mount -t overlay overlay \
-        -o "lowerdir=$lower,upperdir=$s/upper,workdir=$s/work" \
+        -o "lowerdir=$lower,upperdir=$s/upper/data,workdir=$s/upper/work" \
         "$s/merged"
 }
 
@@ -254,7 +255,7 @@ _inject_secret_placeholders() {
     local secrets_file="$DATA/secrets.json"
     [ ! -f "$secrets_file" ] && return 0
 
-    local env_dir="$s/upper/etc/profile.d"
+    local env_dir="$s/upper/data/etc/profile.d"
     mkdir -p "$env_dir"
 
     # Determine proxy address — use gateway IP if in a netns, otherwise localhost
@@ -279,13 +280,32 @@ _inject_secret_placeholders() {
 
 # ── Network namespace helpers (Phase 3) ───────────────────────────────
 
+_allocate_netns_index() {
+    (
+        flock -x 9
+        local index=1
+        while [ "$index" -le 254 ]; do
+            local in_use=0
+            for d in "$SANDBOXES"/*/; do
+                [ -f "$d/.meta/netns_index" ] || continue
+                [ "$(cat "$d/.meta/netns_index")" = "$index" ] && { in_use=1; break; }
+            done
+            [ "$in_use" = "0" ] && { echo "$index"; return 0; }
+            index=$((index + 1))
+        done
+        echo "no free netns index" >&2
+        return 1
+    ) 9>"$DATA/.netns-index.lock"
+}
+
 _chroot_setup_netns() {
     local id="$1" allow_net="$2"
     local veth_host="sq-${id}-h"
     local veth_sandbox="sq-${id}-s"
 
-    # Derive unique subnet index from sandbox id (hash to 1-254)
-    local sandbox_index=$(printf '%s' "$id" | cksum | awk '{print ($1 % 254) + 1}')
+    # Allocate unique subnet index (sequential scan under flock)
+    local sandbox_index
+    sandbox_index=$(_allocate_netns_index) || { echo "subnet exhausted" >&2; return 1; }
 
     # Create persistent network namespace
     ip netns add "squash-$id"
@@ -331,9 +351,12 @@ _apply_egress_rules() {
     iptables -N "$chain" 2>/dev/null || true
     iptables -A FORWARD -i "$iface" -j "$chain"
 
-    # Allow DNS (needed to resolve allowed hosts)
-    iptables -A "$chain" -p udp --dport 53 -j ACCEPT
-    iptables -A "$chain" -p tcp --dport 53 -j ACCEPT
+    # Block ICMP (prevents tunneling)
+    iptables -A "$chain" -p icmp -j DROP
+
+    # Rate-limited DNS (prevents DNS tunneling)
+    iptables -A "$chain" -p udp --dport 53 -m limit --limit 10/s --limit-burst 20 -j ACCEPT
+    iptables -A "$chain" -p tcp --dport 53 -m limit --limit 10/s --limit-burst 20 -j ACCEPT
 
     # Allow established/related connections
     iptables -A "$chain" -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -390,14 +413,23 @@ _chroot_create_sandbox() {
 
     exists "$id" && { echo "already exists" >&2; return 1; }
 
+    local max_sandboxes="${SQUASH_MAX_SANDBOXES:-100}"
+    local current_count=$(ls -1d "$SANDBOXES"/*/ 2>/dev/null | wc -l)
+    [ "$current_count" -ge "$max_sandboxes" ] && {
+        echo "sandbox limit reached ($max_sandboxes)" >&2; return 1
+    }
+
     # Validate layers
     local mod
     for mod in $(echo "$layer_csv" | tr ',' ' '); do
         mod_exists "$mod" || { echo "module not found: $mod" >&2; return 2; }
     done
 
-    # Build directory tree
-    mkdir -p "$s/images" "$s/upper" "$s/work" "$s/merged" "$s/.meta/log"
+    # Build directory tree (upper is a size-limited tmpfs holding overlay data + workdir)
+    mkdir -p "$s/images" "$s/upper" "$s/merged" "$s/.meta/log"
+    local upper_limit="${SQUASH_UPPER_LIMIT_MB:-512}"
+    mount -t tmpfs -o "size=${upper_limit}M" tmpfs "$s/upper"
+    mkdir -p "$s/upper/data" "$s/upper/work"
 
     # Metadata as files
     echo "$owner"          > "$s/.meta/owner"
@@ -431,25 +463,18 @@ _chroot_create_sandbox() {
         return 3
     }
 
-    # Set up network namespace if allow_net is specified
-    if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
-        _chroot_setup_netns "$id" "$allow_net" 2>/dev/null || true
-    fi
+    # Always create network namespace for isolation
+    _chroot_setup_netns "$id" "$allow_net" 2>/dev/null || true
 
-    # Seed /etc/resolv.conf — use gateway IP if in a netns, otherwise host resolver
+    # Seed /etc/resolv.conf — DNS goes through the netns gateway
     if [ -f /etc/resolv.conf ]; then
-        mkdir -p "$s/upper/etc"
-        if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
-            # In a network namespace, DNS goes through the gateway
-            local sandbox_index
-            sandbox_index=$(cat "$s/.meta/netns_index" 2>/dev/null || echo "")
-            if [ -n "$sandbox_index" ]; then
-                echo "nameserver 10.200.${sandbox_index}.1" > "$s/upper/etc/resolv.conf"
-            else
-                cp /etc/resolv.conf "$s/upper/etc/resolv.conf"
-            fi
+        mkdir -p "$s/upper/data/etc"
+        local sandbox_index
+        sandbox_index=$(cat "$s/.meta/netns_index" 2>/dev/null || echo "")
+        if [ -n "$sandbox_index" ]; then
+            echo "nameserver 10.200.${sandbox_index}.1" > "$s/upper/data/etc/resolv.conf"
         else
-            cp /etc/resolv.conf "$s/upper/etc/resolv.conf"
+            cp /etc/resolv.conf "$s/upper/data/etc/resolv.conf"
         fi
     fi
 
@@ -500,13 +525,13 @@ _chroot_exec_in_sandbox() {
     if [ -n "$netns_name" ] && ip netns list 2>/dev/null | grep -q "^$netns_name"; then
         timeout "$timeout_s" \
             ip netns exec "$netns_name" \
-            unshare --mount --pid --fork --map-root-user \
+            unshare --mount --pid --ipc --uts --fork --map-root-user \
             chroot "$s/merged" \
             /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$workdir" "$cmd" \
             >"$out" 2>"$err" || rc=$?
     else
         timeout "$timeout_s" \
-            unshare --mount --pid --fork --map-root-user \
+            unshare --mount --pid --ipc --uts --fork --map-root-user \
             chroot "$s/merged" \
             /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$workdir" "$cmd" \
             >"$out" 2>"$err" || rc=$?
@@ -569,7 +594,12 @@ _chroot_snapshot_sandbox() {
     [ -f "$snapfile" ] && { echo "exists: $label" >&2; return 1; }
 
     mkdir -p "$snapdir"
-    mksquashfs "$s/upper" "$snapfile" -comp gzip -b 256K -noappend -quiet
+    # Use zstd if kernel supports it, otherwise fall back to gzip
+    local comp_args="-comp gzip -b 256K"
+    if zgrep -q CONFIG_SQUASHFS_ZSTD=y /proc/config.gz 2>/dev/null; then
+        comp_args="-comp zstd -Xcompression-level 3 -b 128K"
+    fi
+    mksquashfs "$s/upper/data" "$snapfile" $comp_args -noappend -quiet
 
     local size=$(stat -c%s "$snapfile")
     jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
@@ -606,9 +636,9 @@ _chroot_restore_sandbox() {
         umount "$s/images/_snapshot" 2>/dev/null || umount -l "$s/images/_snapshot"
     fi
 
-    # Clear upper + work
-    rm -rf "$s/upper" "$s/work"
-    mkdir -p "$s/upper" "$s/work"
+    # Clear upper contents (preserve tmpfs mount) + reset work
+    find "$s/upper/data" -mindepth 1 -delete 2>/dev/null || true
+    find "$s/upper/work" -mindepth 1 -delete 2>/dev/null || true
 
     # Mount snapshot as top read-only layer
     mkdir -p "$s/images/_snapshot"
@@ -622,8 +652,8 @@ _chroot_restore_sandbox() {
 
     # Re-seed DNS
     if [ -f /etc/resolv.conf ]; then
-        mkdir -p "$s/upper/etc"
-        cp /etc/resolv.conf "$s/upper/etc/resolv.conf"
+        mkdir -p "$s/upper/data/etc"
+        cp /etc/resolv.conf "$s/upper/data/etc/resolv.conf"
     fi
 }
 
@@ -634,10 +664,10 @@ _chroot_destroy_sandbox() {
     [ ! -d "$s" ] && return 0
 
     # Ephemeral mode: auto-snapshot to S3 before destroying
-    if _ephemeral_enabled && [ -d "$s/upper" ]; then
-        local upper_files=$(find "$s/upper" -mindepth 1 \
-            -not -path "$s/upper/etc" \
-            -not -path "$s/upper/etc/resolv.conf" | head -1)
+    if _ephemeral_enabled && [ -d "$s/upper/data" ]; then
+        local upper_files=$(find "$s/upper/data" -mindepth 1 \
+            -not -path "$s/upper/data/etc" \
+            -not -path "$s/upper/data/etc/resolv.conf" | head -1)
         if [ -n "$upper_files" ]; then
             echo "[ephemeral] auto-snapshot $id before destroy" >&2
             local snapfile=$(_chroot_snapshot_sandbox "$id" 2>/dev/null) || true
@@ -668,6 +698,9 @@ _chroot_destroy_sandbox() {
         [ -d "$d" ] && { umount "$d" 2>/dev/null || umount -l "$d" 2>/dev/null || true; }
     done
 
+    # Unmount tmpfs upper layer
+    umount "$s/upper" 2>/dev/null || true
+
     rm -rf "$s"
 }
 
@@ -683,7 +716,8 @@ _firecracker_setup_network() {
     local id="$1"
     local s=$(sdir "$id")
     local tap="sq-${id}-tap"
-    local sandbox_index=$(printf '%s' "$id" | cksum | awk '{print ($1 % 254) + 1}')
+    local sandbox_index
+    sandbox_index=$(_allocate_netns_index) || { echo "subnet exhausted" >&2; return 1; }
 
     echo "$sandbox_index" > "$s/.meta/netns_index"
 
@@ -730,6 +764,12 @@ _firecracker_create_sandbox() {
     local s=$(sdir "$id")
 
     exists "$id" && { echo "already exists" >&2; return 1; }
+
+    local max_sandboxes="${SQUASH_MAX_SANDBOXES:-100}"
+    local current_count=$(ls -1d "$SANDBOXES"/*/ 2>/dev/null | wc -l)
+    [ "$current_count" -ge "$max_sandboxes" ] && {
+        echo "sandbox limit reached ($max_sandboxes)" >&2; return 1
+    }
 
     # Validate layers
     local mod
@@ -980,7 +1020,7 @@ sandbox_info() {
     [ -f "$s/.meta/snapshots.jsonl" ] && snapshots=$(jq -s '.' "$s/.meta/snapshots.jsonl" 2>/dev/null || echo '[]')
     local active_snap="null"
     [ -f "$s/.meta/active_snapshot" ] && active_snap="\"$(cat "$s/.meta/active_snapshot")\""
-    local upper_bytes=$(du -sb "$s/upper" 2>/dev/null | cut -f1 || echo 0)
+    local upper_bytes=$(du -sb "$s/upper/data" 2>/dev/null | cut -f1 || echo 0)
 
     local cpu=$(cat "$s/.meta/cpu" 2>/dev/null || echo "2")
     local memory_mb=$(cat "$s/.meta/memory_mb" 2>/dev/null || echo "1024")

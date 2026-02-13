@@ -1,4 +1,7 @@
-# Squash Sandbox
+# Squash Sandbox (Experimental)
+
+> **This project is experimental.** APIs, storage formats, and behavior may
+> change without notice. Not recommended for production use.
 
 Composable sandboxes from stacked squashfs layers. The PorteuX pattern,
 distro-agnostic. Dual backend: chroot (default) or Firecracker microVM.
@@ -155,16 +158,28 @@ Available bases: `base-alpine` (~8MB, musl), `base-debian` (~30MB, glibc),
 ## Security
 
 **Resource limits** — `cpu` (cgroups v2 / VM config), `memory_mb` (OOM-killed
-on exceed), `max_lifetime_s` (auto-destroyed by `sq-reaper`).
+on exceed), `max_lifetime_s` (auto-destroyed by `sq-reaper`),
+`SQUASH_UPPER_LIMIT_MB` (writable layer capped at 512MB tmpfs by default),
+`SQUASH_MAX_SANDBOXES` (default 100 concurrent sandboxes).
+
+**Namespace isolation** — Each sandbox exec runs in its own mount, PID, IPC,
+and UTS namespaces (`unshare --mount --pid --ipc --uts`). Every sandbox also
+gets a dedicated network namespace with veth pair, regardless of `allow_net`.
 
 **Network egress** — `allow_net` field on create. `[]` = allow all (default),
-`["api.anthropic.com"]` = whitelist, `["none"]` = block all. Each sandbox
-gets its own network namespace (chroot) or tap device (firecracker) with
-iptables rules.
+`["api.anthropic.com"]` = whitelist, `["none"]` = block all. Every sandbox
+gets its own network namespace (chroot) or tap device (firecracker). When
+`allow_net` is specified, iptables egress rules are applied with ICMP blocking
+and DNS rate limiting (10/s) to prevent tunneling.
 
 **Secret proxy** — `sq-secret-proxy` injects real credentials into outbound
-HTTP requests without exposing them inside the sandbox. Configure
-`$SQUASH_DATA/secrets.json`:
+HTTP requests without exposing them inside the sandbox. **HTTP only** — HTTPS
+connections bypass the proxy entirely. For HTTPS APIs, handle TLS termination
+outside the sandbox (API gateway, reverse proxy, or Firecracker backend where
+the host network handles TLS). Sandboxes sending HTTPS requests with
+placeholder values will simply fail; no secrets are leaked.
+
+Configure `$SQUASH_DATA/secrets.json`:
 
 ```json
 {
@@ -230,8 +245,24 @@ etc. — anything that supports privileged containers.
 | `SQUASH_S3_REGION`    | `us-east-1`                   | AWS region                           |
 | `SQUASH_S3_PREFIX`    | `""`                          | Key prefix (e.g. `prod/`)           |
 | `SQUASH_EPHEMERAL`    | `""` (disabled)               | S3-backed ephemeral mode (set `1`)   |
+| `SQUASH_UPPER_LIMIT_MB` | `512`                      | Max size of writable upper layer (tmpfs) |
+| `SQUASH_MAX_SANDBOXES`  | `100`                      | Max concurrent sandboxes             |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
 
-## Not in scope
+## Known limitations
+
+- **Chroot: shared kernel** — a kernel exploit inside a sandbox could compromise
+  the host. Firecracker mode mitigates this with a separate guest kernel.
+- **Chroot: UID mapping in privileged containers** — `--map-root-user` helps but
+  effective isolation depends on the container runtime's user namespace config.
+  Use Firecracker mode for stronger isolation.
+- **Secret proxy: HTTP only** — HTTPS connections bypass the proxy. Handle TLS
+  termination outside the sandbox or use the Firecracker backend.
+- **Seccomp optional** — chroot relies on namespace isolation by default. Apply
+  Docker's seccomp infrastructure at deployment time for additional syscall
+  filtering: `docker run --privileged --security-opt seccomp=seccomp.json ...`
+  A reference `seccomp.json` is included in the repo.
+- **Single-container architecture** — API server and sandbox host share a process
+  tree. Protect with `SQUASH_AUTH_TOKEN` and network-level access control.
 
 Not for untrusted multi-tenant. No GPU passthrough. No live migration between backends.

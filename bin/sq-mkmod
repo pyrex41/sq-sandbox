@@ -24,7 +24,11 @@ trap cleanup EXIT
 squash_it() {
     local src="$1" name="$2" out="$MODULES/$name.squashfs"
     mkdir -p "$MODULES"
-    mksquashfs "$src" "$out" -comp zstd -Xcompression-level 15 -b 128K -noappend -quiet -no-xattrs -no-exports
+    local comp_args="-comp gzip -b 256K"
+    if zgrep -q CONFIG_SQUASHFS_ZSTD=y /proc/config.gz 2>/dev/null; then
+        comp_args="-comp zstd -Xcompression-level 15 -b 128K"
+    fi
+    mksquashfs "$src" "$out" $comp_args -noappend -quiet -no-xattrs -no-exports
     log "built: $name.squashfs ($(du -sh "$out" | cut -f1))"
     if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
         sq-s3 push-bg "$out" "modules/$name.squashfs"

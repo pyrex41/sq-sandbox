@@ -10,6 +10,10 @@ MODULES="$DATA/modules"
 SANDBOXES="$DATA/sandboxes"
 BACKEND="${SQUASH_BACKEND:-chroot}"
 
+# ── S3 sync ──────────────────────────────────────────────────────────
+
+_s3_enabled() { [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; }
+
 # ── HTTP ───────────────────────────────────────────────────────────────
 
 json_response() {
@@ -49,19 +53,36 @@ check_auth() {
 # Stored in $MODULES/. Loop-mounted read-only per sandbox.
 
 mod_path() { echo "$MODULES/$1.squashfs"; }
-mod_exists() { [ -f "$(mod_path "$1")" ]; }
+mod_exists() {
+    [ -f "$(mod_path "$1")" ] && return 0
+    _s3_enabled && sq-s3 pull "modules/$1.squashfs" "$(mod_path "$1")" 2>/dev/null && return 0
+    return 1
+}
 
 list_modules() {
     local out="["
     local first=true
+    local seen=""
     for f in "$MODULES"/*.squashfs; do
         [ ! -f "$f" ] && continue
         local name=$(basename "$f" .squashfs)
         local size=$(stat -c%s "$f" 2>/dev/null || echo 0)
         $first || out="$out,"
         first=false
-        out="$out{\"name\":\"$name\",\"size\":$size}"
+        out="$out{\"name\":\"$name\",\"size\":$size,\"location\":\"local\"}"
+        seen="$seen $name "
     done
+    # Include remote-only modules from S3
+    if _s3_enabled; then
+        sq-s3 list "modules/" 2>/dev/null | while read -r key; do
+            [ -z "$key" ] && continue
+            local rname=$(basename "$key" .squashfs)
+            case "$seen" in *" $rname "*) continue ;; esac
+            $first || out="$out,"
+            first=false
+            out="$out{\"name\":\"$rname\",\"size\":0,\"location\":\"remote\"}"
+        done
+    fi
     echo "$out]"
 }
 
@@ -396,6 +417,8 @@ _chroot_snapshot_sandbox() {
     printf '{"label":"%s","created":"%s","size":%s}\n' \
         "$label" "$(date -Iseconds)" "$size" >> "$s/.meta/snapshots.jsonl"
 
+    _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+
     echo "$snapfile"
 }
 
@@ -406,7 +429,15 @@ _chroot_restore_sandbox() {
     local s=$(sdir "$id")
     local snapfile="$s/snapshots/$label.squashfs"
 
-    [ -f "$snapfile" ] || { echo "not found: $label" >&2; return 1; }
+    if [ ! -f "$snapfile" ]; then
+        if _s3_enabled; then
+            mkdir -p "$(dirname "$snapfile")"
+            sq-s3 pull "sandboxes/$id/snapshots/$label.squashfs" "$snapfile" 2>/dev/null || {
+                echo "not found: $label" >&2; return 1; }
+        else
+            echo "not found: $label" >&2; return 1
+        fi
+    fi
 
     # Tear down current overlay
     _umount_overlay "$id"
@@ -618,6 +649,8 @@ _firecracker_snapshot_sandbox() {
     printf '{"label":"%s","created":"%s","size":%s}\n' \
         "$label" "$(date -Iseconds)" "$size" >> "$s/.meta/snapshots.jsonl"
 
+    _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+
     echo "$snapfile"
 }
 
@@ -628,7 +661,15 @@ _firecracker_restore_sandbox() {
     local s=$(sdir "$id")
     local snapfile="$s/snapshots/$label.squashfs"
 
-    [ -f "$snapfile" ] || { echo "not found: $label" >&2; return 1; }
+    if [ ! -f "$snapfile" ]; then
+        if _s3_enabled; then
+            mkdir -p "$(dirname "$snapfile")"
+            sq-s3 pull "sandboxes/$id/snapshots/$label.squashfs" "$snapfile" 2>/dev/null || {
+                echo "not found: $label" >&2; return 1; }
+        else
+            echo "not found: $label" >&2; return 1
+        fi
+    fi
 
     # Stop VM
     sq-firecracker stop "$id"

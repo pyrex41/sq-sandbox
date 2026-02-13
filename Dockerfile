@@ -12,7 +12,9 @@ RUN apk add --no-cache \
     curl wget \
     coreutils \
     socat \
+    openssl \
     busybox-extras \
+    && apk add --no-cache aws-cli 2>/dev/null || true \
     && apk add --no-cache tailscale 2>/dev/null || true
 
 COPY bin/         /app/bin/
@@ -29,6 +31,10 @@ ENV SQUASH_DATA=/data \
     SQUASH_PORT=8080 \
     SQUASH_BACKEND=chroot \
     SQUASH_AUTH_TOKEN="" \
+    SQUASH_S3_BUCKET="" \
+    SQUASH_S3_ENDPOINT="" \
+    SQUASH_S3_REGION="us-east-1" \
+    SQUASH_S3_PREFIX="" \
     TAILSCALE_AUTHKEY="" \
     TAILSCALE_HOSTNAME="squash"
 

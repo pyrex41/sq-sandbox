@@ -9,6 +9,8 @@ primary_region = "iad"
 [env]
   SQUASH_DATA = "/data"
   SQUASH_PORT = "8080"
+  SQUASH_S3_BUCKET = ""
+  SQUASH_S3_REGION = "us-east-1"
 
 [mounts]
   source = "squash_data"

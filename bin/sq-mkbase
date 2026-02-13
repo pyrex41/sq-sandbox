@@ -33,6 +33,9 @@ squash_it() {
     mksquashfs "$src" "$out" -comp gzip -b 256K -noappend -quiet \
         -no-xattrs -no-exports
     log "done: $out ($(du -sh "$out" | cut -f1))"
+    if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
+        sq-s3 push-bg "$out" "modules/$name.squashfs"
+    fi
 }
 
 # ── Alpine ─────────────────────────────────────────────────────────────

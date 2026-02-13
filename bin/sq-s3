@@ -1,0 +1,400 @@
+#!/bin/sh
+# squash/bin/sq-s3 — S3 operations for squash modules and snapshots
+# Supports any S3-compatible service (AWS S3, Cloudflare R2, MinIO, Backblaze B2).
+# Transport: aws CLI if available, otherwise curl + AWS Signature V4 signing.
+set -eu
+
+BUCKET="${SQUASH_S3_BUCKET:-}"
+ENDPOINT="${SQUASH_S3_ENDPOINT:-}"
+REGION="${SQUASH_S3_REGION:-us-east-1}"
+PREFIX="${SQUASH_S3_PREFIX:-}"
+DATA="${SQUASH_DATA:-/data}"
+MODULES="$DATA/modules"
+SANDBOXES="$DATA/sandboxes"
+
+log() { echo "[sq-s3] $*" >&2; }
+
+# ── Transport detection ─────────────────────────────────────────────
+
+_transport=""
+_detect_transport() {
+    [ -n "$_transport" ] && return 0
+    if command -v aws >/dev/null 2>&1; then
+        _transport="awscli"
+    elif command -v curl >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+        _transport="curl"
+    else
+        log "ERROR: need aws CLI or curl+openssl"
+        return 1
+    fi
+}
+
+# ── AWS CLI transport ───────────────────────────────────────────────
+
+_aws_args() {
+    local args=""
+    [ -n "$ENDPOINT" ] && args="--endpoint-url $ENDPOINT"
+    [ -n "$REGION" ] && args="$args --region $REGION"
+    echo "$args"
+}
+
+_awscli_push() {
+    local src="$1" key="$2"
+    eval "aws s3 cp '$src' 's3://$BUCKET/${PREFIX}$key' $(_aws_args) --quiet" 2>&1
+}
+
+_awscli_pull() {
+    local key="$1" dest="$2"
+    eval "aws s3 cp 's3://$BUCKET/${PREFIX}$key' '$dest' $(_aws_args) --quiet" 2>&1
+}
+
+_awscli_exists() {
+    local key="$1"
+    eval "aws s3api head-object --bucket '$BUCKET' --key '${PREFIX}$key' $(_aws_args)" >/dev/null 2>&1
+}
+
+_awscli_list() {
+    local prefix="$1"
+    eval "aws s3api list-objects-v2 --bucket '$BUCKET' --prefix '${PREFIX}$prefix' $(_aws_args) --query 'Contents[].Key' --output text" 2>/dev/null \
+        | tr '\t' '\n' \
+        | sed "s|^${PREFIX}||"
+}
+
+# ── curl + SigV4 transport ──────────────────────────────────────────
+
+_sha256() {
+    if [ -n "${1:-}" ]; then
+        printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | sed 's/.*= //'
+    else
+        openssl dgst -sha256 2>/dev/null | sed 's/.*= //'
+    fi
+}
+
+_sha256_file() {
+    openssl dgst -sha256 "$1" 2>/dev/null | sed 's/.*= //'
+}
+
+_hmac_sha256() {
+    local key_hex="$1" data="$2"
+    printf '%s' "$data" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$key_hex" 2>/dev/null | sed 's/.*= //'
+}
+
+_to_hex() {
+    printf '%s' "$1" | od -A n -t x1 | tr -d ' \n'
+}
+
+_sigv4_sign() {
+    local method="$1" path="$2" query="${3:-}" payload_hash="$4"
+    local access_key="${AWS_ACCESS_KEY_ID:-${SQUASH_S3_ACCESS_KEY_ID:-}}"
+    local secret_key="${AWS_SECRET_ACCESS_KEY:-${SQUASH_S3_SECRET_ACCESS_KEY:-}}"
+
+    [ -z "$access_key" ] || [ -z "$secret_key" ] && { log "ERROR: AWS credentials not set"; return 1; }
+
+    local datestamp=$(date -u +%Y%m%d)
+    local datetime=$(date -u +%Y%m%dT%H%M%SZ)
+    local host=$(_s3_host)
+    local scope="$datestamp/$REGION/s3/aws4_request"
+
+    # Canonical request
+    local signed_headers="host;x-amz-content-sha256;x-amz-date"
+    local canonical_headers="host:$host\nx-amz-content-sha256:$payload_hash\nx-amz-date:$datetime\n"
+    local canonical_request=$(printf '%s\n%s\n%s\n%b\n%s\n%s' \
+        "$method" "$path" "$query" "$canonical_headers" "$signed_headers" "$payload_hash")
+
+    # String to sign
+    local request_hash=$(_sha256 "$canonical_request")
+    local string_to_sign=$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' \
+        "$datetime" "$scope" "$request_hash")
+
+    # Signing key
+    local k_secret=$(_to_hex "AWS4$secret_key")
+    local k_date=$(_hmac_sha256 "$k_secret" "$datestamp")
+    local k_region=$(_hmac_sha256 "$k_date" "$REGION")
+    local k_service=$(_hmac_sha256 "$k_region" "s3")
+    local k_signing=$(_hmac_sha256 "$k_service" "aws4_request")
+
+    # Signature
+    local signature=$(_hmac_sha256 "$k_signing" "$string_to_sign")
+
+    # Authorization header
+    printf 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s' \
+        "$access_key" "$scope" "$signed_headers" "$signature"
+
+    # Return datetime for use in headers
+    echo ""
+    echo "$datetime"
+    echo "$payload_hash"
+}
+
+_s3_host() {
+    if [ -n "$ENDPOINT" ]; then
+        echo "$ENDPOINT" | sed 's|^https\?://||; s|/.*||; s|:.*||'
+    else
+        echo "$BUCKET.s3.$REGION.amazonaws.com"
+    fi
+}
+
+_s3_base_url() {
+    if [ -n "$ENDPOINT" ]; then
+        echo "${ENDPOINT%/}/$BUCKET"
+    else
+        echo "https://$BUCKET.s3.$REGION.amazonaws.com"
+    fi
+}
+
+_curl_s3() {
+    local method="$1" key="$2" file="${3:-}" payload_hash="${4:-}"
+
+    local url_path="/$BUCKET/${PREFIX}$key"
+    local query=""
+
+    # For list operations, key contains the query
+    if [ "$method" = "LIST" ]; then
+        method="GET"
+        query="list-type=2&prefix=${PREFIX}$key"
+        url_path="/$BUCKET"
+        [ -n "$ENDPOINT" ] && url_path="/$BUCKET"
+        payload_hash=$(_sha256 "")
+    fi
+
+    [ -z "$payload_hash" ] && payload_hash=$(_sha256 "")
+
+    # Path-style for custom endpoints, virtual-hosted for AWS
+    if [ -n "$ENDPOINT" ]; then
+        url_path="/$BUCKET/${PREFIX}$key"
+        [ "$1" = "LIST" ] && url_path="/$BUCKET"
+    else
+        url_path="/${PREFIX}$key"
+    fi
+
+    local sig_output=$(_sigv4_sign "$method" "$url_path" "$query" "$payload_hash")
+    local auth_header=$(echo "$sig_output" | sed -n '1p')
+    local datetime=$(echo "$sig_output" | sed -n '2p')
+    local content_hash=$(echo "$sig_output" | sed -n '3p')
+
+    local base_url=$(_s3_base_url)
+    local full_url="$base_url/${PREFIX}$key"
+    [ -n "$query" ] && full_url="$base_url/?$query"
+
+    local curl_args="-s -f -X $method"
+    curl_args="$curl_args -H 'Authorization: $auth_header'"
+    curl_args="$curl_args -H 'x-amz-content-sha256: $content_hash'"
+    curl_args="$curl_args -H 'x-amz-date: $datetime'"
+
+    case "$method" in
+        PUT)
+            curl_args="$curl_args -T '$file'"
+            eval "curl $curl_args '$full_url'" 2>/dev/null
+            ;;
+        GET)
+            if [ -n "$file" ]; then
+                eval "curl $curl_args -o '$file' '$full_url'" 2>/dev/null
+            else
+                eval "curl $curl_args '$full_url'" 2>/dev/null
+            fi
+            ;;
+        HEAD)
+            eval "curl $curl_args -I '$full_url'" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+_curl_push() {
+    local src="$1" key="$2"
+    local payload_hash=$(_sha256_file "$src")
+    _curl_s3 PUT "$key" "$src" "$payload_hash"
+}
+
+_curl_pull() {
+    local key="$1" dest="$2"
+    _curl_s3 GET "$key" "$dest"
+}
+
+_curl_exists() {
+    local key="$1"
+    _curl_s3 HEAD "$key"
+}
+
+_curl_list() {
+    local prefix="$1"
+    local xml=$(_curl_s3 LIST "$prefix")
+    echo "$xml" | sed -n 's/.*<Key>\([^<]*\)<\/Key>.*/\1/gp' | sed "s|^${PREFIX}||"
+}
+
+# ── Public API ──────────────────────────────────────────────────────
+
+s3_push() {
+    local src="$1" key="$2"
+    _detect_transport
+    log "push: $key ($(du -sh "$src" 2>/dev/null | cut -f1))"
+    case "$_transport" in
+        awscli) _awscli_push "$src" "$key" ;;
+        curl)   _curl_push "$src" "$key" ;;
+    esac
+}
+
+s3_pull() {
+    local key="$1" dest="$2"
+    _detect_transport
+
+    # Atomic download: write to .tmp then mv
+    local tmp="${dest}.s3tmp"
+    mkdir -p "$(dirname "$dest")"
+
+    # flock to prevent concurrent pulls of the same file
+    local lockfile="${dest}.s3lock"
+    (
+        if command -v flock >/dev/null 2>&1; then
+            flock -n 9 2>/dev/null || { sleep 2; [ -f "$dest" ] && exit 0; flock 9 2>/dev/null; }
+        fi
+        # Double-check after acquiring lock
+        [ -f "$dest" ] && exit 0
+
+        log "pull: $key"
+        case "$_transport" in
+            awscli) _awscli_pull "$key" "$tmp" ;;
+            curl)   _curl_pull "$key" "$tmp" ;;
+        esac
+        if [ -f "$tmp" ]; then
+            mv "$tmp" "$dest"
+        else
+            exit 1
+        fi
+    ) 9>"$lockfile" 2>/dev/null
+    local rc=$?
+    rm -f "$lockfile"
+    return $rc
+}
+
+s3_exists() {
+    local key="$1"
+    _detect_transport
+    case "$_transport" in
+        awscli) _awscli_exists "$key" ;;
+        curl)   _curl_exists "$key" ;;
+    esac
+}
+
+s3_list() {
+    local prefix="$1"
+    _detect_transport
+    case "$_transport" in
+        awscli) _awscli_list "$prefix" ;;
+        curl)   _curl_list "$prefix" ;;
+    esac
+}
+
+s3_push_bg() {
+    local src="$1" key="$2"
+    (s3_push "$src" "$key" >> "$DATA/.s3-push.log" 2>&1 || true) &
+}
+
+# ── Sync operations ─────────────────────────────────────────────────
+
+sync_modules() {
+    _detect_transport
+
+    # Push local-only modules
+    for f in "$MODULES"/*.squashfs; do
+        [ ! -f "$f" ] && continue
+        local name=$(basename "$f")
+        local key="modules/$name"
+        s3_exists "$key" 2>/dev/null || {
+            log "push (local-only): $name"
+            s3_push "$f" "$key"
+        }
+    done
+
+    # Pull remote-only modules
+    s3_list "modules/" 2>/dev/null | while read -r key; do
+        [ -z "$key" ] && continue
+        local name=$(basename "$key")
+        [ -f "$MODULES/$name" ] && continue
+        log "pull (remote-only): $name"
+        s3_pull "modules/$name" "$MODULES/$name"
+    done
+}
+
+sync_snapshots() {
+    local id="$1"
+    local snapdir="$SANDBOXES/$id/snapshots"
+    _detect_transport
+
+    # Push local-only snapshots
+    if [ -d "$snapdir" ]; then
+        for f in "$snapdir"/*.squashfs; do
+            [ ! -f "$f" ] && continue
+            local name=$(basename "$f")
+            local key="sandboxes/$id/snapshots/$name"
+            s3_exists "$key" 2>/dev/null || {
+                log "push (local-only): $name"
+                s3_push "$f" "$key"
+            }
+        done
+    fi
+
+    # Pull remote-only snapshots
+    mkdir -p "$snapdir"
+    s3_list "sandboxes/$id/snapshots/" 2>/dev/null | while read -r key; do
+        [ -z "$key" ] && continue
+        local name=$(basename "$key")
+        [ -f "$snapdir/$name" ] && continue
+        log "pull (remote-only): $name"
+        s3_pull "sandboxes/$id/snapshots/$name" "$snapdir/$name"
+    done
+}
+
+# ── CLI dispatch ────────────────────────────────────────────────────
+
+[ -z "$BUCKET" ] && { log "ERROR: SQUASH_S3_BUCKET is not set"; exit 1; }
+
+case "${1:-help}" in
+    push)
+        [ $# -lt 3 ] && { echo "usage: sq-s3 push <local-path> <s3-key>" >&2; exit 1; }
+        s3_push "$2" "$3"
+        ;;
+    pull)
+        [ $# -lt 3 ] && { echo "usage: sq-s3 pull <s3-key> <local-path>" >&2; exit 1; }
+        s3_pull "$2" "$3"
+        ;;
+    exists)
+        [ $# -lt 2 ] && { echo "usage: sq-s3 exists <s3-key>" >&2; exit 1; }
+        s3_exists "$2"
+        ;;
+    list)
+        [ $# -lt 2 ] && { echo "usage: sq-s3 list <s3-prefix>" >&2; exit 1; }
+        s3_list "$2"
+        ;;
+    push-bg)
+        [ $# -lt 3 ] && { echo "usage: sq-s3 push-bg <local-path> <s3-key>" >&2; exit 1; }
+        s3_push_bg "$2" "$3"
+        ;;
+    sync-modules)
+        sync_modules
+        ;;
+    sync-snapshots)
+        [ $# -lt 2 ] && { echo "usage: sq-s3 sync-snapshots <sandbox-id>" >&2; exit 1; }
+        sync_snapshots "$2"
+        ;;
+    help|*)
+        cat <<'EOF'
+usage: sq-s3 <command> [args]
+
+  push     <local-path> <s3-key>       upload file to S3
+  pull     <s3-key> <local-path>        download file from S3
+  exists   <s3-key>                     check if key exists (exit 0/1)
+  list     <s3-prefix>                  list keys under prefix
+  push-bg  <local-path> <s3-key>        background upload (non-blocking)
+  sync-modules                          bi-directional module sync
+  sync-snapshots <sandbox-id>           bi-directional snapshot sync
+
+env:
+  SQUASH_S3_BUCKET       bucket name (required)
+  SQUASH_S3_ENDPOINT     custom endpoint for R2/MinIO/B2 (optional)
+  SQUASH_S3_REGION       AWS region (default: us-east-1)
+  SQUASH_S3_PREFIX       key prefix (optional)
+  AWS_ACCESS_KEY_ID      credentials
+  AWS_SECRET_ACCESS_KEY  credentials
+EOF
+        ;;
+esac

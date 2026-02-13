@@ -13,8 +13,18 @@ mkdir -p "$MODULES" "$SANDBOXES"
 
 # ── Build default base if missing ──────────────────────────────────────
 if [ ! -f "$MODULES/000-base-alpine.squashfs" ]; then
-    log "no base module found, building Alpine base"
-    "$SCRIPT_DIR/sq-mkbase" alpine
+    if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
+        log "no base module found, trying S3"
+        if sq-s3 pull "modules/000-base-alpine.squashfs" "$MODULES/000-base-alpine.squashfs" 2>/dev/null; then
+            log "pulled base from S3: $(ls -lh "$MODULES/000-base-alpine.squashfs" | awk '{print $5}')"
+        else
+            log "S3 pull failed, building Alpine base"
+            "$SCRIPT_DIR/sq-mkbase" alpine
+        fi
+    else
+        log "no base module found, building Alpine base"
+        "$SCRIPT_DIR/sq-mkbase" alpine
+    fi
 else
     log "base module present: $(ls -lh "$MODULES/000-base-alpine.squashfs" | awk '{print $5}')"
 fi
@@ -45,7 +55,15 @@ for sdir in "$SANDBOXES"/*/; do
     for mod in $(echo "$layers" | tr ',' ' '); do
         local_mp="$sdir/images/$mod.squashfs"
         sqfs="$MODULES/$mod.squashfs"
-        [ ! -f "$sqfs" ] && { log "  WARN: module missing: $mod"; continue; }
+        if [ ! -f "$sqfs" ]; then
+            if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
+                log "  pulling missing module from S3: $mod"
+                sq-s3 pull "modules/$mod.squashfs" "$sqfs" 2>/dev/null || {
+                    log "  WARN: module missing (local and S3): $mod"; continue; }
+            else
+                log "  WARN: module missing: $mod"; continue
+            fi
+        fi
         mkdir -p "$local_mp"
         mountpoint -q "$local_mp" 2>/dev/null || \
             mount -o loop,ro -t squashfs "$sqfs" "$local_mp" 2>/dev/null || \

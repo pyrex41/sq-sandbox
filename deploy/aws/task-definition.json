@@ -9,6 +9,10 @@
         "privileged": true,
         "memory": 7680,
         "portMappings": [{"containerPort": 8080, "hostPort": 8080}],
+        "environment": [
+            {"name": "SQUASH_S3_BUCKET", "value": ""},
+            {"name": "SQUASH_S3_REGION", "value": "us-east-1"}
+        ],
         "secrets": [
             {"name": "SQUASH_AUTH_TOKEN", "valueFrom": "arn:aws:ssm:REGION:ACCOUNT:parameter/squash/auth-token"},
             {"name": "TAILSCALE_AUTHKEY", "valueFrom": "arn:aws:ssm:REGION:ACCOUNT:parameter/squash/tailscale-key"}

@@ -214,6 +214,7 @@ bin/
   sq-firecracker      Firecracker VM lifecycle management (start, exec, stop)
   sq-reaper           auto-destroy expired sandboxes (background)
   sq-secret-proxy     credential-injecting HTTP proxy
+  sq-s3               S3 sync helper (push, pull, list, sync)
   sq-ctl              CLI for the API
   start-api           launch busybox httpd
   setup-tailscale     join tailnet (optional)
@@ -248,6 +249,10 @@ entrypoint.sh         init -> reaper -> secret proxy -> api
 | `SQUASH_PORT`         | `8080`                        | HTTP API listen port                 |
 | `SQUASH_AUTH_TOKEN`   | `""` (no auth)                | Bearer token for API authentication  |
 | `SQUASH_API`          | `http://localhost:$SQUASH_PORT` | API base URL (used by `sq-ctl`)    |
+| `SQUASH_S3_BUCKET`    | `""` (disabled)               | S3 bucket for module/snapshot sync   |
+| `SQUASH_S3_ENDPOINT`  | `""` (AWS default)            | Custom endpoint for R2/MinIO/B2      |
+| `SQUASH_S3_REGION`    | `us-east-1`                   | AWS region                           |
+| `SQUASH_S3_PREFIX`    | `""`                          | Key prefix (e.g. `prod/`)           |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
 | `TAILSCALE_HOSTNAME`  | `squash`                      | Hostname on tailnet                  |
 
@@ -267,6 +272,69 @@ install inside a running sandbox instead.
 
 Custom modules: `sq-mkmod from-dir <path> <NNN-name>` or
 `sq-mkmod from-sandbox <id> <NNN-name>` to package a sandbox's upper layer.
+
+## S3 Sync
+
+Optional S3 integration makes modules and snapshots durable and portable
+across hosts. Local disk acts as a cache; S3 is the source of truth.
+Works with any S3-compatible service (AWS S3, Cloudflare R2, MinIO, Backblaze B2).
+
+**Disabled by default.** Set `SQUASH_S3_BUCKET` to enable.
+
+```
+Local (fast, ephemeral)          S3 (durable, universal)
+┌──────────────────┐             ┌──────────────────┐
+│ modules/ (cache)  │──push-bg──>│ modules/*.sqfs    │
+│                   │<───pull────│                   │
+│ snapshots/ (cache)│──push-bg──>│ sandboxes/*/snap/ │
+│                   │<───pull────│                   │
+└──────────────────┘             └──────────────────┘
+```
+
+### Auto sync behavior
+
+- **After module build** (`sq-mkbase`, `sq-mkmod`): background push to S3
+- **After snapshot**: background push to S3
+- **On sandbox create**: if a requested module is missing locally, pull from S3
+- **On restore**: if snapshot is missing locally, pull from S3
+- **On startup** (`sq-init`): pull missing base/modules from S3 before building
+
+### Manual CLI
+
+```
+sq-ctl push [modules|snapshots <id>]    push all to S3
+sq-ctl pull [modules|snapshots <id>]    pull all from S3
+sq-ctl sync [sandbox-id]                bi-directional sync
+```
+
+### Provider examples
+
+**AWS S3:**
+```sh
+SQUASH_S3_BUCKET=my-squash-modules
+SQUASH_S3_REGION=us-west-2
+# Credentials via IAM role, env vars, or ~/.aws/credentials
+```
+
+**Cloudflare R2:**
+```sh
+SQUASH_S3_BUCKET=my-squash-modules
+SQUASH_S3_ENDPOINT=https://ACCOUNT.r2.cloudflarestorage.com
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+**MinIO (self-hosted):**
+```sh
+SQUASH_S3_BUCKET=squash
+SQUASH_S3_ENDPOINT=http://minio:9000
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+```
+
+Transport: uses `aws` CLI if available, falls back to `curl` + AWS Signature V4
+signing via `openssl`. No additional dependencies required beyond what's in the
+base image.
 
 ## What this is NOT
 

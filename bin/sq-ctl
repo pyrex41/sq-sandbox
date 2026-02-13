@@ -35,6 +35,67 @@ case "${1:-help}" in
     destroy)   _curl DELETE "sandboxes/$2" && echo "destroyed: $2" ;;
     modules)   _curl GET modules | jq . ;;
     health)    _curl GET ../health | jq . ;;
+    push)
+        [ -z "${SQUASH_S3_BUCKET:-}" ] && { echo "SQUASH_S3_BUCKET not set" >&2; exit 1; }
+        DATA="${SQUASH_DATA:-/data}"
+        case "${2:-modules}" in
+            modules)
+                for f in "$DATA/modules"/*.squashfs; do
+                    [ ! -f "$f" ] && continue
+                    echo "pushing $(basename "$f")"
+                    sq-s3 push "$f" "modules/$(basename "$f")"
+                done
+                ;;
+            snapshots)
+                [ -z "${3:-}" ] && { echo "usage: $0 push snapshots <sandbox-id>" >&2; exit 1; }
+                sdir="$DATA/sandboxes/$3/snapshots"
+                [ -d "$sdir" ] || { echo "no snapshots for: $3" >&2; exit 1; }
+                for f in "$sdir"/*.squashfs; do
+                    [ ! -f "$f" ] && continue
+                    echo "pushing $(basename "$f")"
+                    sq-s3 push "$f" "sandboxes/$3/snapshots/$(basename "$f")"
+                done
+                ;;
+            *) echo "usage: $0 push [modules|snapshots <id>]" >&2 ;;
+        esac
+        ;;
+    pull)
+        [ -z "${SQUASH_S3_BUCKET:-}" ] && { echo "SQUASH_S3_BUCKET not set" >&2; exit 1; }
+        DATA="${SQUASH_DATA:-/data}"
+        case "${2:-modules}" in
+            modules)
+                sq-s3 list "modules/" | while read -r key; do
+                    [ -z "$key" ] && continue
+                    name=$(basename "$key")
+                    [ -f "$DATA/modules/$name" ] && { echo "skip (cached): $name"; continue; }
+                    echo "pulling $name"
+                    sq-s3 pull "modules/$name" "$DATA/modules/$name"
+                done
+                ;;
+            snapshots)
+                [ -z "${3:-}" ] && { echo "usage: $0 pull snapshots <sandbox-id>" >&2; exit 1; }
+                mkdir -p "$DATA/sandboxes/$3/snapshots"
+                sq-s3 list "sandboxes/$3/snapshots/" | while read -r key; do
+                    [ -z "$key" ] && continue
+                    name=$(basename "$key")
+                    dest="$DATA/sandboxes/$3/snapshots/$name"
+                    [ -f "$dest" ] && { echo "skip (cached): $name"; continue; }
+                    echo "pulling $name"
+                    sq-s3 pull "sandboxes/$3/snapshots/$name" "$dest"
+                done
+                ;;
+            *) echo "usage: $0 pull [modules|snapshots <id>]" >&2 ;;
+        esac
+        ;;
+    sync)
+        [ -z "${SQUASH_S3_BUCKET:-}" ] && { echo "SQUASH_S3_BUCKET not set" >&2; exit 1; }
+        echo "=== Syncing modules ==="
+        sq-s3 sync-modules
+        if [ -n "${2:-}" ]; then
+            echo "=== Syncing snapshots for $2 ==="
+            sq-s3 sync-snapshots "$2"
+        fi
+        ;;
     help|*)
         cat <<'EOF'
 usage: sq-ctl <command> [args]
@@ -50,6 +111,11 @@ usage: sq-ctl <command> [args]
   destroy  <id>                           remove sandbox
   modules                                 available modules
   health                                  status
+
+s3 (requires SQUASH_S3_BUCKET):
+  push     [modules|snapshots <id>]      push to S3
+  pull     [modules|snapshots <id>]      pull from S3
+  sync     [sandbox-id]                  bi-directional sync
 
 examples:
   sq-ctl create dev alice 000-base-alpine,100-python312 "dev env"

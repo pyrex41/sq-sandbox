@@ -20,11 +20,15 @@ if [ -z "$id" ]; then
             owner=$(echo "$body" | jq -r '.owner // "anon"')
             layers=$(echo "$body" | jq -r 'if .layers | type == "array" then .layers | join(",") elif .layers then .layers else "000-base-alpine" end')
             task=$(echo "$body" | jq -r '.task // ""')
+            cpu=$(echo "$body" | jq -r '.cpu // "2"')
+            mem=$(echo "$body" | jq -r '.memory_mb // "1024"')
+            maxlife=$(echo "$body" | jq -r '.max_lifetime_s // "0"')
+            allow_net=$(echo "$body" | jq -c '.allow_net // empty')
 
             [ -z "$sb_id" ] && { json_err 400 "id required"; exit 0; }
             case "$sb_id" in *[!a-zA-Z0-9_-]*) json_err 400 "id: alphanumeric/dash/underscore only"; exit 0;; esac
 
-            err=$(create_sandbox "$sb_id" "$owner" "$layers" "$task" 2>&1) || {
+            err=$(create_sandbox "$sb_id" "$owner" "$layers" "$task" "$cpu" "$mem" "$maxlife" "$allow_net" 2>&1) || {
                 json_err 400 "$err"; exit 0
             }
             json_response 201 "$(sandbox_info "$sb_id")"

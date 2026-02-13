@@ -19,6 +19,15 @@ else
     log "base module present: $(ls -lh "$MODULES/000-base-alpine.squashfs" | awk '{print $5}')"
 fi
 
+if [ "${SQUASH_BACKEND:-chroot}" = "firecracker" ]; then
+    if [ ! -f "$DATA/vm/firecracker" ]; then
+        log "firecracker backend: provisioning VM components"
+        "$SCRIPT_DIR/sq-mkvm" all
+    else
+        log "firecracker backend: VM components present"
+    fi
+fi
+
 # ── Remount surviving sandboxes ────────────────────────────────────────
 for sdir in "$SANDBOXES"/*/; do
     [ ! -f "$sdir/.meta/layers" ] && continue

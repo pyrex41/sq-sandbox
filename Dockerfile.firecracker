@@ -1,7 +1,6 @@
-# Squash v3
-# The HOST is Alpine (runs the API). SANDBOX GUESTS are any Linux distro
-# assembled from squashfs layers.
-# Requires: --privileged (for mount, overlayfs, loop, unshare)
+# Squash v3 — Firecracker backend
+# Extended image with socat, iptables, iproute2 for microVM networking.
+# Requires: --privileged + /dev/kvm passthrough
 
 FROM alpine:3.21
 
@@ -12,10 +11,14 @@ RUN apk add --no-cache \
     curl wget \
     coreutils \
     socat \
+    iptables \
+    iproute2 \
+    bc \
     && apk add --no-cache tailscale 2>/dev/null || true
 
 COPY bin/         /app/bin/
 COPY cgi-bin/     /app/cgi-bin/
+COPY vm/          /app/vm/
 COPY entrypoint.sh /app/
 COPY static/      /app/static/
 
@@ -26,7 +29,7 @@ EXPOSE 8080
 
 ENV SQUASH_DATA=/data \
     SQUASH_PORT=8080 \
-    SQUASH_BACKEND=chroot \
+    SQUASH_BACKEND=firecracker \
     SQUASH_AUTH_TOKEN="" \
     TAILSCALE_AUTHKEY="" \
     TAILSCALE_HOSTNAME="squash"

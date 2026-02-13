@@ -1,0 +1,114 @@
+#!/bin/sh
+# squash/bin/sq-mkvm — build Firecracker guest rootfs + fetch kernel & binary
+#
+# Usage:
+#   sq-mkvm rootfs        Build guest rootfs ext4 image
+#   sq-mkvm kernel        Download Firecracker-compatible kernel
+#   sq-mkvm firecracker   Download Firecracker binary
+#   sq-mkvm all           All of the above
+#
+# Outputs go to $SQUASH_DATA/vm/. Downloads are skipped when files
+# already exist.
+
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+VM_DIR="$DATA/vm"
+WORK="/tmp/sq-mkvm.$$"
+FC_VER="v1.10.1"
+
+log() { echo "[sq-mkvm] $*"; }
+die() { echo "[sq-mkvm] ERROR: $*" >&2; cleanup; exit 1; }
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+mkdir -p "$WORK" "$VM_DIR"
+
+# ── Build guest rootfs as ext4 image ──────────────────────────────────
+
+build_rootfs() {
+    local rootfs="$WORK/rootfs"
+    local img="$VM_DIR/guest-rootfs.ext4"
+
+    [ -f "$img" ] && { log "guest rootfs already present"; return; }
+
+    mkdir -p "$rootfs"
+    log "building guest rootfs"
+
+    # Start from Alpine minirootfs
+    local url="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz"
+    log "downloading Alpine minirootfs"
+    wget -qO "$WORK/alpine.tar.gz" "$url" || die "failed to download Alpine minirootfs"
+    tar xzf "$WORK/alpine.tar.gz" -C "$rootfs"
+
+    # Install guest dependencies
+    log "installing guest packages"
+    chroot "$rootfs" /sbin/apk --no-cache add \
+        socat jq coreutils squashfs-tools || die "failed to install guest packages"
+
+    # Install our init and handler
+    cp vm/init "$rootfs/init"
+    chmod +x "$rootfs/init"
+    mkdir -p "$rootfs/usr/local/bin"
+    cp vm/sq-vsock-handler "$rootfs/usr/local/bin/"
+    chmod +x "$rootfs/usr/local/bin/sq-vsock-handler"
+
+    # Create directories expected by init
+    mkdir -p "$rootfs/layers" "$rootfs/sandbox"
+
+    # Create ext4 image (256MB sparse)
+    log "creating ext4 image"
+    dd if=/dev/zero of="$img" bs=1M count=0 seek=256 2>/dev/null
+    mkfs.ext4 -F -d "$rootfs" "$img" || die "mkfs.ext4 failed"
+
+    log "guest rootfs: $img ($(du -sh "$img" | cut -f1))"
+}
+
+# ── Download Firecracker-compatible kernel ────────────────────────────
+
+fetch_kernel() {
+    local kernel="$VM_DIR/vmlinux"
+
+    [ -f "$kernel" ] && { log "kernel already present"; return; }
+
+    log "downloading Firecracker-compatible kernel"
+    local url="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/vmlinux-6.1-x86_64.bin"
+    wget -qO "$kernel" "$url" || {
+        log "WARN: primary kernel URL failed, trying CI mirror"
+        url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1"
+        wget -qO "$kernel" "$url" || die "kernel download failed"
+    }
+
+    log "kernel: $kernel"
+}
+
+# ── Download Firecracker binary ───────────────────────────────────────
+
+fetch_firecracker() {
+    local fc="$VM_DIR/firecracker"
+
+    [ -f "$fc" ] && { log "firecracker binary already present"; return; }
+
+    log "downloading Firecracker ${FC_VER}"
+    local url="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz"
+    wget -qO "$WORK/fc.tgz" "$url" || die "firecracker download failed"
+    tar xzf "$WORK/fc.tgz" -C "$WORK"
+    cp "$WORK"/release-*/firecracker-*-x86_64 "$fc" || die "firecracker binary not found in archive"
+    chmod +x "$fc"
+
+    log "firecracker: $fc"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+case "${1:-all}" in
+    rootfs)      build_rootfs ;;
+    kernel)      fetch_kernel ;;
+    firecracker) fetch_firecracker ;;
+    all)         build_rootfs; fetch_kernel; fetch_firecracker ;;
+    *)
+        echo "usage: $0 [rootfs|kernel|firecracker|all]"
+        echo ""
+        echo "Build Firecracker guest VM components."
+        echo "Output: \$SQUASH_DATA/vm/ (default: /data/vm/)"
+        ;;
+esac

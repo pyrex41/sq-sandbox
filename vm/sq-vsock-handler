@@ -1,0 +1,91 @@
+#!/bin/sh
+# squash/vm/sq-vsock-handler — vsock command listener
+#
+# Listens on vsock port 5000, accepts JSON commands, executes inside
+# the sandbox overlayfs via chroot.
+#
+# Protocol (one JSON object per connection):
+#   Request:  {"cmd":"uname -a","workdir":"/","timeout":300}
+#   Response: {"exit_code":0,"stdout":"...","stderr":"..."}
+#
+# Special command "__squash_remount" rebuilds the overlayfs mount
+# after new drives are hot-added.
+
+set -eu
+
+MERGED="/sandbox/merged"
+MAX_OUTPUT=65536
+
+# ── Handle a single request from stdin ────────────────────────────────
+
+handle_request() {
+    local req
+    req=$(cat)
+
+    local cmd wd tout
+    cmd=$(echo "$req" | jq -er '.cmd // empty' 2>/dev/null) || true
+    wd=$(echo "$req" | jq -er '.workdir // "/"' 2>/dev/null) || true
+    tout=$(echo "$req" | jq -er '.timeout // 300' 2>/dev/null) || true
+
+    if [ -z "$cmd" ]; then
+        jq -n '{exit_code:-1,stdout:"",stderr:"missing cmd"}'
+        return
+    fi
+
+    # Special: rebuild overlayfs after hot-add
+    if [ "$cmd" = "__squash_remount" ]; then
+        _remount_overlay
+        jq -n '{exit_code:0,stdout:"remounted",stderr:""}'
+        return
+    fi
+
+    local out err rc
+    out=$(mktemp)
+    err=$(mktemp)
+    rc=0
+
+    timeout "$tout" chroot "$MERGED" /bin/sh -c "cd $wd 2>/dev/null || true; $cmd" \
+        >"$out" 2>"$err" || rc=$?
+
+    jq -n \
+        --argjson rc "$rc" \
+        --arg stdout "$(head -c "$MAX_OUTPUT" "$out")" \
+        --arg stderr "$(head -c "$MAX_OUTPUT" "$err")" \
+        '{exit_code:$rc,stdout:$stdout,stderr:$stderr}'
+
+    rm -f "$out" "$err"
+}
+
+# ── Rebuild overlayfs from current block devices ──────────────────────
+
+_remount_overlay() {
+    local lower="" i=0
+    for dev in /dev/vd[b-z]; do
+        [ -b "$dev" ] || continue
+        mp="/layers/$i"
+        mkdir -p "$mp"
+        # Skip if already mounted
+        mountpoint -q "$mp" 2>/dev/null || \
+            mount -o ro -t squashfs "$dev" "$mp" 2>/dev/null || continue
+        if [ -n "$lower" ]; then
+            lower="$mp:$lower"
+        else
+            lower="$mp"
+        fi
+        i=$((i + 1))
+    done
+
+    umount /sandbox/merged 2>/dev/null || true
+    mount -t overlay overlay \
+        -o "lowerdir=$lower,upperdir=/sandbox/upper/data,workdir=/sandbox/work" \
+        /sandbox/merged
+}
+
+# ── Export for socat fork ─────────────────────────────────────────────
+
+export MERGED MAX_OUTPUT
+export -f handle_request _remount_overlay
+
+# ── Listen on vsock port 5000, fork per connection ────────────────────
+
+exec socat VSOCK-LISTEN:5000,reuseaddr,fork EXEC:"/bin/sh -c handle_request"

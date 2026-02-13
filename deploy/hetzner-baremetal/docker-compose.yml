@@ -1,0 +1,25 @@
+# deploy/hetzner-baremetal/docker-compose.yml
+# Hetzner dedicated server (e.g. AX42 Ryzen 5 3600 / 64GB) ~€47/mo
+# Requires /dev/kvm for Firecracker microVM backend.
+services:
+  squash:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.firecracker
+    privileged: true
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    volumes: [squash-data:/data]
+    devices: [/dev/kvm:/dev/kvm]
+    environment:
+      SQUASH_BACKEND: firecracker
+      SQUASH_AUTH_TOKEN: ${SQUASH_AUTH_TOKEN}
+      TAILSCALE_AUTHKEY: ${TAILSCALE_AUTHKEY:-}
+      TAILSCALE_HOSTNAME: ${TAILSCALE_HOSTNAME:-squash}
+    healthcheck:
+      test: wget -qO- http://localhost:8080/cgi-bin/health
+      interval: 30s
+      start_period: 60s
+
+volumes:
+  squash-data:

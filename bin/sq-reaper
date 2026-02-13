@@ -1,0 +1,30 @@
+#!/bin/sh
+# sq-reaper — background sandbox reaper
+# Runs in a loop, destroying sandboxes that exceed their max_lifetime_s.
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/../cgi-bin/common.sh"
+
+while true; do
+    for sdir in "$SANDBOXES"/*/; do
+        [ ! -d "$sdir" ] && continue
+        [ ! -f "$sdir/.meta/max_lifetime_s" ] && continue
+
+        max=$(cat "$sdir/.meta/max_lifetime_s" 2>/dev/null || echo "0")
+        [ "$max" = "0" ] && continue
+        [ -z "$max" ] && continue
+
+        [ ! -f "$sdir/.meta/created" ] && continue
+        created_ts=$(date -d "$(cat "$sdir/.meta/created")" +%s 2>/dev/null) || continue
+        now=$(date +%s)
+        age=$((now - created_ts))
+
+        if [ "$age" -gt "$max" ]; then
+            id=$(basename "$sdir")
+            echo "[sq-reaper] destroying expired sandbox: $id (age=${age}s, max=${max}s)" >&2
+            destroy_sandbox "$id" || true
+        fi
+    done
+    sleep 10
+done

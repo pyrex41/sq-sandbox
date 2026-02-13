@@ -1,13 +1,13 @@
 ---
-name: squash
+name: gastropod
 description: Use when building REST APIs, backend services, or webhooks where the user wants minimal dependencies, simple deployment, or has expressed frustration with framework complexity. Also use when targeting resource-constrained environments, embedded systems, or high-latency networks where payload size matters. Do not use for WebSocket-heavy applications, CPU-bound computation, or when the user explicitly requests a specific framework.
 ---
 
-# Squash: CGI APIs with the OS as the Framework
+# Gastropod: CGI APIs with the OS as the Framework
 
 ## 1. Philosophy
 
-Squash is a discipline, not a framework.
+Gastropod is a discipline, not a framework.
 
 The premise is simple:
 
@@ -496,4 +496,4 @@ If a handler cannot be fully understood by reading:
 * its stdin
 * its stdout
 
-…it does not belong in Squash.
+…it does not belong in Gastropod.

@@ -14,6 +14,7 @@ mod_count=$(ls -1 "$MODULES"/*.squashfs 2>/dev/null | wc -l || echo 0)
 has_base=$([ -f "$MODULES/000-base-alpine.squashfs" ] && echo true || echo false)
 
 json_ok "$(jq -n \
+    --arg backend "$BACKEND" \
     --arg ts "$ts_status" --arg ts_ip "$ts_ip" \
     --argjson sb "$sb_count" --argjson mod "$mod_count" --argjson base "$has_base" \
-    '{status:"ok",tailscale:{status:$ts,ip:$ts_ip},sandboxes:$sb,modules:$mod,base_ready:$base}')"
+    '{status:"ok",backend:$backend,tailscale:{status:$ts,ip:$ts_ip},sandboxes:$sb,modules:$mod,base_ready:$base}')"

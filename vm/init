@@ -1,0 +1,80 @@
+#!/bin/sh
+# squash/vm/init — Firecracker guest PID 1
+#
+# Mounts squashfs drives as overlayfs layers and starts the vsock
+# command listener. Passed layer config via kernel cmdline:
+#   squash.layers=N  squash.allow_net=host1,host2
+
+set -eu
+
+# ── Mount essential filesystems ───────────────────────────────────────
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+
+# ── Parse kernel cmdline ──────────────────────────────────────────────
+# Format: squash.layers=3 squash.allow_net=api.example.com,pypi.org
+
+LAYER_COUNT=99
+ALLOW_NET=""
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+        squash.layers=*) LAYER_COUNT="${tok#squash.layers=}" ;;
+        squash.allow_net=*) ALLOW_NET="${tok#squash.allow_net=}" ;;
+    esac
+done
+
+# ── Mount squashfs layers from virtio block devices ───────────────────
+# /dev/vda = guest rootfs (this image)
+# /dev/vdb = first squashfs layer (base)
+# /dev/vdc = second layer, etc.
+#
+# Overlayfs lowerdir is last-mounted = highest priority, matching
+# the chroot backend's stacking order.
+
+LOWER=""
+i=0
+for dev in /dev/vd[b-z]; do
+    [ -b "$dev" ] || continue
+    [ "$i" -ge "$LAYER_COUNT" ] && break
+    mp="/layers/$i"
+    mkdir -p "$mp"
+    mount -o ro -t squashfs "$dev" "$mp" 2>/dev/null || continue
+    if [ -n "$LOWER" ]; then
+        LOWER="$mp:$LOWER"
+    else
+        LOWER="$mp"
+    fi
+    i=$((i + 1))
+done
+
+# ── Set up overlayfs ─────────────────────────────────────────────────
+
+mkdir -p /sandbox/upper /sandbox/work /sandbox/merged
+mount -t tmpfs tmpfs /sandbox/upper
+mkdir -p /sandbox/upper/data /sandbox/work
+mount -t overlay overlay \
+    -o "lowerdir=$LOWER,upperdir=/sandbox/upper/data,workdir=/sandbox/work" \
+    /sandbox/merged
+
+# ── Seed DNS ──────────────────────────────────────────────────────────
+
+mkdir -p /sandbox/merged/etc
+echo "nameserver 10.0.0.1" > /sandbox/merged/etc/resolv.conf 2>/dev/null || true
+
+# ── Network setup ─────────────────────────────────────────────────────
+
+ip link set lo up
+ip addr add 10.0.0.2/30 dev eth0 2>/dev/null || true
+ip link set eth0 up 2>/dev/null || true
+ip route add default via 10.0.0.1 2>/dev/null || true
+
+echo "[squash-guest] ready — layers=$i"
+
+# ── Start vsock command listener ──────────────────────────────────────
+
+exec /usr/local/bin/sq-vsock-handler

@@ -1,0 +1,132 @@
+#!/bin/sh
+# squash/bin/sq-firecracker — manage Firecracker microVMs for Squash sandboxes
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+VM_DIR="$DATA/vm"
+FC="$VM_DIR/firecracker"
+KERNEL="$VM_DIR/vmlinux"
+ROOTFS="$VM_DIR/guest-rootfs.ext4"
+
+# Start a Firecracker VM for a sandbox
+# Usage: sq-firecracker start <sandbox-id> <cpu> <mem_mb> <squashfs1> [squashfs2 ...]
+fc_start() {
+    local id="$1" cpu="$2" mem="$3"; shift 3
+    local sock="$DATA/sandboxes/$id/.meta/fc.sock"
+    local pid_file="$DATA/sandboxes/$id/.meta/fc.pid"
+    local log_file="$DATA/sandboxes/$id/.meta/fc.log"
+    local cid_file="$DATA/sandboxes/$id/.meta/fc.cid"
+
+    # Assign a unique CID for vsock (3+)
+    local cid=$((3 + $(ls -1d "$DATA/sandboxes"/*/ 2>/dev/null | wc -l)))
+    echo "$cid" > "$cid_file"
+
+    # Start Firecracker process
+    rm -f "$sock"
+    "$FC" --api-sock "$sock" > "$log_file" 2>&1 &
+    echo $! > "$pid_file"
+    sleep 0.5
+
+    # Configure VM via API
+    # Kernel + boot args
+    local layer_count=$#
+    local boot_args="console=ttyS0 reboot=k panic=1 pci=off squash.layers=$layer_count"
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/boot-source" \
+        -H 'Content-Type: application/json' \
+        -d "{\"kernel_image_path\":\"$KERNEL\",\"boot_args\":\"$boot_args\"}"
+
+    # Guest rootfs (vda)
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/drives/rootfs" \
+        -H 'Content-Type: application/json' \
+        -d "{\"drive_id\":\"rootfs\",\"path_on_host\":\"$ROOTFS\",\"is_root_device\":true,\"is_read_only\":true}"
+
+    # Squashfs layers as additional drives (vdb, vdc, ...)
+    local i=0
+    for sqfs in "$@"; do
+        curl -s --unix-socket "$sock" -X PUT "http://localhost/drives/layer$i" \
+            -H 'Content-Type: application/json' \
+            -d "{\"drive_id\":\"layer$i\",\"path_on_host\":\"$sqfs\",\"is_root_device\":false,\"is_read_only\":true}"
+        i=$((i + 1))
+    done
+
+    # Machine config
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/machine-config" \
+        -H 'Content-Type: application/json' \
+        -d "{\"vcpu_count\":${cpu%.*},\"mem_size_mib\":$mem}"
+
+    # Vsock
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/vsock" \
+        -H 'Content-Type: application/json' \
+        -d "{\"guest_cid\":$cid,\"uds_path\":\"$DATA/sandboxes/$id/.meta/vsock.sock\"}"
+
+    # Network (tap device created by _firecracker_setup_network before this call)
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/network-interfaces/eth0" \
+        -H 'Content-Type: application/json' \
+        -d "{\"iface_id\":\"eth0\",\"host_dev_name\":\"sq-${id}-tap\"}"
+
+    # Boot the VM
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/actions" \
+        -H 'Content-Type: application/json' \
+        -d '{"action_type":"InstanceStart"}'
+
+    # Wait for vsock to be ready
+    local retries=0
+    while [ $retries -lt 20 ]; do
+        echo '{"cmd":"echo ready"}' | socat - VSOCK-CONNECT:$cid:5000 2>/dev/null && break
+        retries=$((retries + 1))
+        sleep 0.1
+    done
+}
+
+# Send command to VM via vsock
+# Usage: sq-firecracker exec <sandbox-id> <cmd> [workdir] [timeout]
+fc_exec() {
+    local id="$1" cmd="$2" workdir="${3:-/}" timeout="${4:-300}"
+    local cid=$(cat "$DATA/sandboxes/$id/.meta/fc.cid")
+
+    jq -n --arg cmd "$cmd" --arg wd "$workdir" --argjson t "$timeout" \
+        '{cmd:$cmd,workdir:$wd,timeout:$t}' \
+    | socat -T"$timeout" - VSOCK-CONNECT:$cid:5000
+}
+
+# Stop a Firecracker VM
+# Usage: sq-firecracker stop <sandbox-id>
+fc_stop() {
+    local id="$1"
+    local pid_file="$DATA/sandboxes/$id/.meta/fc.pid"
+    [ -f "$pid_file" ] && kill "$(cat "$pid_file")" 2>/dev/null || true
+    rm -f "$DATA/sandboxes/$id/.meta/fc.sock"
+    rm -f "$DATA/sandboxes/$id/.meta/vsock.sock"
+}
+
+# Hot-add a drive (for activate_module)
+# Usage: sq-firecracker add-drive <sandbox-id> <drive-id> <squashfs-path>
+fc_add_drive() {
+    local id="$1" drive_id="$2" sqfs_path="$3"
+    local sock="$DATA/sandboxes/$id/.meta/fc.sock"
+
+    curl -s --unix-socket "$sock" -X PUT "http://localhost/drives/$drive_id" \
+        -H 'Content-Type: application/json' \
+        -d "{\"drive_id\":\"$drive_id\",\"path_on_host\":\"$sqfs_path\",\"is_root_device\":false,\"is_read_only\":true}"
+
+    # Tell guest to remount overlayfs with new drive
+    local cid=$(cat "$DATA/sandboxes/$id/.meta/fc.cid")
+    echo '{"cmd":"__squash_remount"}' | socat - VSOCK-CONNECT:$cid:5000
+}
+
+case "${1:-help}" in
+    start)     shift; fc_start "$@" ;;
+    exec)      shift; fc_exec "$@" ;;
+    stop)      shift; fc_stop "$@" ;;
+    add-drive) shift; fc_add_drive "$@" ;;
+    help|*)
+        cat <<'EOF'
+usage: sq-firecracker <command> [args]
+
+  start     <id> <cpu> <mem_mb> <sqfs...>   boot a microVM
+  exec      <id> <cmd> [workdir] [timeout]  run command via vsock
+  stop      <id>                            kill VM and clean up
+  add-drive <id> <drive-id> <sqfs-path>     hot-add squashfs drive
+EOF
+        ;;
+esac

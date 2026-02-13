@@ -82,6 +82,7 @@ EOF
     }
 
     squash_it "$rootfs" "000-base-alpine"
+    echo "2" > "$MODULES/000-base-alpine.version"
 }
 
 # ── Debian / Ubuntu ────────────────────────────────────────────────────

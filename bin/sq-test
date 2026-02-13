@@ -173,8 +173,20 @@ if [ -f "$DATA/secrets.json" ]; then
         "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
         && _pass || _skip "no NODE_EXTRA_CA_CERTS (SQUASH_PROXY_HTTPS not enabled)"
 
+    _log "SSL_CERT_FILE set in env"
+    grep -q "SSL_CERT_FILE" \
+        "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
+        && _pass || _skip "no SSL_CERT_FILE (SQUASH_PROXY_HTTPS not enabled)"
+
+    _log "REQUESTS_CA_BUNDLE set in env"
+    grep -q "REQUESTS_CA_BUNDLE" \
+        "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
+        && _pass || _skip "no REQUESTS_CA_BUNDLE (SQUASH_PROXY_HTTPS not enabled)"
+
     _api DELETE /cgi-bin/api/sandboxes/test-sec >/dev/null 2>&1
 else
+    _skip "no secrets.json"
+    _skip "no secrets.json"
     _skip "no secrets.json"
     _skip "no secrets.json"
     _skip "no secrets.json"

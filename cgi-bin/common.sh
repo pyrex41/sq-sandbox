@@ -295,6 +295,12 @@ _inject_secret_placeholders() {
         # Env vars for runtimes that don't use the system bundle
         echo "export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/sq-proxy-ca.crt" \
             >> "$env_dir/squash-secrets.sh"
+
+        # Python: requests uses certifi, not system bundle; ssl module checks SSL_CERT_FILE
+        echo "export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" \
+            >> "$env_dir/squash-secrets.sh"
+        echo "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" \
+            >> "$env_dir/squash-secrets.sh"
     fi
 }
 
@@ -358,6 +364,18 @@ _chroot_setup_netns() {
     # NAT on host for outbound
     iptables -t nat -A POSTROUTING -s "10.200.${sandbox_index}.0/30" -j MASQUERADE
 
+    # DNS forwarding — redirect queries to gateway to host's real resolver
+    local host_dns
+    host_dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || echo "")
+    if [ -n "$host_dns" ]; then
+        iptables -t nat -A PREROUTING -s "10.200.${sandbox_index}.0/30" \
+            -d "10.200.${sandbox_index}.1" -p udp --dport 53 \
+            -j DNAT --to-destination "$host_dns"
+        iptables -t nat -A PREROUTING -s "10.200.${sandbox_index}.0/30" \
+            -d "10.200.${sandbox_index}.1" -p tcp --dport 53 \
+            -j DNAT --to-destination "$host_dns"
+    fi
+
     # Egress filtering (applied to host-side veth — filters FORWARD traffic)
     if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
         _apply_egress_rules "$id" "$veth_host" "$allow_net"
@@ -415,6 +433,17 @@ _chroot_teardown_netns() {
 
     if [ -n "$sandbox_index" ]; then
         iptables -t nat -D POSTROUTING -s "10.200.${sandbox_index}.0/30" -j MASQUERADE 2>/dev/null || true
+
+        local host_dns
+        host_dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || echo "")
+        if [ -n "$host_dns" ]; then
+            iptables -t nat -D PREROUTING -s "10.200.${sandbox_index}.0/30" \
+                -d "10.200.${sandbox_index}.1" -p udp --dport 53 \
+                -j DNAT --to-destination "$host_dns" 2>/dev/null || true
+            iptables -t nat -D PREROUTING -s "10.200.${sandbox_index}.0/30" \
+                -d "10.200.${sandbox_index}.1" -p tcp --dport 53 \
+                -j DNAT --to-destination "$host_dns" 2>/dev/null || true
+        fi
     fi
 
     # Delete veth pair (host end — peer is auto-deleted)

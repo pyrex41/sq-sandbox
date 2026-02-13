@@ -12,7 +12,9 @@ log() { echo "[sq-init] $*"; }
 mkdir -p "$MODULES" "$SANDBOXES"
 
 # ── Build default base if missing ──────────────────────────────────────
-if [ ! -f "$MODULES/000-base-alpine.squashfs" ]; then
+_base_current=2
+_base_version=$(cat "$MODULES/000-base-alpine.version" 2>/dev/null || echo "0")
+if [ ! -f "$MODULES/000-base-alpine.squashfs" ] || [ "$_base_version" -lt "$_base_current" ]; then
     if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
         log "no base module found, trying S3"
         if sq-s3 pull "modules/000-base-alpine.squashfs" "$MODULES/000-base-alpine.squashfs" 2>/dev/null; then

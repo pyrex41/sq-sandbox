@@ -175,7 +175,8 @@ gets a dedicated network namespace with veth pair, regardless of `allow_net`.
 
 **Network egress** — `allow_net` field on create. `[]` = allow all (default),
 `["api.anthropic.com"]` = whitelist, `["none"]` = block all. Every sandbox
-gets its own network namespace (chroot) or tap device (firecracker). When
+gets its own network namespace (chroot) or tap device (firecracker). DNS
+queries targeting the gateway IP are DNAT'd to the host's resolver. When
 `allow_net` is specified, iptables egress rules are applied with ICMP blocking
 and DNS rate limiting (10/s) to prevent tunneling.
 
@@ -188,9 +189,10 @@ requests without exposing them inside the sandbox. Two modes:
 
 - **HTTPS mode** (`SQUASH_PROXY_HTTPS=1`): Go-based MITM proxy generates
   per-host TLS certificates signed by a CA created at container startup. The CA
-  is automatically injected into each sandbox's trust store. All HTTPS API calls
-  to `allowed_hosts` get transparent credential injection. Non-allowed hosts are
-  tunneled through without inspection.
+  is automatically injected into each sandbox's trust store (`ca-certificates.crt`,
+  `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`). All HTTPS API
+  calls to `allowed_hosts` get transparent credential injection. Non-allowed
+  hosts are tunneled through without inspection.
 
 Configure `$SQUASH_DATA/secrets.json`:
 

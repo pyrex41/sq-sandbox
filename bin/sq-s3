@@ -31,33 +31,41 @@ _detect_transport() {
 
 # ── AWS CLI transport ───────────────────────────────────────────────
 
-_aws_args() {
-    local args=""
-    [ -n "$ENDPOINT" ] && args="--endpoint-url $ENDPOINT"
-    [ -n "$REGION" ] && args="$args --region $REGION"
-    echo "$args"
-}
-
 _awscli_push() {
     local src="$1" key="$2"
-    eval "aws s3 cp '$src' 's3://$BUCKET/${PREFIX}$key' $(_aws_args) --quiet" 2>&1
+    if [ -n "$ENDPOINT" ]; then
+        aws s3 cp "$src" "s3://$BUCKET/${PREFIX}$key" --endpoint-url "$ENDPOINT" --region "$REGION" --quiet 2>&1
+    else
+        aws s3 cp "$src" "s3://$BUCKET/${PREFIX}$key" --region "$REGION" --quiet 2>&1
+    fi
 }
 
 _awscli_pull() {
     local key="$1" dest="$2"
-    eval "aws s3 cp 's3://$BUCKET/${PREFIX}$key' '$dest' $(_aws_args) --quiet" 2>&1
+    if [ -n "$ENDPOINT" ]; then
+        aws s3 cp "s3://$BUCKET/${PREFIX}$key" "$dest" --endpoint-url "$ENDPOINT" --region "$REGION" --quiet 2>&1
+    else
+        aws s3 cp "s3://$BUCKET/${PREFIX}$key" "$dest" --region "$REGION" --quiet 2>&1
+    fi
 }
 
 _awscli_exists() {
     local key="$1"
-    eval "aws s3api head-object --bucket '$BUCKET' --key '${PREFIX}$key' $(_aws_args)" >/dev/null 2>&1
+    if [ -n "$ENDPOINT" ]; then
+        aws s3api head-object --bucket "$BUCKET" --key "${PREFIX}$key" --endpoint-url "$ENDPOINT" --region "$REGION" >/dev/null 2>&1
+    else
+        aws s3api head-object --bucket "$BUCKET" --key "${PREFIX}$key" --region "$REGION" >/dev/null 2>&1
+    fi
 }
 
 _awscli_list() {
-    local prefix="$1"
-    eval "aws s3api list-objects-v2 --bucket '$BUCKET' --prefix '${PREFIX}$prefix' $(_aws_args) --query 'Contents[].Key' --output text" 2>/dev/null \
-        | tr '\t' '\n' \
-        | sed "s|^${PREFIX}||"
+    local prefix="$1" raw
+    if [ -n "$ENDPOINT" ]; then
+        raw=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}$prefix" --endpoint-url "$ENDPOINT" --region "$REGION" --query 'Contents[].Key' --output text 2>/dev/null)
+    else
+        raw=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}$prefix" --region "$REGION" --query 'Contents[].Key' --output text 2>/dev/null)
+    fi
+    printf '%s\n' "$raw" | tr '\t' '\n' | sed "s|^${PREFIX}||"
 }
 
 # ── curl + SigV4 transport ──────────────────────────────────────────
@@ -144,6 +152,7 @@ _s3_base_url() {
 
 _curl_s3() {
     local method="$1" key="$2" file="${3:-}" payload_hash="${4:-}"
+    local orig_method="$method"
 
     local url_path="/$BUCKET/${PREFIX}$key"
     local query=""
@@ -153,7 +162,6 @@ _curl_s3() {
         method="GET"
         query="list-type=2&prefix=${PREFIX}$key"
         url_path="/$BUCKET"
-        [ -n "$ENDPOINT" ] && url_path="/$BUCKET"
         payload_hash=$(_sha256 "")
     fi
 
@@ -162,7 +170,7 @@ _curl_s3() {
     # Path-style for custom endpoints, virtual-hosted for AWS
     if [ -n "$ENDPOINT" ]; then
         url_path="/$BUCKET/${PREFIX}$key"
-        [ "$1" = "LIST" ] && url_path="/$BUCKET"
+        [ "$orig_method" = "LIST" ] && url_path="/$BUCKET"
     else
         url_path="/${PREFIX}$key"
     fi
@@ -176,25 +184,35 @@ _curl_s3() {
     local full_url="$base_url/${PREFIX}$key"
     [ -n "$query" ] && full_url="$base_url/?$query"
 
-    local curl_args="-s -f -X $method"
-    curl_args="$curl_args -H 'Authorization: $auth_header'"
-    curl_args="$curl_args -H 'x-amz-content-sha256: $content_hash'"
-    curl_args="$curl_args -H 'x-amz-date: $datetime'"
-
     case "$method" in
         PUT)
-            curl_args="$curl_args -T '$file'"
-            eval "curl $curl_args '$full_url'" 2>/dev/null
+            curl -s -f -X PUT \
+                -H "Authorization: $auth_header" \
+                -H "x-amz-content-sha256: $content_hash" \
+                -H "x-amz-date: $datetime" \
+                -T "$file" "$full_url" 2>/dev/null
             ;;
         GET)
             if [ -n "$file" ]; then
-                eval "curl $curl_args -o '$file' '$full_url'" 2>/dev/null
+                curl -s -f -X GET \
+                    -H "Authorization: $auth_header" \
+                    -H "x-amz-content-sha256: $content_hash" \
+                    -H "x-amz-date: $datetime" \
+                    -o "$file" "$full_url" 2>/dev/null
             else
-                eval "curl $curl_args '$full_url'" 2>/dev/null
+                curl -s -f -X GET \
+                    -H "Authorization: $auth_header" \
+                    -H "x-amz-content-sha256: $content_hash" \
+                    -H "x-amz-date: $datetime" \
+                    "$full_url" 2>/dev/null
             fi
             ;;
         HEAD)
-            eval "curl $curl_args -I '$full_url'" >/dev/null 2>&1
+            curl -s -f -I \
+                -H "Authorization: $auth_header" \
+                -H "x-amz-content-sha256: $content_hash" \
+                -H "x-amz-date: $datetime" \
+                "$full_url" >/dev/null 2>&1
             ;;
     esac
 }

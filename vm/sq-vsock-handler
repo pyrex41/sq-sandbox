@@ -44,7 +44,8 @@ handle_request() {
     err=$(mktemp)
     rc=0
 
-    timeout "$tout" chroot "$MERGED" /bin/sh -c "cd $wd 2>/dev/null || true; $cmd" \
+    timeout "$tout" chroot "$MERGED" \
+        /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$wd" "$cmd" \
         >"$out" 2>"$err" || rc=$?
 
     jq -n \

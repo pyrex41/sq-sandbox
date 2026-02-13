@@ -14,6 +14,8 @@ RUN apk add --no-cache \
     socat \
     openssl \
     busybox-extras \
+    iproute2 \
+    iptables \
     && apk add --no-cache aws-cli 2>/dev/null || true \
     && apk add --no-cache tailscale 2>/dev/null || true
 

@@ -35,10 +35,10 @@ Per-sandbox outbound network whitelisting via the `allow_net` field:
 
 Implementation:
 
-- **chroot**: Each sandbox gets its own network namespace. nftables rules
-  restrict outbound connections to resolved IPs of allowed hosts. DNS is
-  always permitted for hostname resolution.
-- **firecracker**: Each VM gets a tap device. nftables rules on the host
+- **chroot**: Each sandbox with `allow_net` gets its own network namespace.
+  iptables rules restrict outbound connections to resolved IPs of allowed
+  hosts. DNS is always permitted for hostname resolution.
+- **firecracker**: Each VM gets a tap device. iptables rules on the host
   filter traffic on the tap interface.
 
 DNS resolution happens at sandbox creation time for the allowed hosts. If a
@@ -87,3 +87,29 @@ The proxy only replaces the placeholder with the real value when the
 outbound request targets a host in `allowed_hosts`. This prevents a
 malicious sandbox from exfiltrating credentials to an attacker-controlled
 server.
+
+## Known limitations
+
+- **Chroot mode: shared kernel** -- sandbox processes share the host kernel.
+  A kernel exploit from inside a sandbox could compromise the host. Firecracker
+  mode mitigates this with a separate guest kernel.
+
+- **Chroot mode: UID mapping in privileged containers** -- `--map-root-user`
+  maps sandbox root to an unprivileged user outside, but when the container
+  itself runs as root with `--privileged`, the effective isolation depends on
+  the container runtime's user namespace configuration. For stronger isolation,
+  use Firecracker mode.
+
+- **Secret proxy: HTTP only** -- The `sq-secret-proxy` handles HTTP requests.
+  HTTPS (CONNECT tunneling with header rewriting) requires a compiled proxy
+  binary. Most modern APIs use HTTPS, so the proxy's utility is limited to
+  HTTP-only endpoints or environments where TLS is terminated before the proxy.
+
+- **No seccomp or AppArmor** -- Neither backend applies syscall filtering or
+  mandatory access control profiles. The chroot backend relies on namespace
+  isolation; the Firecracker backend relies on the VMM.
+
+- **Single-container architecture** -- The API server and sandbox host share a
+  process tree. A compromise of the API server grants access to all sandbox
+  management operations. Use `SQUASH_AUTH_TOKEN` and network-level access
+  control (Tailscale, firewall rules) to protect the API.

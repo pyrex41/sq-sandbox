@@ -5,8 +5,6 @@ distro-agnostic. Dual backend: chroot (default) or Firecracker microVM.
 
 ## Quick Start
 
-### Option A: Docker (just run it)
-
 ```sh
 docker run -d --privileged \
   -p 8080:8080 \
@@ -22,19 +20,25 @@ curl -X POST localhost:8080/cgi-bin/api/sandboxes/dev/exec \
   -d '{"cmd":"python3 -c \"print(42)\""}'
 ```
 
-### Option B: Clone and customize
+## What this is
 
-```sh
-git clone https://github.com/pyrex41/sq-sandbox.git my-sandbox
-cd my-sandbox
+Squash Sandbox is a **single-container system** that is both the control plane
+and the sandbox runtime. One Docker container runs:
 
-# Add a custom module preset in bin/sq-mkmod
-# Configure deploy/ for your provider
-# Set env vars for auth, S3, etc.
+- The HTTP API server (busybox httpd + CGI shell scripts)
+- The sandbox lifecycle manager (create, exec, snapshot, restore, destroy)
+- The sandbox host (overlayfs mounts, cgroups, network namespaces, or Firecracker VMs)
+- Optional background services (reaper, secret proxy, Tailscale)
 
-docker build -t my-sandbox .
-docker run -d --privileged -p 8080:8080 -v data:/data my-sandbox
-```
+There is no separate "sandbox agent" or remote execution node. The container
+that serves the API is the same container that mounts squashfs layers and runs
+sandboxed commands. This means:
+
+- **Deploy one container** — that's the whole system
+- **`--privileged` is required** — the container directly manipulates kernel
+  resources (loop mounts, overlayfs, cgroups, network namespaces)
+- **Sandbox escape = host compromise** in chroot mode — Firecracker mode
+  provides a stronger VM boundary
 
 ## How it works
 
@@ -48,8 +52,6 @@ A sandbox is a stack of read-only squashfs layers + a writable overlay:
 ├─────────────────────────────┤
 │ 100-python312.squashfs      │ <- language runtime
 ├─────────────────────────────┤
-│ 100-nodejs22.squashfs       │ <- another runtime
-├─────────────────────────────┤
 │ 000-base-alpine.squashfs    │ <- root filesystem
 └─────────────────────────────┘
          ↓ overlayfs merge ↓
@@ -58,150 +60,178 @@ A sandbox is a stack of read-only squashfs layers + a writable overlay:
 └─────────────────────────────┘
 ```
 
-Every layer is a squashfs file containing a directory tree. Overlayfs merges
-them bottom-up. The leftmost lowerdir wins on conflict (highest number prefix).
+Operations: create (mount layers as overlayfs), exec (unshare + chroot),
+activate (add layer + remount), snapshot (mksquashfs upper/),
+restore (mount snapshot as layer + clear upper), destroy (unmount + rm).
 
 ## Backends
 
-Selected via the `SQUASH_BACKEND` environment variable. The API is identical
-regardless of backend.
+| Backend       | Isolation              | Requires             |
+|---------------|------------------------|----------------------|
+| `chroot`      | overlayfs + unshare    | Privileged container |
+| `firecracker` | microVM + vsock        | `/dev/kvm`           |
 
-| Backend       | Isolation              | Requires             | Best for                      |
-|---------------|------------------------|----------------------|-------------------------------|
-| `chroot`      | overlayfs + unshare    | Privileged container | Fly, ECS, any VPS             |
-| `firecracker` | microVM + vsock        | `/dev/kvm`           | Bare metal, stronger isolation|
+Set via `SQUASH_BACKEND` env var. The API is identical regardless of backend.
 
-## Bases
+## API
 
-| Base          | Size  | Package manager | libc  |
-|---------------|-------|-----------------|-------|
-| base-alpine   | ~8MB  | apk             | musl  |
-| base-debian   | ~30MB | apt             | glibc |
-| base-ubuntu   | ~45MB | apt             | glibc |
-| base-void     | ~20MB | xbps            | musl  |
+All endpoints live under `/cgi-bin/`. If `SQUASH_AUTH_TOKEN` is set, include
+`Authorization: Bearer <token>` on all requests.
+
+```
+GET    /cgi-bin/health                      {"status":"ok"}
+GET    /cgi-bin/api/sandboxes               list all
+POST   /cgi-bin/api/sandboxes               create
+GET    /cgi-bin/api/sandboxes/:id           info
+DELETE /cgi-bin/api/sandboxes/:id           destroy
+POST   /cgi-bin/api/sandboxes/:id/exec      run command
+POST   /cgi-bin/api/sandboxes/:id/activate  add module layer
+POST   /cgi-bin/api/sandboxes/:id/snapshot  checkpoint upper layer
+POST   /cgi-bin/api/sandboxes/:id/restore   restore from checkpoint
+GET    /cgi-bin/api/sandboxes/:id/logs      execution history
+GET    /cgi-bin/api/modules                 available modules
+```
+
+### Create
+
+```json
+{
+    "id": "dev",
+    "owner": "alice",
+    "layers": "000-base-alpine,100-python312",
+    "task": "run tests",
+    "cpu": 1.0,
+    "memory_mb": 512,
+    "max_lifetime_s": 1800,
+    "allow_net": ["api.anthropic.com", "pypi.org"]
+}
+```
+
+Only `id` and `layers` are required. Defaults: `cpu=2`, `memory_mb=1024`,
+`max_lifetime_s=0` (unlimited), `allow_net=[]` (all egress allowed).
+
+### Exec
+
+```json
+// POST /cgi-bin/api/sandboxes/dev/exec
+{"cmd": "python3 -c \"print(42)\"", "workdir": "/", "timeout": 300}
+
+// Response
+{"exit_code": 0, "stdout": "42\n", "stderr": "", "started": "...", "finished": "..."}
+```
+
+### Activate, Snapshot, Restore
+
+```json
+// POST .../activate  — add a module to a running sandbox (upper preserved)
+{"module": "100-nodejs22"}
+
+// POST .../snapshot  — compress upper/ to squashfs checkpoint
+{"label": "my-checkpoint"}
+
+// POST .../restore   — mount snapshot as layer, clear upper, remount
+{"label": "my-checkpoint"}
+```
 
 ## Modules
 
 | Range | Purpose           | Examples                          |
 |-------|-------------------|-----------------------------------|
 | 000   | Base rootfs       | base-alpine, base-debian          |
-| 01x   | System config     | dns, locale, timezone             |
 | 10x   | Language runtimes | python312, nodejs22, golang       |
 | 11x   | Build tools       | gcc, make, cmake, git             |
-| 12x   | Libraries         | openssl, libffi, zlib             |
 | 20x   | Services/daemons  | tailscale, nginx, postgres        |
 | 9xx   | Checkpoints       | (auto-generated from upper layer) |
 
-See [docs/modules.md](docs/modules.md) for presets, custom modules, and build workflows.
+Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale`
 
-## Operations
+Build from directory: `sq-mkmod from-dir /path/to/tree 110-my-tools`
 
+Build from running sandbox: `sq-mkmod from-sandbox my-sandbox 110-my-customizations`
+
+Available bases: `base-alpine` (~8MB, musl), `base-debian` (~30MB, glibc),
+`base-ubuntu` (~45MB, glibc), `base-void` (~20MB, musl).
+
+## Security
+
+**Resource limits** — `cpu` (cgroups v2 / VM config), `memory_mb` (OOM-killed
+on exceed), `max_lifetime_s` (auto-destroyed by `sq-reaper`).
+
+**Network egress** — `allow_net` field on create. `[]` = allow all (default),
+`["api.anthropic.com"]` = whitelist, `["none"]` = block all. Each sandbox
+gets its own network namespace (chroot) or tap device (firecracker) with
+iptables rules.
+
+**Secret proxy** — `sq-secret-proxy` injects real credentials into outbound
+HTTP requests without exposing them inside the sandbox. Configure
+`$SQUASH_DATA/secrets.json`:
+
+```json
+{
+    "secrets": {
+        "ANTHROPIC_API_KEY": {
+            "placeholder": "sk-placeholder-anthropic",
+            "value": "sk-ant-real-key-here",
+            "allowed_hosts": ["api.anthropic.com"]
+        }
+    }
+}
 ```
-create   -> mount base + modules as overlayfs -> chroot-ready sandbox
-exec     -> unshare + chroot into merged -> run command -> log result
-activate -> add module layer -> remount overlayfs (upper preserved)
-snapshot -> mksquashfs upper/ -> numbered checkpoint
-restore  -> mount checkpoint as layer -> clear upper -> remount
-destroy  -> unmount everything -> rm -rf
+
+Sandboxes see placeholder values. The proxy replaces them with real credentials
+only when the destination host is in `allowed_hosts`.
+
+## S3 Sync
+
+Optional. Set `SQUASH_S3_BUCKET` to enable. Works with AWS S3, Cloudflare R2,
+MinIO, Backblaze B2.
+
+Modules and snapshots auto-sync: push after build/snapshot, pull on miss.
+Manual: `sq-ctl push|pull|sync`.
+
+**Ephemeral mode** (`SQUASH_EPHEMERAL=1`): S3 is sole durable storage, no
+persistent volume needed. Sandboxes auto-snapshot to S3 on destroy and
+auto-restore on create.
+
+```sh
+# Stateless container — no -v flag needed
+docker run --rm --privileged \
+  -e SQUASH_EPHEMERAL=1 \
+  -e SQUASH_S3_BUCKET=my-squash \
+  -p 8080:8080 \
+  ghcr.io/pyrex41/sq-sandbox:latest
 ```
 
-## API
+## Deployment
 
-```
-GET    /cgi-bin/health                      status
-GET    /cgi-bin/api/sandboxes               list
-POST   /cgi-bin/api/sandboxes               create
-GET    /cgi-bin/api/sandboxes/:id           info
-DELETE /cgi-bin/api/sandboxes/:id           destroy
-POST   /cgi-bin/api/sandboxes/:id/exec      run command
-POST   /cgi-bin/api/sandboxes/:id/activate  add module
-POST   /cgi-bin/api/sandboxes/:id/snapshot  checkpoint
-POST   /cgi-bin/api/sandboxes/:id/restore   restore
-GET    /cgi-bin/api/sandboxes/:id/logs      history
-GET    /cgi-bin/api/modules                 available modules
+Runs as a privileged Docker container on any provider.
+
+```sh
+# Chroot backend (default)
+docker compose up -d
+
+# Firecracker backend (requires /dev/kvm)
+docker compose -f docker-compose.firecracker.yml up -d
 ```
 
-See [docs/api.md](docs/api.md) for request/response formats and field reference.
+Set env vars in `.env` or your shell. Works on any VPS, bare metal, ECS, Fly,
+etc. — anything that supports privileged containers.
 
 ## Environment Variables
 
 | Variable              | Default                       | Purpose                              |
 |-----------------------|-------------------------------|--------------------------------------|
-| `SQUASH_BACKEND`      | `chroot`                      | Backend: `chroot` or `firecracker`   |
+| `SQUASH_BACKEND`      | `chroot`                      | `chroot` or `firecracker`            |
 | `SQUASH_DATA`         | `/data`                       | Root directory for all state         |
 | `SQUASH_PORT`         | `8080`                        | HTTP API listen port                 |
 | `SQUASH_AUTH_TOKEN`   | `""` (no auth)                | Bearer token for API authentication  |
-| `SQUASH_API`          | `http://localhost:$SQUASH_PORT` | API base URL (used by `sq-ctl`)    |
 | `SQUASH_S3_BUCKET`    | `""` (disabled)               | S3 bucket for module/snapshot sync   |
 | `SQUASH_S3_ENDPOINT`  | `""` (AWS default)            | Custom endpoint for R2/MinIO/B2      |
 | `SQUASH_S3_REGION`    | `us-east-1`                   | AWS region                           |
 | `SQUASH_S3_PREFIX`    | `""`                          | Key prefix (e.g. `prod/`)           |
 | `SQUASH_EPHEMERAL`    | `""` (disabled)               | S3-backed ephemeral mode (set `1`)   |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
-| `TAILSCALE_HOSTNAME`  | `squash`                      | Hostname on tailnet                  |
 
-## Files
+## Not in scope
 
-```
-bin/
-  sq-init             first-boot: build base modules, provision VM (firecracker), init dirs
-  sq-mkbase           build a base squashfs from a docker image or debootstrap
-  sq-mkmod            build a module squashfs (from dir, preset, or sandbox)
-  sq-mkvm             build Firecracker guest rootfs + fetch kernel + binary
-  sq-firecracker      Firecracker VM lifecycle management (start, exec, stop)
-  sq-reaper           auto-destroy expired sandboxes (background)
-  sq-secret-proxy     credential-injecting HTTP proxy
-  sq-s3               S3 sync helper (push, pull, list, sync)
-  sq-ctl              CLI for the API
-  start-api           launch busybox httpd
-  setup-tailscale     join tailnet (optional)
-vm/
-  init                guest PID 1 — mounts squashfs layers, starts vsock listener
-  sq-vsock-handler    vsock command handler inside Firecracker guest
-cgi-bin/
-  common.sh           shared functions (mount, overlay, exec, checkpoint, backend dispatch)
-  api/sandboxes       REST handler
-  api/modules         module listing
-  health              health check
-deploy/
-  hetzner/            docker-compose + cloud-init (chroot mode, ~12 EUR/mo)
-  hetzner-baremetal/  docker-compose for bare metal with /dev/kvm (firecracker mode)
-  fly/                fly.toml ($62/mo)
-  aws/                ECS task definition ($170/mo)
-static/
-  index.html          API landing page
-docs/
-  plan-firecracker-and-security.md  design doc for Firecracker + security features
-Dockerfile            Alpine host image (chroot mode)
-Dockerfile.firecracker  Extended image with Firecracker + KVM deps
-entrypoint.sh         init -> reaper -> secret proxy -> api
-```
-
-## Security model
-
-The security features — network egress whitelisting, secret materialization via
-placeholder proxy, and per-sandbox resource limits — are inspired by
-[Deno Sandbox](https://deno.com/blog/introducing-deno-sandbox) and
-[coder/httpjail](https://github.com/coder/httpjail). Squash makes this pattern
-self-hostable: the same outbound-proxy-as-chokepoint approach, but running on
-your own infrastructure with either namespace isolation (chroot mode) or
-Firecracker microVMs.
-
-See [docs/security.md](docs/security.md) for details.
-
-## What this is NOT
-
-- Not for untrusted multi-tenant. Firecracker mode provides VM isolation, but
-  the system is designed for internal agents, CI, and dev environments.
-- Not PorteuX. Uses the same squashfs+overlayfs pattern, any distro as base.
-- No GPU passthrough or live migration between backends.
-
-## Documentation
-
-| Doc | Description |
-|-----|-------------|
-| [docs/api.md](docs/api.md) | Full API reference with request/response examples |
-| [docs/security.md](docs/security.md) | Resource limits, network egress, secret proxy |
-| [docs/modules.md](docs/modules.md) | Presets, custom modules, build workflows |
-| [docs/s3-sync.md](docs/s3-sync.md) | S3 sync architecture, providers, CLI |
-| [docs/deployment.md](docs/deployment.md) | Per-provider deployment guides |
+Not for untrusted multi-tenant. No GPU passthrough. No live migration between backends.

@@ -1,10 +1,8 @@
-# deploy/hetzner-baremetal/docker-compose.yml
-# Hetzner dedicated server (e.g. AX42 Ryzen 5 3600 / 64GB) ~€47/mo
-# Requires /dev/kvm for Firecracker microVM backend.
+# Firecracker backend (requires /dev/kvm — bare metal or nested virt)
 services:
   squash:
     build:
-      context: ../..
+      context: .
       dockerfile: Dockerfile.firecracker
     privileged: true
     restart: unless-stopped
@@ -13,11 +11,12 @@ services:
     devices: [/dev/kvm:/dev/kvm]
     environment:
       SQUASH_BACKEND: firecracker
-      SQUASH_AUTH_TOKEN: ${SQUASH_AUTH_TOKEN}
+      SQUASH_AUTH_TOKEN: ${SQUASH_AUTH_TOKEN:-}
       SQUASH_S3_BUCKET: ${SQUASH_S3_BUCKET:-}
       SQUASH_S3_ENDPOINT: ${SQUASH_S3_ENDPOINT:-}
       SQUASH_S3_REGION: ${SQUASH_S3_REGION:-us-east-1}
       SQUASH_S3_PREFIX: ${SQUASH_S3_PREFIX:-}
+      SQUASH_EPHEMERAL: ${SQUASH_EPHEMERAL:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       TAILSCALE_AUTHKEY: ${TAILSCALE_AUTHKEY:-}

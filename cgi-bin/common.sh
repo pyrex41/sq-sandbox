@@ -10,6 +10,20 @@ MODULES="$DATA/modules"
 SANDBOXES="$DATA/sandboxes"
 BACKEND="${SQUASH_BACKEND:-chroot}"
 
+# ── Input validation ──────────────────────────────────────────────────
+
+valid_id() {
+    case "$1" in "") return 1 ;; *[!a-zA-Z0-9_-]*) return 1 ;; esac
+}
+
+valid_label() {
+    case "$1" in "") return 1 ;; *[!a-zA-Z0-9_.-]*) return 1 ;; esac
+}
+
+valid_module() {
+    case "$1" in "") return 1 ;; *[!a-zA-Z0-9_.-]*) return 1 ;; esac
+}
+
 # ── S3 sync ──────────────────────────────────────────────────────────
 
 _s3_enabled() { [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; }
@@ -95,6 +109,12 @@ json_response() {
 json_ok()    { json_response 200 "$1"; }
 json_err()   { json_response "$1" "{\"error\":$(echo "$2" | jq -Rs .)}"; }
 read_body()  { dd bs=1 count="${CONTENT_LENGTH:-0}" 2>/dev/null; }
+require_json() {
+    case "${CONTENT_TYPE:-}" in
+        application/json*) ;;
+        *) json_err 415 "expected Content-Type: application/json"; exit 0 ;;
+    esac
+}
 
 check_auth() {
     local token="${SQUASH_AUTH_TOKEN:-}"
@@ -114,36 +134,33 @@ check_auth() {
 
 mod_path() { echo "$MODULES/$1.squashfs"; }
 mod_exists() {
+    valid_module "$1" || return 1
     [ -f "$(mod_path "$1")" ] && return 0
     _s3_enabled && sq-s3 pull "modules/$1.squashfs" "$(mod_path "$1")" 2>/dev/null && return 0
     return 1
 }
 
 list_modules() {
-    local out="["
-    local first=true
     local seen=""
-    for f in "$MODULES"/*.squashfs; do
-        [ ! -f "$f" ] && continue
-        local name=$(basename "$f" .squashfs)
-        local size=$(stat -c%s "$f" 2>/dev/null || echo 0)
-        $first || out="$out,"
-        first=false
-        out="$out{\"name\":\"$name\",\"size\":$size,\"location\":\"local\"}"
-        seen="$seen $name "
-    done
-    # Include remote-only modules from S3
-    if _s3_enabled; then
-        sq-s3 list "modules/" 2>/dev/null | while read -r key; do
-            [ -z "$key" ] && continue
-            local rname=$(basename "$key" .squashfs)
-            case "$seen" in *" $rname "*) continue ;; esac
-            $first || out="$out,"
-            first=false
-            out="$out{\"name\":\"$rname\",\"size\":0,\"location\":\"remote\"}"
+    {
+        for f in "$MODULES"/*.squashfs; do
+            [ ! -f "$f" ] && continue
+            local name=$(basename "$f" .squashfs)
+            local size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            jq -n --arg name "$name" --argjson size "$size" --arg loc "local" \
+                '{name:$name,size:$size,location:$loc}'
+            seen="$seen $name "
         done
-    fi
-    echo "$out]"
+        if _s3_enabled; then
+            sq-s3 list "modules/" 2>/dev/null | while read -r key; do
+                [ -z "$key" ] && continue
+                local rname=$(basename "$key" .squashfs)
+                case "$seen" in *" $rname "*) continue ;; esac
+                jq -n --arg name "$rname" --argjson size 0 --arg loc "remote" \
+                    '{name:$name,size:$size,location:$loc}'
+            done
+        fi
+    } | jq -s '.'
 }
 
 # ── Sandbox filesystem ─────────────────────────────────────────────────
@@ -230,6 +247,36 @@ _cgroup_teardown() {
     rmdir "$cg" 2>/dev/null || true
 }
 
+# ── Secret proxy injection ────────────────────────────────────────────
+
+_inject_secret_placeholders() {
+    local id="$1" s=$(sdir "$id")
+    local secrets_file="$DATA/secrets.json"
+    [ ! -f "$secrets_file" ] && return 0
+
+    local env_dir="$s/upper/etc/profile.d"
+    mkdir -p "$env_dir"
+
+    # Determine proxy address — use gateway IP if in a netns, otherwise localhost
+    local proxy_host="127.0.0.1"
+    local sandbox_index
+    sandbox_index=$(cat "$s/.meta/netns_index" 2>/dev/null || echo "")
+    if [ -n "$sandbox_index" ]; then
+        proxy_host="10.200.${sandbox_index}.1"
+    fi
+
+    # Generate env script with placeholders + proxy config
+    {
+        jq -r '.secrets | to_entries[] | "export \(.key)=\(.value.placeholder)"' \
+            "$secrets_file" 2>/dev/null
+        echo "export http_proxy=http://${proxy_host}:8888"
+        echo "export https_proxy=http://${proxy_host}:8888"
+        echo "export HTTP_PROXY=http://${proxy_host}:8888"
+        echo "export HTTPS_PROXY=http://${proxy_host}:8888"
+    } > "$env_dir/squash-secrets.sh"
+    chmod 644 "$env_dir/squash-secrets.sh"
+}
+
 # ── Network namespace helpers (Phase 3) ───────────────────────────────
 
 _chroot_setup_netns() {
@@ -237,26 +284,33 @@ _chroot_setup_netns() {
     local veth_host="sq-${id}-h"
     local veth_sandbox="sq-${id}-s"
 
-    # Derive a unique index from the sandbox id (hash to 1-254 range)
+    # Derive unique subnet index from sandbox id (hash to 1-254)
     local sandbox_index=$(printf '%s' "$id" | cksum | awk '{print ($1 % 254) + 1}')
+
+    # Create persistent network namespace
+    ip netns add "squash-$id"
 
     # Create veth pair
     ip link add "$veth_host" type veth peer name "$veth_sandbox"
+
+    # Move sandbox end INTO the namespace
+    ip link set "$veth_sandbox" netns "squash-$id"
+
+    # Configure host end
     ip addr add "10.200.${sandbox_index}.1/30" dev "$veth_host"
     ip link set "$veth_host" up
 
-    # Store the sandbox index for later use
-    echo "$sandbox_index" > "$(sdir "$id")/.meta/netns_index"
+    # Configure sandbox end (inside namespace)
+    ip netns exec "squash-$id" ip addr add "10.200.${sandbox_index}.2/30" dev "$veth_sandbox"
+    ip netns exec "squash-$id" ip link set "$veth_sandbox" up
+    ip netns exec "squash-$id" ip link set lo up
+    ip netns exec "squash-$id" ip route add default via "10.200.${sandbox_index}.1"
 
-    # Note: In production, the sandbox end would be moved into the sandbox's
-    # network namespace. For chroot mode with --net in unshare, the veth_sandbox
-    # end is configured when exec runs. Store interface names for cleanup.
+    # Store metadata for cleanup and exec
+    echo "$sandbox_index" > "$(sdir "$id")/.meta/netns_index"
     echo "$veth_host" > "$(sdir "$id")/.meta/veth_host"
     echo "$veth_sandbox" > "$(sdir "$id")/.meta/veth_sandbox"
-
-    # Configure the sandbox end on the host side for now
-    ip addr add "10.200.${sandbox_index}.2/30" dev "$veth_sandbox"
-    ip link set "$veth_sandbox" up
+    echo "squash-$id" > "$(sdir "$id")/.meta/netns_name"
 
     # Enable IP forwarding
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -264,7 +318,7 @@ _chroot_setup_netns() {
     # NAT on host for outbound
     iptables -t nat -A POSTROUTING -s "10.200.${sandbox_index}.0/30" -j MASQUERADE
 
-    # Egress filtering
+    # Egress filtering (applied to host-side veth — filters FORWARD traffic)
     if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
         _apply_egress_rules "$id" "$veth_host" "$allow_net"
     fi
@@ -311,16 +365,20 @@ _chroot_teardown_netns() {
     local sandbox_index
     sandbox_index=$(cat "$(sdir "$id")/.meta/netns_index" 2>/dev/null || echo "")
 
+    # Remove iptables rules
     iptables -D FORWARD -i "sq-${id}-h" -j "squash-${id}" 2>/dev/null || true
     iptables -F "squash-${id}" 2>/dev/null || true
     iptables -X "squash-${id}" 2>/dev/null || true
 
-    # Remove NAT rule
     if [ -n "$sandbox_index" ]; then
         iptables -t nat -D POSTROUTING -s "10.200.${sandbox_index}.0/30" -j MASQUERADE 2>/dev/null || true
     fi
 
+    # Delete veth pair (host end — peer is auto-deleted)
     ip link delete "sq-${id}-h" 2>/dev/null || true
+
+    # Delete network namespace
+    ip netns delete "squash-$id" 2>/dev/null || true
 }
 
 # ── Chroot backend: Create ────────────────────────────────────────────
@@ -373,16 +431,30 @@ _chroot_create_sandbox() {
         return 3
     }
 
-    # Seed /etc/resolv.conf for network access
-    if [ -f /etc/resolv.conf ]; then
-        mkdir -p "$s/upper/etc"
-        cp /etc/resolv.conf "$s/upper/etc/resolv.conf"
-    fi
-
     # Set up network namespace if allow_net is specified
     if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
         _chroot_setup_netns "$id" "$allow_net" 2>/dev/null || true
     fi
+
+    # Seed /etc/resolv.conf — use gateway IP if in a netns, otherwise host resolver
+    if [ -f /etc/resolv.conf ]; then
+        mkdir -p "$s/upper/etc"
+        if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
+            # In a network namespace, DNS goes through the gateway
+            local sandbox_index
+            sandbox_index=$(cat "$s/.meta/netns_index" 2>/dev/null || echo "")
+            if [ -n "$sandbox_index" ]; then
+                echo "nameserver 10.200.${sandbox_index}.1" > "$s/upper/etc/resolv.conf"
+            else
+                cp /etc/resolv.conf "$s/upper/etc/resolv.conf"
+            fi
+        else
+            cp /etc/resolv.conf "$s/upper/etc/resolv.conf"
+        fi
+    fi
+
+    # Inject secret placeholders + proxy config if secrets.json exists
+    _inject_secret_placeholders "$id"
 
     # Ephemeral mode: auto-restore from latest S3 snapshot
     if _ephemeral_enabled; then
@@ -419,11 +491,26 @@ _chroot_exec_in_sandbox() {
         echo $$ > "$cg/cgroup.procs" 2>/dev/null || true
     fi
 
-    timeout "$timeout_s" \
-        unshare --mount --pid --fork --map-root-user \
-        chroot "$s/merged" \
-        /bin/sh -c "cd $workdir 2>/dev/null || true; $cmd" \
-        >"$out" 2>"$err" || rc=$?
+    # Determine if sandbox has a network namespace
+    local netns_name=""
+    [ -f "$s/.meta/netns_name" ] && netns_name=$(cat "$s/.meta/netns_name")
+
+    # Build the exec command
+    # If we have a netns, enter it; otherwise run without network isolation
+    if [ -n "$netns_name" ] && ip netns list 2>/dev/null | grep -q "^$netns_name"; then
+        timeout "$timeout_s" \
+            ip netns exec "$netns_name" \
+            unshare --mount --pid --fork --map-root-user \
+            chroot "$s/merged" \
+            /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$workdir" "$cmd" \
+            >"$out" 2>"$err" || rc=$?
+    else
+        timeout "$timeout_s" \
+            unshare --mount --pid --fork --map-root-user \
+            chroot "$s/merged" \
+            /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$workdir" "$cmd" \
+            >"$out" 2>"$err" || rc=$?
+    fi
 
     local t1=$(date -Iseconds)
 
@@ -474,6 +561,7 @@ _chroot_activate_module() {
 
 _chroot_snapshot_sandbox() {
     local id="$1" label="${2:-$(date +%Y%m%d-%H%M%S)}"
+    valid_label "$label" || { echo "label: alphanumeric/dash/underscore/dot only" >&2; return 1; }
     local s=$(sdir "$id")
     local snapdir="$s/snapshots"
     local snapfile="$snapdir/$label.squashfs"
@@ -484,8 +572,8 @@ _chroot_snapshot_sandbox() {
     mksquashfs "$s/upper" "$snapfile" -comp gzip -b 256K -noappend -quiet
 
     local size=$(stat -c%s "$snapfile")
-    printf '{"label":"%s","created":"%s","size":%s}\n' \
-        "$label" "$(date -Iseconds)" "$size" >> "$s/.meta/snapshots.jsonl"
+    jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
+        '{label:$label,created:$created,size:$size}' >> "$s/.meta/snapshots.jsonl"
 
     _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
 
@@ -496,6 +584,7 @@ _chroot_snapshot_sandbox() {
 
 _chroot_restore_sandbox() {
     local id="$1" label="$2"
+    valid_label "$label" || { echo "label: alphanumeric/dash/underscore/dot only" >&2; return 1; }
     local s=$(sdir "$id")
     local snapfile="$s/snapshots/$label.squashfs"
 
@@ -670,6 +759,10 @@ _firecracker_create_sandbox() {
 
     sq-firecracker start "$id" "$cpu" "$memory_mb" $sqfs_args
 
+    # TODO: Firecracker secret injection requires passing proxy config via vsock
+    # or kernel cmdline. The guest would need to write /etc/profile.d/ on boot.
+    # For now, secrets.json-based proxy injection only works in chroot mode.
+
     # Ephemeral mode: auto-restore from latest S3 snapshot
     if _ephemeral_enabled; then
         local latest=$(_s3_latest_snapshot "$id")
@@ -731,6 +824,7 @@ _firecracker_activate_module() {
 
 _firecracker_snapshot_sandbox() {
     local id="$1" label="${2:-$(date +%Y%m%d-%H%M%S)}"
+    valid_label "$label" || { echo "label: alphanumeric/dash/underscore/dot only" >&2; return 1; }
     local s=$(sdir "$id")
     local snapdir="$s/snapshots"
     local snapfile="$snapdir/$label.squashfs"
@@ -742,8 +836,8 @@ _firecracker_snapshot_sandbox() {
     sq-firecracker exec "$id" "__squash_snapshot $snapfile" "/" "60"
 
     local size=$(stat -c%s "$snapfile" 2>/dev/null || echo 0)
-    printf '{"label":"%s","created":"%s","size":%s}\n' \
-        "$label" "$(date -Iseconds)" "$size" >> "$s/.meta/snapshots.jsonl"
+    jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
+        '{label:$label,created:$created,size:$size}' >> "$s/.meta/snapshots.jsonl"
 
     _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
 
@@ -754,6 +848,7 @@ _firecracker_snapshot_sandbox() {
 
 _firecracker_restore_sandbox() {
     local id="$1" label="$2"
+    valid_label "$label" || { echo "label: alphanumeric/dash/underscore/dot only" >&2; return 1; }
     local s=$(sdir "$id")
     local snapfile="$s/snapshots/$label.squashfs"
 
@@ -917,13 +1012,10 @@ sandbox_info() {
 }
 
 list_sandboxes() {
-    local out="[" first=true
-    for d in "$SANDBOXES"/*/; do
-        [ ! -d "$d/.meta" ] && continue
-        local id=$(basename "$d")
-        $first || out="$out,"
-        first=false
-        out="$out$(sandbox_info "$id")"
-    done
-    echo "$out]"
+    {
+        for d in "$SANDBOXES"/*/; do
+            [ ! -d "$d/.meta" ] && continue
+            sandbox_info "$(basename "$d")"
+        done
+    } | jq -s '.'
 }

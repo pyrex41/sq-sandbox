@@ -15,6 +15,7 @@ if [ -z "$id" ]; then
     case "$method" in
         GET) json_ok "$(list_sandboxes)" ;;
         POST)
+            require_json
             body=$(read_body)
             sb_id=$(echo "$body" | jq -r '.id // empty')
             owner=$(echo "$body" | jq -r '.owner // "anon"')
@@ -61,6 +62,7 @@ exists "$id" || { json_err 404 "not found: $id"; exit 0; }
 case "$action" in
     exec)
         [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        require_json
         body=$(read_body)
         cmd=$(echo "$body" | jq -r '.cmd // empty')
         wd=$(echo "$body" | jq -r '.workdir // "/"')
@@ -73,24 +75,28 @@ case "$action" in
 
     activate)
         [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        require_json
         body=$(read_body)
         mod=$(echo "$body" | jq -r '.module // empty')
         [ -z "$mod" ] && { json_err 400 "module required"; exit 0; }
+        valid_module "$mod" || { json_err 400 "module: alphanumeric/dash/underscore/dot only"; exit 0; }
         err=$(activate_module "$id" "$mod" 2>&1) || { json_err 400 "$err"; exit 0; }
         json_ok "$(sandbox_info "$id")"
         ;;
 
     snapshot)
         [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        require_json
         body=$(read_body)
         label=$(echo "$body" | jq -r '.label // empty')
         snapfile=$(snapshot_sandbox "$id" "$label" 2>&1) || { json_err 400 "$snapfile"; exit 0; }
         size=$(stat -c%s "$snapfile" 2>/dev/null || echo 0)
-        json_ok "{\"snapshot\":\"$(basename "$snapfile" .squashfs)\",\"size\":$size}"
+        json_ok "$(jq -n --arg snap "$(basename "$snapfile" .squashfs)" --argjson size "$size" '{snapshot:$snap,size:$size}')"
         ;;
 
     restore)
         [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        require_json
         body=$(read_body)
         label=$(echo "$body" | jq -r '.label // empty')
         [ -z "$label" ] && { json_err 400 "label required"; exit 0; }

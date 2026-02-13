@@ -30,8 +30,37 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// ── Limits ───────────────────────────────────────────────────────────
+
+const (
+	maxCertCacheSize   = 1000               // max cached TLS certs (bounded by allowed_hosts in practice)
+	maxResponseBody    = 512 * 1024 * 1024  // 512 MB max response relay
+	maxRequestBody     = 64 * 1024 * 1024   // 64 MB max request body
+	maxConcurrentConns = 512                // max simultaneous proxy connections
+	connIdleTimeout    = 2 * time.Minute    // idle timeout for MITM/tunnel connections
+	connReadTimeout    = 30 * time.Second   // read timeout per request in MITM loop
+	tunnelTimeout      = 10 * time.Minute   // max duration for a TCP tunnel
+)
+
+// connSemaphore limits concurrent proxy connections.
+var connSemaphore = make(chan struct{}, maxConcurrentConns)
+
+func acquireConn() bool {
+	select {
+	case connSemaphore <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseConn() {
+	<-connSemaphore
+}
 
 // ── Secret config ────────────────────────────────────────────────────
 
@@ -112,9 +141,42 @@ func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey) {
 	return caCert, caKey
 }
 
-func generateCert(host string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, cache *sync.Map) (*tls.Certificate, error) {
-	if cached, ok := cache.Load(host); ok {
-		return cached.(*tls.Certificate), nil
+// certCache is a bounded LRU-ish cert cache. When full, it's cleared entirely
+// (simple and sufficient — allowed_hosts is typically < 10 entries).
+type certCache struct {
+	mu    sync.RWMutex
+	certs map[string]*tls.Certificate
+	size  int
+}
+
+func newCertCache(maxSize int) *certCache {
+	return &certCache{
+		certs: make(map[string]*tls.Certificate),
+		size:  maxSize,
+	}
+}
+
+func (c *certCache) get(host string) (*tls.Certificate, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cert, ok := c.certs[host]
+	return cert, ok
+}
+
+func (c *certCache) put(host string, cert *tls.Certificate) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.certs) >= c.size {
+		// Evict all — simple reset, certs regenerate on demand
+		c.certs = make(map[string]*tls.Certificate)
+		log.Printf("cert cache full (%d), cleared", c.size)
+	}
+	c.certs[host] = cert
+}
+
+func generateCert(host string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, cache *certCache) (*tls.Certificate, error) {
+	if cert, ok := cache.get(host); ok {
+		return cert, nil
 	}
 
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -147,8 +209,42 @@ func generateCert(host string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey
 		PrivateKey:  leafKey,
 	}
 
-	cache.Store(host, tlsCert)
+	cache.put(host, tlsCert)
 	return tlsCert, nil
+}
+
+// ── Hop-by-hop headers ───────────────────────────────────────────────
+
+// Headers that must not be forwarded by a proxy (RFC 2616 §13.5.1).
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func stripHopByHop(h http.Header) {
+	for _, k := range hopByHopHeaders {
+		h.Del(k)
+	}
+}
+
+// ── Header replacement allow-list ────────────────────────────────────
+
+// Only replace placeholders in headers that carry credentials.
+// This prevents accidental secret leakage into arbitrary headers.
+var replaceableHeaders = map[string]bool{
+	"Authorization":       true,
+	"X-Api-Key":           true,
+	"Api-Key":             true,
+	"X-Auth-Token":        true,
+	"X-Access-Token":      true,
+	"Proxy-Authorization": true, // replaced before hop-by-hop strip
 }
 
 // ── Proxy handler ────────────────────────────────────────────────────
@@ -157,10 +253,21 @@ type ProxyHandler struct {
 	secrets   *SecretsFile
 	caCert    *x509.Certificate
 	caKey     *ecdsa.PrivateKey
-	certCache *sync.Map
+	certCache *certCache
+	active    atomic.Int64 // track active connections for diagnostics
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !acquireConn() {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	p.active.Add(1)
+	defer func() {
+		p.active.Add(-1)
+		releaseConn()
+	}()
+
 	if r.Method == http.MethodConnect {
 		p.handleConnect(w, r)
 	} else {
@@ -173,9 +280,15 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	host := r.URL.Hostname()
 
 	p.replaceHeaders(r, host)
+	stripHopByHop(r.Header)
 
-	// Build outbound request
-	outReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	// Limit request body
+	var body io.Reader = r.Body
+	if r.Body != nil {
+		body = io.LimitReader(r.Body, maxRequestBody)
+	}
+
+	outReq, err := http.NewRequest(r.Method, r.URL.String(), body)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -184,19 +297,20 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := http.DefaultTransport.RoundTrip(outReq)
 	if err != nil {
-		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	// Copy response headers, stripping hop-by-hop
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
+	stripHopByHop(w.Header())
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	io.Copy(w, io.LimitReader(resp.Body, maxResponseBody))
 }
 
 // handleConnect handles HTTPS CONNECT tunnels.
@@ -207,7 +321,6 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		host = h
 	}
 
-	// Hijack the connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -220,7 +333,6 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	// Send 200 Connection Established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	if p.secrets.hostAllowed(host) {
@@ -240,6 +352,7 @@ func (p *ProxyHandler) tlsMITM(clientConn net.Conn, host, hostPort string) {
 
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		Certificates: []tls.Certificate{*cert},
+		MinVersion:   tls.VersionTLS12,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("TLS handshake error for %s: %v", host, err)
@@ -255,36 +368,60 @@ func (p *ProxyHandler) tlsMITM(clientConn net.Conn, host, hostPort string) {
 	// Read requests from the TLS connection and forward them
 	br := bufio.NewReader(tlsConn)
 	for {
+		// Per-request read deadline
+		tlsConn.SetReadDeadline(time.Now().Add(connIdleTimeout))
+
 		req, err := http.ReadRequest(br)
 		if err != nil {
 			if err != io.EOF {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					// Idle timeout — clean close
+					return
+				}
 				log.Printf("read request error for %s: %v", host, err)
 			}
 			return
 		}
+
+		// Clear read deadline for the forwarding phase
+		tlsConn.SetReadDeadline(time.Time{})
 
 		// Fix up the request URL for forwarding
 		req.URL.Scheme = "https"
 		req.URL.Host = hostPort
 		req.RequestURI = ""
 
+		// Limit request body
+		if req.Body != nil {
+			req.Body = io.NopCloser(io.LimitReader(req.Body, maxRequestBody))
+		}
+
 		p.replaceHeaders(req, host)
+		stripHopByHop(req.Header)
+
+		// Set write deadline for sending response back
+		tlsConn.SetWriteDeadline(time.Now().Add(connReadTimeout))
 
 		resp, err := http.DefaultTransport.RoundTrip(req)
 		if err != nil {
 			log.Printf("upstream error for %s: %v", host, err)
-			// Write a 502 back to the client
 			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
 			return
 		}
 
+		// Limit response body before relaying
+		resp.Body = io.NopCloser(io.LimitReader(resp.Body, maxResponseBody))
+
 		err = resp.Write(tlsConn)
 		resp.Body.Close()
+
+		// Clear write deadline
+		tlsConn.SetWriteDeadline(time.Time{})
+
 		if err != nil {
 			return
 		}
 
-		// If the response or request indicates connection close, stop
 		if resp.Close || req.Close {
 			return
 		}
@@ -305,6 +442,11 @@ func (p *ProxyHandler) tcpTunnel(clientConn net.Conn, hostPort string) {
 	}
 	defer upstream.Close()
 
+	// Set absolute deadline on the tunnel to prevent indefinite connections
+	deadline := time.Now().Add(tunnelTimeout)
+	clientConn.SetDeadline(deadline)
+	upstream.SetDeadline(deadline)
+
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(upstream, clientConn)
@@ -317,16 +459,18 @@ func (p *ProxyHandler) tcpTunnel(clientConn net.Conn, hostPort string) {
 	<-done
 }
 
-// replaceHeaders scans request headers for placeholder strings and replaces
-// them with real values, but only if the destination host is in allowed_hosts.
+// replaceHeaders scans auth-related request headers for placeholder strings
+// and replaces them with real values, only if the destination host is allowed.
 func (p *ProxyHandler) replaceHeaders(r *http.Request, host string) {
 	for name, values := range r.Header {
+		if !replaceableHeaders[http.CanonicalHeaderKey(name)] {
+			continue
+		}
 		for i, v := range values {
 			for secretName, secret := range p.secrets.Secrets {
 				if !strings.Contains(v, secret.Placeholder) {
 					continue
 				}
-				// Check if host is allowed for this secret
 				allowed := false
 				for _, h := range secret.AllowedHosts {
 					if h == host {
@@ -336,9 +480,9 @@ func (p *ProxyHandler) replaceHeaders(r *http.Request, host string) {
 				}
 				if allowed {
 					values[i] = strings.ReplaceAll(v, secret.Placeholder, secret.Value)
-					log.Printf("replaced %s placeholder in %s for host %s", secretName, name, host)
+					log.Printf("replaced %s in %s for %s", secretName, name, host)
 				} else {
-					log.Printf("blocked %s replacement — host %s not allowed", secretName, host)
+					log.Printf("blocked %s — host %s not in allowed_hosts", secretName, host)
 				}
 			}
 		}
@@ -358,18 +502,20 @@ func main() {
 
 	secrets := loadSecrets(secretsFile)
 	caCert, caKey := loadCA(caDir)
-	certCache := &sync.Map{}
 
 	handler := &ProxyHandler{
 		secrets:   secrets,
 		caCert:    caCert,
 		caKey:     caKey,
-		certCache: certCache,
+		certCache: newCertCache(maxCertCacheSize),
 	}
 
 	server := &http.Server{
-		Addr:    ":8888",
-		Handler: handler,
+		Addr:         ":8888",
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 0, // disabled — CONNECT hijacks bypass this anyway
+		IdleTimeout:  connIdleTimeout,
 	}
 
 	log.Printf("sq-secret-proxy-https starting on :8888 (%d secrets configured)", len(secrets.Secrets))

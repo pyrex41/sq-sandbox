@@ -30,7 +30,7 @@ squash_it() {
     local out="$MODULES/$name.squashfs"
     mkdir -p "$MODULES"
     log "compressing $name ($(du -sh "$src" | cut -f1) → squashfs)"
-    mksquashfs "$src" "$out" -comp gzip -b 256K -noappend -quiet \
+    mksquashfs "$src" "$out" -comp zstd -Xcompression-level 15 -b 128K -noappend -quiet \
         -no-xattrs -no-exports
     log "done: $out ($(du -sh "$out" | cut -f1))"
     if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then

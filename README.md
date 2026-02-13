@@ -33,6 +33,13 @@ and the sandbox runtime. One Docker container runs:
 - The sandbox host (overlayfs mounts, cgroups, network namespaces, or Firecracker VMs)
 - Optional background services (reaper, secret proxy, Tailscale)
 
+**HTTPS secret injection** — Set `SQUASH_PROXY_HTTPS=1` to enable transparent
+HTTPS credential injection. The proxy generates per-host TLS certificates
+signed by an auto-generated CA, allowing it to inspect and rewrite HTTPS
+headers. Sandboxes automatically trust the CA. Real API keys never enter the
+sandbox — only placeholders are visible. Works with curl, Python, Node.js, Go,
+and any TLS client that trusts the system CA bundle.
+
 There is no separate "sandbox agent" or remote execution node. The container
 that serves the API is the same container that mounts squashfs layers and runs
 sandboxed commands. This means:
@@ -173,11 +180,17 @@ gets its own network namespace (chroot) or tap device (firecracker). When
 and DNS rate limiting (10/s) to prevent tunneling.
 
 **Secret proxy** — `sq-secret-proxy` injects real credentials into outbound
-HTTP requests without exposing them inside the sandbox. **HTTP only** — HTTPS
-connections bypass the proxy entirely. For HTTPS APIs, handle TLS termination
-outside the sandbox (API gateway, reverse proxy, or Firecracker backend where
-the host network handles TLS). Sandboxes sending HTTPS requests with
-placeholder values will simply fail; no secrets are leaked.
+requests without exposing them inside the sandbox. Two modes:
+
+- **HTTP mode** (default): Shell-based proxy replaces placeholders in plaintext
+  HTTP headers. HTTPS connections bypass the proxy. Suitable when TLS is
+  terminated externally (API gateway, reverse proxy, Firecracker backend).
+
+- **HTTPS mode** (`SQUASH_PROXY_HTTPS=1`): Go-based MITM proxy generates
+  per-host TLS certificates signed by a CA created at container startup. The CA
+  is automatically injected into each sandbox's trust store. All HTTPS API calls
+  to `allowed_hosts` get transparent credential injection. Non-allowed hosts are
+  tunneled through without inspection.
 
 Configure `$SQUASH_DATA/secrets.json`:
 
@@ -247,6 +260,7 @@ etc. — anything that supports privileged containers.
 | `SQUASH_EPHEMERAL`    | `""` (disabled)               | S3-backed ephemeral mode (set `1`)   |
 | `SQUASH_UPPER_LIMIT_MB` | `512`                      | Max size of writable upper layer (tmpfs) |
 | `SQUASH_MAX_SANDBOXES`  | `100`                      | Max concurrent sandboxes             |
+| `SQUASH_PROXY_HTTPS`  | `""` (disabled)               | HTTPS MITM proxy (set `1`)           |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
 
 ## Known limitations
@@ -256,8 +270,8 @@ etc. — anything that supports privileged containers.
 - **Chroot: UID mapping in privileged containers** — `--map-root-user` helps but
   effective isolation depends on the container runtime's user namespace config.
   Use Firecracker mode for stronger isolation.
-- **Secret proxy: HTTP only** — HTTPS connections bypass the proxy. Handle TLS
-  termination outside the sandbox or use the Firecracker backend.
+- **Secret proxy modes** — Default HTTP mode doesn't handle HTTPS. Set
+  `SQUASH_PROXY_HTTPS=1` for full HTTPS support (generates a MITM CA).
 - **Seccomp optional** — chroot relies on namespace isolation by default. Apply
   Docker's seccomp infrastructure at deployment time for additional syscall
   filtering: `docker run --privileged --security-opt seccomp=seccomp.json ...`

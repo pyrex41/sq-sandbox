@@ -76,7 +76,7 @@ EOF
     # (We can do this because Alpine minirootfs includes apk)
     log "pre-installing bash, curl, git"
     chroot "$rootfs" /sbin/apk --no-cache add \
-        bash coreutils curl wget git jq tar xz || {
+        bash coreutils curl wget git jq tar xz ca-certificates || {
         log "WARN: could not pre-install packages (no network in build?)"
         log "sandbox will need 'apk add' after creation"
     }

@@ -159,8 +159,25 @@ if [ -f "$DATA/secrets.json" ]; then
     grep -q "http_proxy" "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
         && _pass || _fail "no http_proxy"
 
+    _log "proxy CA cert injected into sandbox"
+    [ -f "$SANDBOXES/test-sec/upper/data/usr/local/share/ca-certificates/sq-proxy-ca.crt" ] \
+        && _pass || _skip "no CA (SQUASH_PROXY_HTTPS not enabled)"
+
+    _log "CA cert appended to system bundle"
+    grep -q "sq-secret-proxy CA" \
+        "$SANDBOXES/test-sec/upper/data/etc/ssl/certs/ca-certificates.crt" 2>/dev/null \
+        && _pass || _skip "no CA in system bundle (SQUASH_PROXY_HTTPS not enabled)"
+
+    _log "NODE_EXTRA_CA_CERTS set in env"
+    grep -q "NODE_EXTRA_CA_CERTS" \
+        "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
+        && _pass || _skip "no NODE_EXTRA_CA_CERTS (SQUASH_PROXY_HTTPS not enabled)"
+
     _api DELETE /cgi-bin/api/sandboxes/test-sec >/dev/null 2>&1
 else
+    _skip "no secrets.json"
+    _skip "no secrets.json"
+    _skip "no secrets.json"
     _skip "no secrets.json"
     _skip "no secrets.json"
 fi

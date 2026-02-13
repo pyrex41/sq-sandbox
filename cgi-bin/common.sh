@@ -276,6 +276,26 @@ _inject_secret_placeholders() {
         echo "export HTTPS_PROXY=http://${proxy_host}:8888"
     } > "$env_dir/squash-secrets.sh"
     chmod 644 "$env_dir/squash-secrets.sh"
+
+    # Inject proxy CA into sandbox trust store (only if HTTPS proxy is enabled)
+    local ca_cert="$DATA/proxy-ca/ca.crt"
+    if [ -f "$ca_cert" ]; then
+        # Copy CA cert into sandbox
+        mkdir -p "$s/upper/data/usr/local/share/ca-certificates"
+        cp "$ca_cert" "$s/upper/data/usr/local/share/ca-certificates/sq-proxy-ca.crt"
+
+        # Append to system CA bundle (used by curl, wget, python, etc.)
+        if [ -f "$s/merged/etc/ssl/certs/ca-certificates.crt" ]; then
+            mkdir -p "$s/upper/data/etc/ssl/certs"
+            cp "$s/merged/etc/ssl/certs/ca-certificates.crt" \
+                "$s/upper/data/etc/ssl/certs/ca-certificates.crt"
+            cat "$ca_cert" >> "$s/upper/data/etc/ssl/certs/ca-certificates.crt"
+        fi
+
+        # Env vars for runtimes that don't use the system bundle
+        echo "export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/sq-proxy-ca.crt" \
+            >> "$env_dir/squash-secrets.sh"
+    fi
 }
 
 # ── Network namespace helpers (Phase 3) ───────────────────────────────

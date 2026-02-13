@@ -3,6 +3,11 @@
 # assembled from squashfs layers.
 # Requires: --privileged (for mount, overlayfs, loop, unshare)
 
+# Build the HTTPS-capable secret proxy
+FROM golang:1.22-alpine AS proxy-build
+COPY proxy/ /build/
+RUN cd /build && CGO_ENABLED=0 go build -ldflags='-s -w' -o /sq-secret-proxy-https .
+
 FROM alpine:3.21
 
 RUN apk add --no-cache \
@@ -19,6 +24,7 @@ RUN apk add --no-cache \
     && apk add --no-cache aws-cli 2>/dev/null || true \
     && apk add --no-cache tailscale 2>/dev/null || true
 
+COPY --from=proxy-build /sq-secret-proxy-https /app/bin/sq-secret-proxy-https
 COPY bin/         /app/bin/
 COPY cgi-bin/     /app/cgi-bin/
 COPY entrypoint.sh /app/
@@ -40,6 +46,7 @@ ENV SQUASH_DATA=/data \
     SQUASH_EPHEMERAL="" \
     SQUASH_UPPER_LIMIT_MB=512 \
     SQUASH_MAX_SANDBOXES=100 \
+    SQUASH_PROXY_HTTPS="" \
     TAILSCALE_AUTHKEY="" \
     TAILSCALE_HOSTNAME="squash"
 

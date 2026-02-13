@@ -12,6 +12,7 @@ RUN apk add --no-cache \
     curl wget \
     coreutils \
     socat \
+    busybox-extras \
     && apk add --no-cache tailscale 2>/dev/null || true
 
 COPY bin/         /app/bin/

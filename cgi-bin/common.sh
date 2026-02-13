@@ -258,7 +258,7 @@ _chroot_create_sandbox() {
     done
 
     # Build directory tree
-    mkdir -p "$s"/{images,upper,work,merged,.meta/log}
+    mkdir -p "$s/images" "$s/upper" "$s/work" "$s/merged" "$s/.meta/log"
 
     # Metadata as files
     echo "$owner"          > "$s/.meta/owner"
@@ -390,7 +390,7 @@ _chroot_snapshot_sandbox() {
     [ -f "$snapfile" ] && { echo "exists: $label" >&2; return 1; }
 
     mkdir -p "$snapdir"
-    mksquashfs "$s/upper" "$snapfile" -comp zstd -b 256K -noappend -quiet
+    mksquashfs "$s/upper" "$snapfile" -comp gzip -b 256K -noappend -quiet
 
     local size=$(stat -c%s "$snapfile")
     printf '{"label":"%s","created":"%s","size":%s}\n' \

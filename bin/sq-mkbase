@@ -30,7 +30,7 @@ squash_it() {
     local out="$MODULES/$name.squashfs"
     mkdir -p "$MODULES"
     log "compressing $name ($(du -sh "$src" | cut -f1) → squashfs)"
-    mksquashfs "$src" "$out" -comp zstd -b 256K -noappend -quiet \
+    mksquashfs "$src" "$out" -comp gzip -b 256K -noappend -quiet \
         -no-xattrs -no-exports
     log "done: $out ($(du -sh "$out" | cut -f1))"
 }
@@ -45,12 +45,13 @@ build_alpine() {
 
     log "building Alpine $version base"
 
-    local url="https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/x86_64/alpine-minirootfs-$version.0-x86_64.tar.gz"
-    log "downloading minirootfs"
+    local arch=$(uname -m)
+    local url="https://dl-cdn.alpinelinux.org/alpine/v${version}/releases/$arch/alpine-minirootfs-$version.0-$arch.tar.gz"
+    log "downloading minirootfs ($arch)"
     wget -qO "$WORK/alpine.tar.gz" "$url" || {
-        # Try without patch version
-        url="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/"
-        local tarball=$(wget -qO- "$url" 2>/dev/null | grep -oP 'alpine-minirootfs-[\d.]+-x86_64\.tar\.gz' | tail -1)
+        # Try listing the releases directory
+        url="https://dl-cdn.alpinelinux.org/alpine/v${version}/releases/$arch/"
+        local tarball=$(wget -qO- "$url" 2>/dev/null | sed -n 's/.*href="\(alpine-minirootfs-[0-9.]*-'"$arch"'\.tar\.gz\)".*/\1/p' | tail -1)
         [ -z "$tarball" ] && die "could not find Alpine minirootfs"
         wget -qO "$WORK/alpine.tar.gz" "$url$tarball"
     }
@@ -59,8 +60,8 @@ build_alpine() {
 
     # Minimal config for sandbox use
     cat > "$rootfs/etc/apk/repositories" <<EOF
-https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main
-https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/community
+https://dl-cdn.alpinelinux.org/alpine/v${version}/main
+https://dl-cdn.alpinelinux.org/alpine/v${version}/community
 EOF
 
     # Pre-install essentials that every sandbox needs
@@ -120,7 +121,7 @@ build_void() {
     else
         # Download ROOTFS tarball directly
         local url="https://repo-default.voidlinux.org/live/current/"
-        local tarball=$(wget -qO- "$url" 2>/dev/null | grep -oP 'void-x86_64-musl-ROOTFS-[\d.]+\.tar\.xz' | tail -1)
+        local tarball=$(wget -qO- "$url" 2>/dev/null | sed -n 's/.*href="\(void-x86_64-musl-ROOTFS-[0-9.]*\.tar\.xz\)".*/\1/p' | tail -1)
         [ -z "$tarball" ] && die "could not find Void rootfs tarball"
         wget -qO "$WORK/void.tar.xz" "$url$tarball"
         tar xJf "$WORK/void.tar.xz" -C "$rootfs"

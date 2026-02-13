@@ -24,7 +24,7 @@ trap cleanup EXIT
 squash_it() {
     local src="$1" name="$2" out="$MODULES/$name.squashfs"
     mkdir -p "$MODULES"
-    mksquashfs "$src" "$out" -comp zstd -b 256K -noappend -quiet -no-xattrs -no-exports
+    mksquashfs "$src" "$out" -comp gzip -b 256K -noappend -quiet -no-xattrs -no-exports
     log "built: $name.squashfs ($(du -sh "$out" | cut -f1))"
 }
 
@@ -40,13 +40,14 @@ preset_python() {
 
     # python-build-standalone provides self-contained CPython
     local tag="20241002"
-    local url="https://github.com/indygreg/python-build-standalone/releases/download/$tag/cpython-${ver}+${tag}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+    local pyarch=$(uname -m); case "$pyarch" in aarch64) pyarch=aarch64;; x86_64) pyarch=x86_64;; esac
+    local url="https://github.com/indygreg/python-build-standalone/releases/download/$tag/cpython-${ver}+${tag}-${pyarch}-unknown-linux-gnu-install_only_stripped.tar.gz"
 
     log "downloading python-build-standalone"
     wget -qO "$WORK/python.tar.gz" "$url" 2>/dev/null || {
         # Fallback: try latest tag pattern
         log "WARN: exact URL failed, trying alternate"
-        url="https://github.com/indygreg/python-build-standalone/releases/latest/download/cpython-${ver}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+        url="https://github.com/indygreg/python-build-standalone/releases/latest/download/cpython-${ver}-${pyarch}-unknown-linux-gnu-install_only_stripped.tar.gz"
         wget -qO "$WORK/python.tar.gz" "$url" 2>/dev/null || {
             log "WARN: pre-built download failed."
             log "Alternative: create sandbox, run 'apk add python3', then:"
@@ -73,7 +74,8 @@ preset_nodejs() {
     log "building Node.js $ver module"
 
     local index="https://nodejs.org/dist/latest-v${ver}.x/"
-    local tarball=$(wget -qO- "$index" 2>/dev/null | grep -oP 'node-v[\d.]+-linux-x64\.tar\.xz' | head -1)
+    local arch=$(uname -m); case "$arch" in aarch64) arch=arm64;; x86_64) arch=x64;; esac
+    local tarball=$(wget -qO- "$index" 2>/dev/null | sed -n 's/.*href="\(node-v[0-9.]*-linux-'"$arch"'\.tar\.xz\)".*/\1/p' | head -1)
     [ -z "$tarball" ] && die "no Node.js $ver found"
 
     log "downloading $tarball"
@@ -95,7 +97,8 @@ preset_golang() {
     log "building Go module"
 
     local page=$(wget -qO- "https://go.dev/dl/" 2>/dev/null)
-    local tarball=$(echo "$page" | grep -oP 'go[\d.]+\.linux-amd64\.tar\.gz' | head -1)
+    local goarch=$(uname -m); case "$goarch" in aarch64) goarch=arm64;; x86_64) goarch=amd64;; esac
+    local tarball=$(echo "$page" | sed -n 's/.*href="\(go[0-9.]*\.linux-'"$goarch"'\.tar\.gz\)".*/\1/p' | head -1)
     [ -z "$tarball" ] && die "no Go tarball found"
 
     log "downloading $tarball"
@@ -151,7 +154,8 @@ preset_tailscale() {
     log "building Tailscale module"
 
     local page=$(wget -qO- "https://pkgs.tailscale.com/stable/" 2>/dev/null)
-    local tarball=$(echo "$page" | grep -oP 'tailscale_[\d.]+_amd64\.tgz' | head -1)
+    local tsarch=$(uname -m); case "$tsarch" in aarch64) tsarch=arm64;; x86_64) tsarch=amd64;; esac
+    local tarball=$(echo "$page" | sed -n 's/.*href="\(tailscale_[0-9.]*_'"$tsarch"'\.tgz\)".*/\1/p' | head -1)
     [ -z "$tarball" ] && die "no Tailscale tarball found"
 
     log "downloading $tarball"
@@ -186,8 +190,8 @@ mkdir -p "$WORK"
 case "${1:-help}" in
     preset)
         case "${2:-}" in
-            python*)     preset_python "$(echo "$2" | grep -oP '[\d.]+$' || echo 3.12)" ;;
-            node*|js*)   preset_nodejs "$(echo "$2" | grep -oP '[\d]+$' || echo 22)" ;;
+            python*)     preset_python "$(echo "$2" | sed -n 's/.*\([0-9][0-9.]*\)$/\1/p')" ;;
+            node*|js*)   preset_nodejs "$(echo "$2" | sed -n 's/.*\([0-9][0-9]*\)$/\1/p')" ;;
             go|golang)   preset_golang ;;
             rust)        preset_rust ;;
             build*|dev*) preset_build_tools ;;

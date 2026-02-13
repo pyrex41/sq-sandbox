@@ -55,10 +55,9 @@ The base layer is the root filesystem. Any Linux distro works:
 | Base               | Size  | Package manager | libc  |
 |--------------------|-------|-----------------|-------|
 | base-alpine        | ~8MB  | apk             | musl  |
-| base-debian-slim   | ~30MB | apt             | glibc |
-| base-ubuntu-noble  | ~45MB | apt             | glibc |
+| base-debian        | ~30MB | apt             | glibc |
+| base-ubuntu        | ~45MB | apt             | glibc |
 | base-void          | ~20MB | xbps            | musl  |
-| base-porteux-core  | ~200MB| installpkg      | glibc |
 
 Default: `base-alpine`. Override per sandbox.
 
@@ -68,7 +67,7 @@ Numbered layers stacked on the base:
 
 | Range   | Purpose              | Examples                          |
 |---------|----------------------|-----------------------------------|
-| 000     | Base rootfs          | base-alpine, base-debian-slim     |
+| 000     | Base rootfs          | base-alpine, base-debian           |
 | 01x     | System config        | dns, locale, timezone             |
 | 10x     | Language runtimes    | python312, nodejs22, golang       |
 | 11x     | Build tools          | gcc, make, cmake, git             |
@@ -147,7 +146,6 @@ POST   /cgi-bin/api/sandboxes/:id/snapshot  checkpoint
 POST   /cgi-bin/api/sandboxes/:id/restore   restore
 GET    /cgi-bin/api/sandboxes/:id/logs    history
 GET    /cgi-bin/api/modules               available modules
-POST   /cgi-bin/api/modules/build         build module from preset
 ```
 
 ### Create sandbox (POST)
@@ -157,6 +155,7 @@ POST   /cgi-bin/api/modules/build         build module from preset
     "id": "dev",
     "owner": "alice",
     "layers": "000-base-alpine,100-python312",
+    "task": "run tests",
     "cpu": 1.0,
     "memory_mb": 512,
     "max_lifetime_s": 1800,
@@ -164,7 +163,45 @@ POST   /cgi-bin/api/modules/build         build module from preset
 }
 ```
 
-All fields except `id` and `layers` are optional.
+All fields except `id` and `layers` are optional. `layers` accepts a
+comma-separated string or a JSON array.
+
+### Sandbox info (GET /sandboxes/:id)
+
+```json
+{
+    "id": "dev",
+    "owner": "alice",
+    "task": "run tests",
+    "layers": ["000-base-alpine", "100-python312"],
+    "created": "2025-01-01T00:00:00Z",
+    "last_active": "2025-01-01T00:05:00Z",
+    "mounted": true,
+    "exec_count": 3,
+    "upper_bytes": 4096,
+    "snapshots": [],
+    "active_snapshot": null,
+    "cpu": 1.0,
+    "memory_mb": 512,
+    "max_lifetime_s": 1800,
+    "allow_net": ["api.anthropic.com", "pypi.org"]
+}
+```
+
+### Exec response (POST /sandboxes/:id/exec)
+
+```json
+{
+    "exit_code": 0,
+    "stdout": "hello\n",
+    "stderr": "",
+    "started": "2025-01-01T00:05:00Z",
+    "ended": "2025-01-01T00:05:01Z",
+    "duration_ms": 1000
+}
+```
+
+Output is truncated to 64KB per stream.
 
 ## Files
 
@@ -186,17 +223,50 @@ vm/
 cgi-bin/
   common.sh           shared functions (mount, overlay, exec, checkpoint, backend dispatch)
   api/sandboxes       REST handler
-  api/modules         module listing + build trigger
+  api/modules         module listing
   health              health check
 deploy/
   hetzner/            docker-compose + cloud-init (chroot mode, ~12 EUR/mo)
   hetzner-baremetal/  docker-compose for bare metal with /dev/kvm (firecracker mode)
   fly/                fly.toml ($62/mo)
   aws/                ECS task definition ($170/mo)
+static/
+  index.html          API landing page
+docs/
+  plan-firecracker-and-security.md  design doc for Firecracker + security features
 Dockerfile            Alpine host image (chroot mode)
 Dockerfile.firecracker  Extended image with Firecracker + KVM deps
 entrypoint.sh         init -> reaper -> secret proxy -> api
 ```
+
+## Environment Variables
+
+| Variable              | Default                       | Purpose                              |
+|-----------------------|-------------------------------|--------------------------------------|
+| `SQUASH_BACKEND`      | `chroot`                      | Backend: `chroot` or `firecracker`   |
+| `SQUASH_DATA`         | `/data`                       | Root directory for all state         |
+| `SQUASH_PORT`         | `8080`                        | HTTP API listen port                 |
+| `SQUASH_AUTH_TOKEN`   | `""` (no auth)                | Bearer token for API authentication  |
+| `SQUASH_API`          | `http://localhost:$SQUASH_PORT` | API base URL (used by `sq-ctl`)    |
+| `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
+| `TAILSCALE_HOSTNAME`  | `squash`                      | Hostname on tailnet                  |
+
+## Module Presets
+
+Build with `sq-mkmod preset <name>`:
+
+| Preset        | Module name      | Source                              |
+|---------------|------------------|-------------------------------------|
+| `python3.12`  | `100-python312`  | python-build-standalone (GitHub)    |
+| `nodejs22`    | `100-nodejs22`   | nodejs.org binary                   |
+| `golang`      | `100-golang`     | go.dev binary                       |
+| `tailscale`   | `200-tailscale`  | pkgs.tailscale.com binary           |
+
+`rust` and `build-tools` presets exist as stubs — they print instructions to
+install inside a running sandbox instead.
+
+Custom modules: `sq-mkmod from-dir <path> <NNN-name>` or
+`sq-mkmod from-sandbox <id> <NNN-name>` to package a sandbox's upper layer.
 
 ## What this is NOT
 

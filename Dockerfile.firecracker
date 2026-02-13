@@ -37,6 +37,7 @@ ENV SQUASH_DATA=/data \
     SQUASH_S3_ENDPOINT="" \
     SQUASH_S3_REGION="us-east-1" \
     SQUASH_S3_PREFIX="" \
+    SQUASH_EPHEMERAL="" \
     TAILSCALE_AUTHKEY="" \
     TAILSCALE_HOSTNAME="squash"
 

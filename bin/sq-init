@@ -39,6 +39,9 @@ if [ "${SQUASH_BACKEND:-chroot}" = "firecracker" ]; then
 fi
 
 # ── Remount surviving sandboxes ────────────────────────────────────────
+if [ "${SQUASH_EPHEMERAL:-}" = "1" ]; then
+    log "ephemeral mode: skipping sandbox remount (S3 is source of truth)"
+else
 for sdir in "$SANDBOXES"/*/; do
     [ ! -f "$sdir/.meta/layers" ] && continue
     id=$(basename "$sdir")
@@ -101,5 +104,6 @@ for sdir in "$SANDBOXES"/*/; do
             "$sdir/merged" 2>/dev/null && log "$id: ok" || log "$id: FAILED"
     fi
 done
+fi
 
 log "ready — modules: $(ls -1 "$MODULES"/*.squashfs 2>/dev/null | wc -l), sandboxes: $(ls -1d "$SANDBOXES"/*/ 2>/dev/null | wc -l)"

@@ -14,6 +14,66 @@ BACKEND="${SQUASH_BACKEND:-chroot}"
 
 _s3_enabled() { [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; }
 
+# ── Ephemeral mode ────────────────────────────────────────────────────
+
+_ephemeral_enabled() { [ "${SQUASH_EPHEMERAL:-}" = "1" ] && _s3_enabled; }
+
+_s3_push_manifest() {
+    local id="$1" s=$(sdir "$id")
+    [ ! -d "$s/.meta" ] && return 1
+    local tmp=$(mktemp)
+    local layers=$(cat "$s/.meta/layers" 2>/dev/null || echo "")
+    local owner=$(cat "$s/.meta/owner" 2>/dev/null || echo "")
+    local task=$(cat "$s/.meta/task" 2>/dev/null || echo "")
+    local cpu=$(cat "$s/.meta/cpu" 2>/dev/null || echo "2")
+    local memory_mb=$(cat "$s/.meta/memory_mb" 2>/dev/null || echo "1024")
+    local max_lifetime_s=$(cat "$s/.meta/max_lifetime_s" 2>/dev/null || echo "0")
+    local allow_net=$(cat "$s/.meta/allow_net" 2>/dev/null || echo "[]")
+    echo "$allow_net" | jq empty 2>/dev/null || allow_net="[]"
+    local latest_snapshot=$(_s3_latest_snapshot "$id" 2>/dev/null || echo "")
+    jq -n \
+        --arg id "$id" \
+        --arg layers "$layers" \
+        --arg owner "$owner" \
+        --arg task "$task" \
+        --argjson cpu "$cpu" \
+        --argjson memory_mb "$memory_mb" \
+        --argjson max_lifetime_s "$max_lifetime_s" \
+        --argjson allow_net "$allow_net" \
+        --arg latest_snapshot "$latest_snapshot" \
+        '{id:$id,layers:$layers,owner:$owner,task:$task,cpu:$cpu,
+          memory_mb:$memory_mb,max_lifetime_s:$max_lifetime_s,
+          allow_net:$allow_net,latest_snapshot:$latest_snapshot}' \
+        > "$tmp"
+    sq-s3 push "$tmp" "sandboxes/$id/manifest.json"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+_s3_pull_manifest() {
+    local id="$1"
+    local tmp=$(mktemp)
+    sq-s3 pull "sandboxes/$id/manifest.json" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    echo "$tmp"
+}
+
+_s3_latest_snapshot() {
+    local id="$1"
+    sq-s3 list "sandboxes/$id/snapshots/" 2>/dev/null \
+        | sed -n 's|.*/\([^/]*\)\.squashfs$|\1|p' \
+        | sort \
+        | tail -1
+}
+
+_ephemeral_stage_and_push() {
+    local src="$1" key="$2"
+    local tmp="/tmp/sq-push-$(basename "$src")"
+    cp "$src" "$tmp"
+    # Background push from temp copy; self-cleans after
+    (sq-s3 push "$tmp" "$key" >> "$DATA/.s3-push.log" 2>&1; rm -f "$tmp") &
+}
+
 # ── HTTP ───────────────────────────────────────────────────────────────
 
 json_response() {
@@ -323,6 +383,16 @@ _chroot_create_sandbox() {
     if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
         _chroot_setup_netns "$id" "$allow_net" 2>/dev/null || true
     fi
+
+    # Ephemeral mode: auto-restore from latest S3 snapshot
+    if _ephemeral_enabled; then
+        local latest=$(_s3_latest_snapshot "$id")
+        if [ -n "$latest" ]; then
+            echo "[ephemeral] restoring $id from S3 snapshot: $latest" >&2
+            _chroot_restore_sandbox "$id" "$latest" || \
+                echo "[ephemeral] restore failed, continuing with clean sandbox" >&2
+        fi
+    fi
 }
 
 # ── Chroot backend: Execute ───────────────────────────────────────────
@@ -474,6 +544,22 @@ _chroot_destroy_sandbox() {
     local id="$1" s=$(sdir "$id")
     [ ! -d "$s" ] && return 0
 
+    # Ephemeral mode: auto-snapshot to S3 before destroying
+    if _ephemeral_enabled && [ -d "$s/upper" ]; then
+        local upper_files=$(find "$s/upper" -mindepth 1 \
+            -not -path "$s/upper/etc" \
+            -not -path "$s/upper/etc/resolv.conf" | head -1)
+        if [ -n "$upper_files" ]; then
+            echo "[ephemeral] auto-snapshot $id before destroy" >&2
+            local snapfile=$(_chroot_snapshot_sandbox "$id" 2>/dev/null) || true
+            if [ -n "$snapfile" ] && [ -f "$snapfile" ]; then
+                _ephemeral_stage_and_push "$snapfile" \
+                    "sandboxes/$id/snapshots/$(basename "$snapfile")"
+            fi
+        fi
+        _s3_push_manifest "$id" 2>/dev/null || true
+    fi
+
     # Tear down network namespace
     _chroot_teardown_netns "$id" 2>/dev/null || true
 
@@ -583,6 +669,16 @@ _firecracker_create_sandbox() {
     done
 
     sq-firecracker start "$id" "$cpu" "$memory_mb" $sqfs_args
+
+    # Ephemeral mode: auto-restore from latest S3 snapshot
+    if _ephemeral_enabled; then
+        local latest=$(_s3_latest_snapshot "$id")
+        if [ -n "$latest" ]; then
+            echo "[ephemeral] restoring $id from S3 snapshot: $latest" >&2
+            _firecracker_restore_sandbox "$id" "$latest" || \
+                echo "[ephemeral] restore failed, continuing with clean sandbox" >&2
+        fi
+    fi
 }
 
 # ── Firecracker backend: Execute ─────────────────────────────────────
@@ -695,6 +791,18 @@ _firecracker_restore_sandbox() {
 _firecracker_destroy_sandbox() {
     local id="$1" s=$(sdir "$id")
     [ ! -d "$s" ] && return 0
+
+    # Ephemeral mode: auto-snapshot to S3 before destroying
+    if _ephemeral_enabled; then
+        echo "[ephemeral] auto-snapshot $id before destroy" >&2
+        local snapfile=$(_firecracker_snapshot_sandbox "$id" 2>/dev/null) || true
+        if [ -n "$snapfile" ] && [ -f "$snapfile" ]; then
+            _ephemeral_stage_and_push "$snapfile" \
+                "sandboxes/$id/snapshots/$(basename "$snapfile")"
+        fi
+        _s3_push_manifest "$id" 2>/dev/null || true
+    fi
+
     sq-firecracker stop "$id" 2>/dev/null || true
     _firecracker_teardown_network "$id" 2>/dev/null || true
     rm -rf "$s"

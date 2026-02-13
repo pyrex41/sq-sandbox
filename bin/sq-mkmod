@@ -1,0 +1,231 @@
+#!/bin/sh
+# squash/bin/sq-mkmod — build add-on module layers
+#
+# Usage:
+#   sq-mkmod preset <name>                 Build from preset
+#   sq-mkmod from-dir <path> <NNN-name>    Squash a directory
+#   sq-mkmod from-sandbox <id> <NNN-name>  Package sandbox upper as module
+#   sq-mkmod list                          Show presets
+#
+# Presets download pre-built binaries and package them as squashfs layers.
+# When stacked on a base, the sandbox gains that runtime.
+
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+MODULES="$DATA/modules"
+WORK="/tmp/sq-mkmod.$$"
+
+log() { echo "[sq-mkmod] $*"; }
+die() { echo "[sq-mkmod] ERROR: $*" >&2; cleanup; exit 1; }
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+squash_it() {
+    local src="$1" name="$2" out="$MODULES/$name.squashfs"
+    mkdir -p "$MODULES"
+    mksquashfs "$src" "$out" -comp zstd -b 256K -noappend -quiet -no-xattrs -no-exports
+    log "built: $name.squashfs ($(du -sh "$out" | cut -f1))"
+}
+
+# ── Python ─────────────────────────────────────────────────────────────
+# Uses python-build-standalone for portable, pre-built CPython.
+
+preset_python() {
+    local ver="${1:-3.12}" root="$WORK/rootfs"
+    local name="100-python${ver//./}"
+    mkdir -p "$root/usr/local"
+
+    log "building Python $ver module"
+
+    # python-build-standalone provides self-contained CPython
+    local tag="20241002"
+    local url="https://github.com/indygreg/python-build-standalone/releases/download/$tag/cpython-${ver}+${tag}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+
+    log "downloading python-build-standalone"
+    wget -qO "$WORK/python.tar.gz" "$url" 2>/dev/null || {
+        # Fallback: try latest tag pattern
+        log "WARN: exact URL failed, trying alternate"
+        url="https://github.com/indygreg/python-build-standalone/releases/latest/download/cpython-${ver}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+        wget -qO "$WORK/python.tar.gz" "$url" 2>/dev/null || {
+            log "WARN: pre-built download failed."
+            log "Alternative: create sandbox, run 'apk add python3', then:"
+            log "  sq-mkmod from-sandbox <id> $name"
+            die "download failed"
+        }
+    }
+
+    tar xzf "$WORK/python.tar.gz" -C "$root/usr/local" --strip-components=1
+
+    # Ensure pip
+    "$root/usr/local/bin/python3" -m ensurepip 2>/dev/null || true
+
+    squash_it "$root" "$name"
+}
+
+# ── Node.js ────────────────────────────────────────────────────────────
+
+preset_nodejs() {
+    local ver="${1:-22}" root="$WORK/rootfs"
+    local name="100-nodejs${ver}"
+    mkdir -p "$root/usr/local"
+
+    log "building Node.js $ver module"
+
+    local index="https://nodejs.org/dist/latest-v${ver}.x/"
+    local tarball=$(wget -qO- "$index" 2>/dev/null | grep -oP 'node-v[\d.]+-linux-x64\.tar\.xz' | head -1)
+    [ -z "$tarball" ] && die "no Node.js $ver found"
+
+    log "downloading $tarball"
+    wget -qO "$WORK/node.tar.xz" "$index$tarball"
+    tar xJf "$WORK/node.tar.xz" -C "$WORK"
+    local extracted=$(ls -1d "$WORK"/node-v* | head -1)
+    cp -a "$extracted"/{bin,lib,include} "$root/usr/local/" 2>/dev/null || true
+
+    squash_it "$root" "$name"
+}
+
+# ── Go ─────────────────────────────────────────────────────────────────
+
+preset_golang() {
+    local root="$WORK/rootfs"
+    local name="100-golang"
+    mkdir -p "$root/usr/local"
+
+    log "building Go module"
+
+    local page=$(wget -qO- "https://go.dev/dl/" 2>/dev/null)
+    local tarball=$(echo "$page" | grep -oP 'go[\d.]+\.linux-amd64\.tar\.gz' | head -1)
+    [ -z "$tarball" ] && die "no Go tarball found"
+
+    log "downloading $tarball"
+    wget -qO "$WORK/go.tar.gz" "https://go.dev/dl/$tarball"
+    tar xzf "$WORK/go.tar.gz" -C "$root/usr/local"
+
+    # PATH helper
+    mkdir -p "$root/etc/profile.d"
+    echo 'export PATH=/usr/local/go/bin:$PATH GOPATH=$HOME/go' > "$root/etc/profile.d/go.sh"
+
+    squash_it "$root" "$name"
+}
+
+# ── Rust ───────────────────────────────────────────────────────────────
+
+preset_rust() {
+    local root="$WORK/rootfs"
+    local name="100-rust"
+    mkdir -p "$root/usr/local"
+
+    log "building Rust module"
+    log "NOTE: Rust is best installed inside a sandbox via rustup."
+    log "  Create sandbox with base + 110-build-tools, then:"
+    log "  exec: curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y"
+    log "  sq-mkmod from-sandbox <id> $name"
+
+    die "use sandbox-based install for Rust"
+}
+
+# ── Build tools (gcc, make, git, etc.) ─────────────────────────────────
+# This is base-specific. For Alpine, we pack the dev packages.
+
+preset_build_tools() {
+    local root="$WORK/rootfs"
+    local name="110-build-tools"
+    mkdir -p "$root"
+
+    log "building build-tools module"
+    log "NOTE: this module is base-specific."
+    log "For Alpine: create sandbox, exec 'apk add build-base git cmake'"
+    log "Then: sq-mkmod from-sandbox <id> $name"
+
+    die "use sandbox-based install for build-tools"
+}
+
+# ── Tailscale ──────────────────────────────────────────────────────────
+
+preset_tailscale() {
+    local root="$WORK/rootfs"
+    local name="200-tailscale"
+    mkdir -p "$root/usr/local/bin" "$root/usr/local/sbin"
+
+    log "building Tailscale module"
+
+    local page=$(wget -qO- "https://pkgs.tailscale.com/stable/" 2>/dev/null)
+    local tarball=$(echo "$page" | grep -oP 'tailscale_[\d.]+_amd64\.tgz' | head -1)
+    [ -z "$tarball" ] && die "no Tailscale tarball found"
+
+    log "downloading $tarball"
+    wget -qO "$WORK/ts.tgz" "https://pkgs.tailscale.com/stable/$tarball"
+    tar xzf "$WORK/ts.tgz" -C "$WORK"
+
+    local extracted=$(ls -1d "$WORK"/tailscale_* | head -1)
+    cp "$extracted/tailscale"  "$root/usr/local/bin/"
+    cp "$extracted/tailscaled" "$root/usr/local/sbin/"
+
+    squash_it "$root" "$name"
+}
+
+# ── From directory or sandbox ──────────────────────────────────────────
+
+from_dir() {
+    local src="$1" name="$2"
+    [ -d "$src" ] || die "not a directory: $src"
+    squash_it "$src" "$name"
+}
+
+from_sandbox() {
+    local id="$1" name="$2"
+    local upper="$DATA/sandboxes/$id/upper"
+    [ -d "$upper" ] || die "sandbox not found or empty upper: $id"
+    squash_it "$upper" "$name"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────
+mkdir -p "$WORK"
+
+case "${1:-help}" in
+    preset)
+        case "${2:-}" in
+            python*)     preset_python "$(echo "$2" | grep -oP '[\d.]+$' || echo 3.12)" ;;
+            node*|js*)   preset_nodejs "$(echo "$2" | grep -oP '[\d]+$' || echo 22)" ;;
+            go|golang)   preset_golang ;;
+            rust)        preset_rust ;;
+            build*|dev*) preset_build_tools ;;
+            tailscale)   preset_tailscale ;;
+            *)           die "unknown preset: ${2:-}. Run '$0 list'" ;;
+        esac
+        ;;
+    from-dir)
+        [ $# -lt 3 ] && die "usage: $0 from-dir <path> <NNN-name>"
+        from_dir "$2" "$3"
+        ;;
+    from-sandbox)
+        [ $# -lt 3 ] && die "usage: $0 from-sandbox <sandbox-id> <NNN-name>"
+        from_sandbox "$2" "$3"
+        ;;
+    list)
+        cat <<'EOF'
+presets:
+  python3.12   → 100-python312.squashfs    Python 3.12 (standalone)
+  python3.11   → 100-python311.squashfs    Python 3.11
+  nodejs22     → 100-nodejs22.squashfs     Node.js 22 LTS
+  nodejs20     → 100-nodejs20.squashfs     Node.js 20 LTS
+  golang       → 100-golang.squashfs       Go (latest)
+  tailscale    → 200-tailscale.squashfs    Tailscale client
+
+build-in-sandbox (recommended for base-specific packages):
+  1. sq-ctl create builder anon 000-base-alpine
+  2. sq-ctl exec builder "apk add build-base git cmake python3 py3-pip"
+  3. sq-mkmod from-sandbox builder 110-build-tools
+  4. sq-ctl destroy builder
+
+  The resulting module is portable across sandboxes with the same base.
+EOF
+        ;;
+    help|*)
+        echo "usage: $0 preset <name>                 Build from preset"
+        echo "       $0 from-dir <path> <NNN-name>    Squash a directory"
+        echo "       $0 from-sandbox <id> <NNN-name>  Package sandbox changes"
+        echo "       $0 list                           Show presets"
+        ;;
+esac

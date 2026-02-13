@@ -1,0 +1,164 @@
+#!/bin/sh
+# squash/bin/sq-mkbase — build base rootfs squashfs layers
+#
+# Uses `docker export` (if available) or direct rootfs construction
+# to create distro-agnostic base layers.
+#
+# Usage:
+#   sq-mkbase alpine              → 000-base-alpine.squashfs (~8MB)
+#   sq-mkbase debian              → 000-base-debian.squashfs (~30MB)
+#   sq-mkbase ubuntu              → 000-base-ubuntu.squashfs (~45MB)
+#   sq-mkbase void                → 000-base-void.squashfs (~20MB)
+#   sq-mkbase from-dir /path name → 000-name.squashfs (any dir)
+#
+# The output is a squashfs file containing a complete Linux rootfs,
+# suitable as the bottom layer of a sandbox.
+
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+MODULES="$DATA/modules"
+WORK="/tmp/sq-mkbase.$$"
+
+log() { echo "[sq-mkbase] $*"; }
+die() { echo "[sq-mkbase] ERROR: $*" >&2; cleanup; exit 1; }
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+squash_it() {
+    local src="$1" name="$2"
+    local out="$MODULES/$name.squashfs"
+    mkdir -p "$MODULES"
+    log "compressing $name ($(du -sh "$src" | cut -f1) → squashfs)"
+    mksquashfs "$src" "$out" -comp zstd -b 256K -noappend -quiet \
+        -no-xattrs -no-exports
+    log "done: $out ($(du -sh "$out" | cut -f1))"
+}
+
+# ── Alpine ─────────────────────────────────────────────────────────────
+# Build directly from alpine-minirootfs — no docker needed.
+
+build_alpine() {
+    local version="${1:-3.21}"
+    local rootfs="$WORK/rootfs"
+    mkdir -p "$rootfs"
+
+    log "building Alpine $version base"
+
+    local url="https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/x86_64/alpine-minirootfs-$version.0-x86_64.tar.gz"
+    log "downloading minirootfs"
+    wget -qO "$WORK/alpine.tar.gz" "$url" || {
+        # Try without patch version
+        url="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/"
+        local tarball=$(wget -qO- "$url" 2>/dev/null | grep -oP 'alpine-minirootfs-[\d.]+-x86_64\.tar\.gz' | tail -1)
+        [ -z "$tarball" ] && die "could not find Alpine minirootfs"
+        wget -qO "$WORK/alpine.tar.gz" "$url$tarball"
+    }
+
+    tar xzf "$WORK/alpine.tar.gz" -C "$rootfs"
+
+    # Minimal config for sandbox use
+    cat > "$rootfs/etc/apk/repositories" <<EOF
+https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main
+https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/community
+EOF
+
+    # Pre-install essentials that every sandbox needs
+    # (We can do this because Alpine minirootfs includes apk)
+    log "pre-installing bash, curl, git"
+    chroot "$rootfs" /sbin/apk --no-cache add \
+        bash coreutils curl wget git jq tar xz || {
+        log "WARN: could not pre-install packages (no network in build?)"
+        log "sandbox will need 'apk add' after creation"
+    }
+
+    squash_it "$rootfs" "000-base-alpine"
+}
+
+# ── Debian / Ubuntu ────────────────────────────────────────────────────
+# Uses debootstrap if available, otherwise docker export.
+
+build_debian() {
+    local suite="${1:-bookworm}"
+    local name="000-base-debian"
+    [ "$suite" = "noble" ] || [ "$suite" = "jammy" ] && name="000-base-ubuntu"
+
+    local rootfs="$WORK/rootfs"
+    mkdir -p "$rootfs"
+
+    log "building Debian/Ubuntu ($suite) base"
+
+    if command -v debootstrap >/dev/null 2>&1; then
+        log "using debootstrap"
+        debootstrap --variant=minbase "$suite" "$rootfs" || die "debootstrap failed"
+    elif command -v docker >/dev/null 2>&1; then
+        log "using docker export"
+        local image="debian:$suite-slim"
+        case "$suite" in noble|jammy|focal) image="ubuntu:$suite" ;; esac
+        local cid=$(docker create "$image" /bin/true)
+        docker export "$cid" | tar xf - -C "$rootfs"
+        docker rm "$cid" >/dev/null
+    else
+        die "need debootstrap or docker to build Debian/Ubuntu base"
+    fi
+
+    squash_it "$rootfs" "$name"
+}
+
+# ── Void Linux ─────────────────────────────────────────────────────────
+
+build_void() {
+    local rootfs="$WORK/rootfs"
+    mkdir -p "$rootfs"
+
+    log "building Void Linux base"
+
+    if command -v docker >/dev/null 2>&1; then
+        local cid=$(docker create voidlinux/voidlinux-musl:latest /bin/true)
+        docker export "$cid" | tar xf - -C "$rootfs"
+        docker rm "$cid" >/dev/null
+    else
+        # Download ROOTFS tarball directly
+        local url="https://repo-default.voidlinux.org/live/current/"
+        local tarball=$(wget -qO- "$url" 2>/dev/null | grep -oP 'void-x86_64-musl-ROOTFS-[\d.]+\.tar\.xz' | tail -1)
+        [ -z "$tarball" ] && die "could not find Void rootfs tarball"
+        wget -qO "$WORK/void.tar.xz" "$url$tarball"
+        tar xJf "$WORK/void.tar.xz" -C "$rootfs"
+    fi
+
+    squash_it "$rootfs" "000-base-void"
+}
+
+# ── From arbitrary directory ───────────────────────────────────────────
+
+build_from_dir() {
+    local src="$1" name="$2"
+    [ -d "$src" ] || die "not a directory: $src"
+    squash_it "$src" "000-$name"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────
+mkdir -p "$WORK"
+
+case "${1:-help}" in
+    alpine)       build_alpine "${2:-3.21}" ;;
+    debian)       build_debian "${2:-bookworm}" ;;
+    ubuntu)       build_debian "${2:-noble}" ;;
+    void)         build_void ;;
+    from-dir)
+        [ $# -lt 3 ] && die "usage: $0 from-dir <path> <name>"
+        build_from_dir "$2" "$3"
+        ;;
+    list)
+        echo "alpine   (~8MB)   musl/apk    — default, minimal"
+        echo "debian   (~30MB)  glibc/apt   — broad compat"
+        echo "ubuntu   (~45MB)  glibc/apt   — max compat"
+        echo "void     (~20MB)  musl/xbps   — alternative minimal"
+        echo "from-dir          any rootfs  — bring your own"
+        ;;
+    help|*)
+        echo "usage: $0 <distro> [version]"
+        echo "       $0 from-dir <path> <name>"
+        echo "       $0 list"
+        ;;
+esac

@@ -1,0 +1,64 @@
+#!/bin/sh
+# squash/bin/sq-ctl — CLI for sandbox management
+set -eu
+
+API="${SQUASH_API:-http://localhost:${SQUASH_PORT:-8080}}"
+TOKEN="${SQUASH_AUTH_TOKEN:-}"
+
+_curl() {
+    local method="$1" path="$2" body="${3:-}"
+    local args="-s -X $method -H 'Content-Type: application/json'"
+    [ -n "$TOKEN" ] && args="$args -H 'Authorization: Bearer $TOKEN'"
+    [ -n "$body" ] && args="$args -d '$body'"
+    eval "curl $args '$API/cgi-bin/api/$path'"
+}
+
+case "${1:-help}" in
+    create)
+        [ $# -lt 3 ] && { echo "usage: $0 create <id> <owner> [layers] [task]"; exit 1; }
+        _curl POST sandboxes "$(jq -n \
+            --arg id "$2" --arg owner "$3" \
+            --arg layers "${4:-000-base-alpine}" --arg task "${5:-}" \
+            '{id:$id,owner:$owner,layers:$layers,task:$task}')" | jq .
+        ;;
+    exec)
+        [ $# -lt 3 ] && { echo "usage: $0 exec <id> <cmd>"; exit 1; }
+        id="$2"; shift 2
+        _curl POST "sandboxes/$id/exec" "$(jq -n --arg cmd "$*" '{cmd:$cmd}')" | jq .
+        ;;
+    info)      _curl GET "sandboxes/$2" | jq . ;;
+    list)      _curl GET sandboxes | jq . ;;
+    activate)  _curl POST "sandboxes/$2/activate" "$(jq -n --arg m "$3" '{module:$m}')" | jq . ;;
+    snapshot)  _curl POST "sandboxes/$2/snapshot" "$(jq -n --arg l "${3:-}" '{label:$l}')" | jq . ;;
+    restore)   _curl POST "sandboxes/$2/restore" "$(jq -n --arg l "$3" '{label:$l}')" | jq . ;;
+    logs)      _curl GET "sandboxes/$2/logs" | jq . ;;
+    destroy)   _curl DELETE "sandboxes/$2" && echo "destroyed: $2" ;;
+    modules)   _curl GET modules | jq . ;;
+    health)    _curl GET ../health | jq . ;;
+    help|*)
+        cat <<'EOF'
+usage: sq-ctl <command> [args]
+
+  create   <id> <owner> [layers] [task]   default layers: 000-base-alpine
+  exec     <id> <cmd>                     run in sandbox
+  info     <id>                           sandbox details
+  list                                    all sandboxes
+  activate <id> <module>                  add layer to running sandbox
+  snapshot <id> [label]                   checkpoint
+  restore  <id> <label>                   restore checkpoint
+  logs     <id>                           execution history
+  destroy  <id>                           remove sandbox
+  modules                                 available modules
+  health                                  status
+
+examples:
+  sq-ctl create dev alice 000-base-alpine,100-python312 "dev env"
+  sq-ctl exec dev "python3 --version"
+  sq-ctl exec dev "apk add gcc musl-dev && python3 -c 'print(1+1)'"
+  sq-ctl snapshot dev clean-state
+  sq-ctl exec dev "rm -rf /usr"
+  sq-ctl restore dev clean-state
+  sq-ctl destroy dev
+EOF
+        ;;
+esac

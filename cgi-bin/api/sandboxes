@@ -1,0 +1,108 @@
+#!/bin/sh
+# squash/cgi-bin/api/sandboxes — sandbox REST handler
+. "$(dirname "$0")/../common.sh"
+check_auth
+
+path="${PATH_INFO#/}"
+method="${REQUEST_METHOD:-GET}"
+
+# Parse: [id[/action]]
+id=$(echo "$path" | cut -d/ -f1)
+action=$(echo "$path" | cut -sd/ -f2)
+
+# ── Collection ─────────────────────────────────────────────────────────
+if [ -z "$id" ]; then
+    case "$method" in
+        GET) json_ok "$(list_sandboxes)" ;;
+        POST)
+            body=$(read_body)
+            sb_id=$(echo "$body" | jq -r '.id // empty')
+            owner=$(echo "$body" | jq -r '.owner // "anon"')
+            layers=$(echo "$body" | jq -r 'if .layers | type == "array" then .layers | join(",") elif .layers then .layers else "000-base-alpine" end')
+            task=$(echo "$body" | jq -r '.task // ""')
+
+            [ -z "$sb_id" ] && { json_err 400 "id required"; exit 0; }
+            case "$sb_id" in *[!a-zA-Z0-9_-]*) json_err 400 "id: alphanumeric/dash/underscore only"; exit 0;; esac
+
+            err=$(create_sandbox "$sb_id" "$owner" "$layers" "$task" 2>&1) || {
+                json_err 400 "$err"; exit 0
+            }
+            json_response 201 "$(sandbox_info "$sb_id")"
+            ;;
+        *) json_err 400 "method not allowed" ;;
+    esac
+    exit 0
+fi
+
+# ── Instance ───────────────────────────────────────────────────────────
+if [ -z "$action" ]; then
+    case "$method" in
+        GET)
+            exists "$id" || { json_err 404 "not found: $id"; exit 0; }
+            json_ok "$(sandbox_info "$id")"
+            ;;
+        DELETE)
+            exists "$id" || { json_err 404 "not found: $id"; exit 0; }
+            destroy_sandbox "$id"
+            json_response 204 ""
+            ;;
+        *) json_err 400 "method not allowed" ;;
+    esac
+    exit 0
+fi
+
+# ── Actions ────────────────────────────────────────────────────────────
+exists "$id" || { json_err 404 "not found: $id"; exit 0; }
+
+case "$action" in
+    exec)
+        [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        body=$(read_body)
+        cmd=$(echo "$body" | jq -r '.cmd // empty')
+        wd=$(echo "$body" | jq -r '.workdir // "/"')
+        tout=$(echo "$body" | jq -r '.timeout // "300"')
+        [ -z "$cmd" ] && { json_err 400 "cmd required"; exit 0; }
+        mounted "$id" || { json_err 400 "not mounted"; exit 0; }
+        result=$(exec_in_sandbox "$id" "$cmd" "$wd" "$tout" 2>&1) || true
+        json_ok "$result"
+        ;;
+
+    activate)
+        [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        body=$(read_body)
+        mod=$(echo "$body" | jq -r '.module // empty')
+        [ -z "$mod" ] && { json_err 400 "module required"; exit 0; }
+        err=$(activate_module "$id" "$mod" 2>&1) || { json_err 400 "$err"; exit 0; }
+        json_ok "$(sandbox_info "$id")"
+        ;;
+
+    snapshot)
+        [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        body=$(read_body)
+        label=$(echo "$body" | jq -r '.label // empty')
+        snapfile=$(snapshot_sandbox "$id" "$label" 2>&1) || { json_err 400 "$snapfile"; exit 0; }
+        size=$(stat -c%s "$snapfile" 2>/dev/null || echo 0)
+        json_ok "{\"snapshot\":\"$(basename "$snapfile" .squashfs)\",\"size\":$size}"
+        ;;
+
+    restore)
+        [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        body=$(read_body)
+        label=$(echo "$body" | jq -r '.label // empty')
+        [ -z "$label" ] && { json_err 400 "label required"; exit 0; }
+        err=$(restore_sandbox "$id" "$label" 2>&1) || { json_err 400 "$err"; exit 0; }
+        json_ok "$(sandbox_info "$id")"
+        ;;
+
+    logs)
+        [ "$method" = "GET" ] || { json_err 400 "GET only"; exit 0; }
+        logdir="$(sdir "$id")/.meta/log"
+        if [ -d "$logdir" ] && [ "$(ls "$logdir" 2>/dev/null)" ]; then
+            json_ok "$(cat "$logdir"/*.json | jq -s '.')"
+        else
+            json_ok "[]"
+        fi
+        ;;
+
+    *) json_err 404 "unknown action: $action" ;;
+esac

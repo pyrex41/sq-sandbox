@@ -1,0 +1,10 @@
+#!/bin/sh
+# squash/bin/start-api
+set -eu
+PORT="${SQUASH_PORT:-8080}"
+APP="$(cd "$(dirname "$0")/.." && pwd)"
+chmod +x "$APP"/cgi-bin/* "$APP"/cgi-bin/api/* 2>/dev/null || true
+export SQUASH_DATA="${SQUASH_DATA:-/data}"
+export SQUASH_AUTH_TOKEN="${SQUASH_AUTH_TOKEN:-}"
+echo "[api] :$PORT  cgi-bin: $APP/cgi-bin"
+exec busybox httpd -f -p "$PORT" -h "$APP" -vv 2>&1

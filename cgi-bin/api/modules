@@ -1,0 +1,11 @@
+#!/bin/sh
+# squash/cgi-bin/api/modules — module listing
+. "$(dirname "$0")/../common.sh"
+check_auth
+
+method="${REQUEST_METHOD:-GET}"
+
+case "$method" in
+    GET) json_ok "$(list_modules)" ;;
+    *)   json_err 400 "GET only" ;;
+esac

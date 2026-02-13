@@ -1,0 +1,78 @@
+#!/bin/sh
+# squash/bin/sq-init — first-boot init + sandbox recovery
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+MODULES="$DATA/modules"
+SANDBOXES="$DATA/sandboxes"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+log() { echo "[sq-init] $*"; }
+
+mkdir -p "$MODULES" "$SANDBOXES"
+
+# ── Build default base if missing ──────────────────────────────────────
+if [ ! -f "$MODULES/000-base-alpine.squashfs" ]; then
+    log "no base module found, building Alpine base"
+    "$SCRIPT_DIR/sq-mkbase" alpine
+else
+    log "base module present: $(ls -lh "$MODULES/000-base-alpine.squashfs" | awk '{print $5}')"
+fi
+
+# ── Remount surviving sandboxes ────────────────────────────────────────
+for sdir in "$SANDBOXES"/*/; do
+    [ ! -f "$sdir/.meta/layers" ] && continue
+    id=$(basename "$sdir")
+
+    if grep -q "$sdir/merged" /proc/mounts 2>/dev/null; then
+        log "$id: already mounted"
+        continue
+    fi
+
+    log "$id: remounting"
+    layers=$(cat "$sdir/.meta/layers")
+
+    # Remount module images
+    for mod in $(echo "$layers" | tr ',' ' '); do
+        local_mp="$sdir/images/$mod.squashfs"
+        sqfs="$MODULES/$mod.squashfs"
+        [ ! -f "$sqfs" ] && { log "  WARN: module missing: $mod"; continue; }
+        mkdir -p "$local_mp"
+        mountpoint -q "$local_mp" 2>/dev/null || \
+            mount -o loop,ro -t squashfs "$sqfs" "$local_mp" 2>/dev/null || \
+            { log "  WARN: mount failed: $mod"; continue; }
+    done
+
+    # Remount active snapshot if any
+    if [ -f "$sdir/.meta/active_snapshot" ]; then
+        label=$(cat "$sdir/.meta/active_snapshot")
+        snapfile="$sdir/snapshots/$label.squashfs"
+        if [ -f "$snapfile" ]; then
+            mkdir -p "$sdir/images/_snapshot"
+            mountpoint -q "$sdir/images/_snapshot" 2>/dev/null || \
+                mount -o loop,ro -t squashfs "$snapfile" "$sdir/images/_snapshot" 2>/dev/null || true
+        fi
+    fi
+
+    # Rebuild overlay
+    mkdir -p "$sdir/upper" "$sdir/work" "$sdir/merged"
+
+    # Build lowerdir
+    lower=""
+    if [ -d "$sdir/images/_snapshot" ] && mountpoint -q "$sdir/images/_snapshot" 2>/dev/null; then
+        lower="$sdir/images/_snapshot"
+    fi
+    for d in $(ls -1d "$sdir"/images/[0-9]*.squashfs 2>/dev/null | sort -r); do
+        mountpoint -q "$d" 2>/dev/null || continue
+        [ -n "$lower" ] && lower="$lower:" || true
+        lower="$lower$d"
+    done
+
+    if [ -n "$lower" ]; then
+        mount -t overlay overlay \
+            -o "lowerdir=$lower,upperdir=$sdir/upper,workdir=$sdir/work" \
+            "$sdir/merged" 2>/dev/null && log "$id: ok" || log "$id: FAILED"
+    fi
+done
+
+log "ready — modules: $(ls -1 "$MODULES"/*.squashfs 2>/dev/null | wc -l), sandboxes: $(ls -1d "$SANDBOXES"/*/ 2>/dev/null | wc -l)"

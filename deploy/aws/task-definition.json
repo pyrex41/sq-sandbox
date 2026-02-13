@@ -1,0 +1,26 @@
+{
+    "family": "squash",
+    "networkMode": "host",
+    "requiresCompatibilities": ["EC2"],
+    "containerDefinitions": [{
+        "name": "squash",
+        "image": "ACCOUNT.dkr.ecr.REGION.amazonaws.com/squash:v3",
+        "essential": true,
+        "privileged": true,
+        "memory": 7680,
+        "portMappings": [{"containerPort": 8080, "hostPort": 8080}],
+        "secrets": [
+            {"name": "SQUASH_AUTH_TOKEN", "valueFrom": "arn:aws:ssm:REGION:ACCOUNT:parameter/squash/auth-token"},
+            {"name": "TAILSCALE_AUTHKEY", "valueFrom": "arn:aws:ssm:REGION:ACCOUNT:parameter/squash/tailscale-key"}
+        ],
+        "mountPoints": [{"sourceVolume": "data", "containerPath": "/data"}],
+        "healthCheck": {
+            "command": ["CMD-SHELL", "wget -qO- http://localhost:8080/cgi-bin/health"],
+            "interval": 30, "startPeriod": 60
+        }
+    }],
+    "volumes": [{
+        "name": "data",
+        "efsVolumeConfiguration": {"fileSystemId": "fs-XXXXX", "rootDirectory": "/squash"}
+    }]
+}

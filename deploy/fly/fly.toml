@@ -1,0 +1,31 @@
+# deploy/fly/fly.toml
+# Performance-2x (2c/4GB) ~$47/mo + Volume 100GB ~$15/mo = ~$62/mo
+app = "squash-sandbox"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[env]
+  SQUASH_DATA = "/data"
+  SQUASH_PORT = "8080"
+
+[mounts]
+  source = "squash_data"
+  destination = "/data"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+  [[services.http_checks]]
+    interval = "30s"
+    path = "/cgi-bin/health"
+
+[[vm]]
+  size = "performance-2x"

@@ -1,0 +1,14 @@
+<!DOCTYPE html><html><head><title>squash</title></head><body><pre>
+squash v3 — composable sandboxes from squashfs layers
+
+  GET  /cgi-bin/health
+  GET  /cgi-bin/api/sandboxes
+  POST /cgi-bin/api/sandboxes         {id, owner, layers, task}
+  *    /cgi-bin/api/sandboxes/:id     GET info, DELETE destroy
+  POST /cgi-bin/api/sandboxes/:id/exec      {cmd, workdir, timeout}
+  POST /cgi-bin/api/sandboxes/:id/activate  {module}
+  POST /cgi-bin/api/sandboxes/:id/snapshot  {label}
+  POST /cgi-bin/api/sandboxes/:id/restore   {label}
+  GET  /cgi-bin/api/sandboxes/:id/logs
+  GET  /cgi-bin/api/modules
+</pre></body></html>

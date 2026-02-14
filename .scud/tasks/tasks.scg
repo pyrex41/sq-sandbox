@@ -1,0 +1,164 @@
+# SCUD Graph v1
+# Phase: zig
+
+@meta {
+  name zig
+  id_format sequential
+  updated 2026-02-14T17:48:11.868135+00:00
+}
+
+@nodes
+# id | title | status | complexity | priority
+1 | Implement Config and Validation | D | 3 | H
+2 | Build HTTP Server Skeleton | I | 3 | H
+3 | Implement Mount Operations | X | 5 | H
+3.1 | Implement Mount Structs with @cImport Syscalls | D | 0 | H
+3.2 | Test Mount Operations and Verify Compatibility | D | 0 | M
+4 | Implement Sandbox Create and Destroy | X | 8 | H
+4.1 | Implement SandboxManager and Sandbox Lifecycle | D | 0 | H
+4.2 | Test Sandbox Lifecycle | D | 0 | H
+5 | Implement Exec in Sandbox | X | 8 | H
+5.1 | Implement Core Sandbox Execution with Namespaces | D | 0 | H
+5.2 | Add Timeout, Output Capture, and Exec Logging | I | 0 | H
+6 | Implement Cgroups and Network Namespaces | X | 5 | M
+6.1 | Implement Cgroup v2 and Full Network Namespace Setup | D | 0 | H
+6.2 | Test Network Isolation and Cleanup | I | 0 | H
+7 | Implement Snapshot and Restore | X | 5 | M
+7.1 | Implement Snapshot, Restore, and Activate Logic | D | 0 | H
+7.2 | Add S3 Pull for Restore and Snapshot Testing | P | 0 | H
+8 | Implement S3 Sync with SigV4 | X | 8 | M
+8.1 | Implement AWS SigV4 Signing Module | D | 0 | H
+8.2 | Implement S3 Client Operations with Atomic Pulls | P | 0 | H
+9 | Complete HTTP API Server | X | 8 | H
+9.1 | Implement JSON Schemas and Dual-Format Layers Handling | D | 0 | H
+9.2 | Implement All 10 API Endpoints with Content-Type Validation | P | 0 | H
+10 | Implement Init/Recovery and Reaper Thread | X | 5 | L
+10.1 | Implement Init Recovery and Reaper Modules | D | 0 | H
+10.2 | Integrate Startup Sequence and Test Recovery | P | 0 | H
+
+@edges
+# dependent -> dependency
+2 -> 1
+3 -> 1
+3.2 -> 3.1
+4 -> 3
+4.1 -> zig:3
+4.2 -> 4.1
+5 -> 4
+5.1 -> zig:4
+5.2 -> 5.1
+6 -> 4
+6 -> zig:1
+6.2 -> 6.1
+7 -> 5
+7 -> 8
+7.1 -> zig:3
+7.1 -> zig:4
+7.2 -> 7.1
+8 -> 1
+8.1 -> zig:1
+8.2 -> 8.1
+9 -> 2
+9 -> 4
+9 -> 5
+9.1 -> zig:1
+9.2 -> 9.1
+10 -> 6
+10 -> 9
+10.1 -> zig:4
+10.1 -> zig:6
+10.2 -> 10.1
+
+@parents
+# parent: subtasks...
+3: 3.1, 3.2
+4: 4.1, 4.2
+5: 5.1, 5.2
+6: 6.1, 6.2
+7: 7.1, 7.2
+8: 8.1, 8.2
+9: 9.1, 9.2
+10: 10.1, 10.2
+
+@agents
+# id | agent_type
+1 | builder
+2 | builder
+3 | builder
+3.1 | builder
+3.2 | tester
+4 | builder
+4.1 | builder
+4.2 | tester
+5 | builder
+5.1 | builder
+5.2 | builder
+6 | builder
+6.1 | builder
+6.2 | tester
+7 | builder
+7.1 | builder
+7.2 | builder
+8 | builder
+8.1 | builder
+8.2 | builder
+9 | builder
+9.1 | builder
+9.2 | builder
+10 | builder
+10.1 | builder
+10.2 | builder
+
+@details
+1 | description |
+  Create config.zig and validate.zig modules to parse environment variables into a Config struct and validate IDs, labels, and module names. Ensure validId, validLabel, and validModule functions are implemented with tests. This foundational module must handle all configuration loading and basic input validation.
+2 | description |
+  Implement the basic HTTP server in api.zig using std.http.Server, starting with health endpoint and routing skeleton. Include auth token checking and basic error handling. This sets up the API foundation for all endpoints.
+3 | description |
+  Create mounts.zig with SquashfsMount, TmpfsMount, and OverlayMount structs, including mount() and deinit() methods. Implement errdefer rollback patterns and test mount/unmount cycles to ensure no orphaned resources. Verify compatibility with kernel headers via @cImport.
+3.1 | description |
+  Create mounts.zig with SquashfsMount, TmpfsMount, and OverlayMount structs using @cImport of sys/mount.h for direct mount/umount2 syscalls. Implement mount() and deinit() methods with idempotent cleanup (active flag pattern) and errdefer rollback chains. TmpfsMount must create overlay subdirectories (data/, work/), OverlayMount must build the lowerdir:upperdir:workdir options string.
+3.2 | description |
+  Implement tests for mount/unmount cycles to ensure no orphaned resources. Verify compatibility with kernel headers using @cImport.
+4 | description |
+  Develop sandbox.zig and manager.zig for SandboxManager with per-sandbox mutex and arena allocator. Implement createSandbox with errdefer chain for mounts, and destroy() method ensuring explicit cleanup. Test lifecycle to confirm resource rollback on failures.
+4.1 | description |
+  Develop sandbox.zig with Sandbox struct (state enum, destroy method in reverse creation order) and manager.zig with SandboxManager (StringHashMap, global lock, per-sandbox ManagedSandbox with mutex and ArenaAllocator). Implement createSandbox with full errdefer chain covering tmpfs, squashfs layers, overlay, cgroup, netns, resolv.conf seeding, secret placeholder injection (via secrets.zig), and metadata writing (via meta.zig). Ensure destroy() is idempotent and destroySandbox() always calls destroy() before hashmap removal.
+4.2 | description |
+  Create tests for the sandbox lifecycle to confirm resource rollback on failures, ensuring the create and destroy methods work correctly under error conditions.
+5 | description |
+  Create exec.zig for execInSandbox function, handling fork, unshare, chroot, and command execution with timeout and output capture. Include poll-based I/O and cgroup/netns integration. Test basic command execution within a sandbox environment.
+5.1 | description |
+  Create exec.zig with execInSandbox function implementing fork, pipe creation for stdout/stderr, child process setup (close pipe ends, dup2, cgroup entry, setns for netns, unshare for mount/PID/IPC/UTS namespaces, chroot into merged overlayfs, chdir, execve /bin/sh -c). Parent process handles pipe reads. This is security-sensitive code requiring exact namespace and chroot ordering.
+5.2 | description |
+  Enhance execInSandbox with poll-based I/O on stdout/stderr pipes with deadline-based timeout (kill child on timeout, return exit code 124). Implement waitpid with WIFEXITED/WIFSIGNALED handling, 64KB output cap, and exec log writing with sequence numbering (writeExecLog). Integrate cgroup/netns entry in child process and add tests for basic command execution, timeout, and output capture.
+6 | description |
+  Develop cgroup.zig and netns.zig, shelling out to ip and iptables for netns setup, veth pairs, and NAT. Implement NetnsHandle and CgroupHandle with deinit methods. Test network isolation and resource cleanup in privileged environment.
+6.1 | description |
+  Develop cgroup.zig with CgroupHandle (create cgroup dir, write cpu.max and memory.max, addProcess, idempotent deinit moving procs out) and netns.zig with NetnsHandle shelling out to ip/iptables for: netns creation, veth pair, IP addressing, NAT masquerade, DNS DNAT forwarding (UDP+TCP port 53), resolv.conf seeding, and egress filtering (applyEgressRules with custom iptables chain, ICMP drop, DNS rate limit, ESTABLISHED/RELATED accept, getaddrinfo host resolution, default drop). Implement flock-based netns index allocation (1-254) scanning .meta/netns_index files.
+6.2 | description |
+  Test the implemented modules for network isolation and proper resource cleanup in a privileged environment.
+7 | description |
+  Build snapshot.zig for mksquashfs shell-out and overlay remount logic. Support local and S3 pulls for restore. Test snapshot creation, restore atomicity, and overlay rebuilding to ensure data integrity.
+7.1 | description |
+  Build snapshot.zig with mksquashfs shell-out for snapshot creation (with zstd/gzip detection), restore logic (unmount overlay, unmount previous snapshot, clear upper/data and upper/work, loop-mount snapshot as highest-priority lower, remount overlay, re-inject secret placeholders), and activate functionality (convert snapshot to a module). Ensure overlay remount atomicity during restore.
+7.2 | description |
+  Extend restore logic to support S3 pulls for remote snapshots. Trigger background S3 push (pushBg) after snapshot creation. Implement tests for snapshot creation, restore atomicity, activate-to-module conversion, overlay rebuilding, and data integrity verification.
+8 | description |
+  Create s3.zig and sigv4.zig for AWS S3 operations using custom HTTP client and SigV4 signing. Include push, pull, exists, and list functions with background upload threads. Test against MinIO or real S3 for signature correctness.
+8.1 | description |
+  Create sigv4.zig implementing AWS Signature V4 signing using std.crypto.hash.sha2.Sha256 and std.crypto.auth.hmac.sha2.HmacSha256 from Zig stdlib. Implement canonical request formatting, string-to-sign construction, signing key derivation (HMAC chain: date → region → service → aws4_request), and final Authorization header generation. Include tests against AWS documentation test vectors for signature correctness.
+8.2 | description |
+  Create s3.zig with S3Client struct implementing push, pull, exists, list, and pushBg (detached thread) operations using std.http.Client and SigV4 signing. Implement pull atomicity: write to .s3tmp then rename, use flock to prevent concurrent pulls of the same file. Test against MinIO for signature correctness and pull atomicity.
+9 | description |
+  Expand api.zig to implement all 10 endpoints (sandboxes CRUD, exec, modules) with JSON parsing/serialization via json.zig. Ensure thread pool dispatching and match existing API schemas exactly. Test API responses for wire compatibility.
+9.1 | description |
+  Create json.zig with all API request/response structs (CreateRequest, ExecRequestJson, ExecResult, sandbox info, module list) using std.json for parsing/serialization. Handle the layers field as both comma-separated string and JSON array per PRD. Define all 10 endpoint schemas to exactly match existing API wire format for backward compatibility.
+9.2 | description |
+  In api.zig, implement all endpoints: health, create/list/get/destroy sandboxes, exec, snapshot/restore/activate, list modules. Add Content-Type: application/json enforcement on POST endpoints (return 415 if missing). Implement thread pool dispatching for concurrent requests. Test API responses for exact wire compatibility with existing shell-based API.
+10 | description |
+  Develop init.zig for startup recovery (create directories, check/pull/build base image, remount surviving sandboxes for non-ephemeral mode) and reaper.zig for background cleanup thread (sleep(10) loop, scan sandboxes for max_lifetime expiry, call destroySandbox). Integrate into main.zig startup sequence. Guest agent is handled separately.
+10.1 | description |
+  Develop init.zig for first-boot recovery: create modules/sandboxes directories, check for 000-base-alpine.squashfs (try S3 pull, then shell out to sq-mkbase), handle Firecracker VM component check, and remount surviving sandboxes by scanning dirs and rebuilding overlayfs. Implement reaper.zig with background thread doing sleep(10) scan for expired sandboxes based on max_lifetime_s, calling destroySandbox for each.
+10.2 | description |
+  Wire init, reaper, proxy child process management, and HTTP server into main.zig startup sequence (GPA allocator, config load, init.run, proxy start, tailscale thread, SandboxManager init with defer destroyAll, reaper thread spawn, api.startServer). Test crash recovery: verify no orphaned mounts, iptables rules, or netns after restart.

@@ -1,0 +1,6 @@
+--- 2026-02-14 11:40:47 ---
+json.zig created with all 10 endpoint schemas: CreateRequest, ExecRequestJson, SnapshotRequest, RestoreRequest, ActivateRequest (requests) and SandboxInfo, ExecResult, ModuleInfo, HealthResponse, SnapshotResult, ErrorResponse (responses). Dual-format layers (CSV string + JSON array) handled via parseLayers(). In Zig 0.15, use std.json.Stringify.valueAlloc() for serialization, not std.json.stringify().
+
+--- 2026-02-14 11:40:48 ---
+Zig 0.15 ArrayList API: std.ArrayList(T) is unmanaged (.empty init, allocator per-call). Use std.json.Stringify.valueAlloc() for JSON serialization. ParseOptions: .ignore_unknown_fields and .allocate = .alloc_always work as expected.
+

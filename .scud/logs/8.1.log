@@ -1,0 +1,3 @@
+--- 2026-02-14 11:41:34 ---
+sigv4.zig created in src/sigv4.zig with sign(), deriveSigningKey(), hashPayload(), uriEncode(). Uses std.crypto.hash.sha2.Sha256 and std.crypto.auth.hmac.sha2.HmacSha256. Note: Zig 0.15 uses std.fmt.bytesToHex() instead of fmtSliceHexLower().
+

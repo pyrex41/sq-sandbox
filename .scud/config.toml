@@ -1,0 +1,22 @@
+[llm]
+fast_model = "xai/grok-code-fast-1"
+fast_provider = "xai"
+max_tokens = 16000
+model = "xai/grok-code-fast-1"
+provider = "xai"
+smart_model = "claude-opus-4-6"
+smart_provider = "anthropic-oauth"
+
+[swarm]
+direct_api_provider = "anthropic"
+harness = "claude"
+round_size = 5
+use_direct_api = false
+
+[swarm.backpressure]
+commands = [
+    "zig build",
+    "zig build test",
+]
+stop_on_failure = true
+timeout_secs = 300

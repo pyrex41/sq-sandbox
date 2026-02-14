@@ -1,0 +1,6 @@
+--- 2026-02-14 11:40:46 ---
+init.zig and reaper.zig implemented. build.zig updated for Zig 0.15 API (root_module instead of root_source_file, capitalized enum variants like .Exited/.Pipe/.Ignore). config.zig getEnvNonEmpty param changed from [*:0]const u8 to []const u8 for 0.15 compat.
+
+--- 2026-02-14 11:40:52 ---
+Zig 0.15 breaking changes found: std.ArrayList is now unmanaged (no .init(allocator), use .empty instead); process.Child.StdIo/Term enums are PascalCase (.Exited, .Pipe, .Ignore); Dir.close needs *Dir not *const Dir; fmtSliceHexLower removed from std.fmt
+

@@ -191,8 +191,9 @@ requests without exposing them inside the sandbox. Two modes:
   per-host TLS certificates signed by a CA created at container startup. The CA
   is automatically injected into each sandbox's trust store (`ca-certificates.crt`,
   `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`). All HTTPS API
-  calls to `allowed_hosts` get transparent credential injection. Non-allowed
-  hosts are tunneled through without inspection.
+  calls to `allowed_hosts` get transparent credential injection. Hosts not in
+  any secret's `allowed_hosts` pass through without MITM (the proxy tunnels raw
+  TCP). Network-level blocking is controlled separately by `allow_net`.
 
 Configure `$SQUASH_DATA/secrets.json`:
 

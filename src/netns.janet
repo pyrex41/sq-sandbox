@@ -4,6 +4,7 @@
 # no injection risk from sandbox IDs or network parameters.
 
 (import lock)
+(import validate :prefix "validate/")
 
 (def netns-lock (lock/make-lock))
 (var netns-index-bitmap @{}) # index -> true when allocated
@@ -61,6 +62,22 @@
           (array/push hosts host)))))
   hosts)
 
+(def max-chain-len 28)  # iptables chain names max 28 chars
+
+(defn- chain-id-hash8 [id]
+  "Stable 8-hex hash suffix for iptables chain uniqueness."
+  (var h 5381)
+  (each ch id
+    (set h (% (+ (* h 33) ch) 4294967296)))
+  (string/format "%08x" h))
+
+(defn- chain-name-for-id [id]
+  "Build bounded chain name with deterministic hash suffix."
+  (def hash8 (chain-id-hash8 id))
+  (def prefix-len (- max-chain-len 3 1 8)) # SQ- + - + 8 hex
+  (def prefix (if (> (length id) prefix-len) (string/slice id 0 prefix-len) id))
+  (string "SQ-" prefix "-" hash8))
+
 (defn- apply-egress-rules
   "Create per-sandbox FORWARD chain and allow only listed hosts."
   [id veth-host allow-net]
@@ -68,7 +85,7 @@
   (when (= (length hosts) 0)
     (return nil))
 
-  (def chain (string "SQ-" id))
+  (def chain (chain-name-for-id id))
   (run-ok "iptables" "-N" chain)
   (run-ok "iptables" "-I" "FORWARD" "-i" veth-host "-j" chain)
 
@@ -80,10 +97,10 @@
   (run-ok "iptables" "-A" chain "-p" "tcp" "--dport" "53" "-j" "ACCEPT")
 
   (each host hosts
-    (if (string/find "*" host)
-      (eprintf "netns: wildcard %s requires proxy mode, skipping\n" host)
-      # Host can be IP/CIDR/domain. iptables resolves domains at rule insert time.
-      (run-ok "iptables" "-A" chain "-d" host "-j" "ACCEPT")))
+    (when (validate/valid-allow-net-host? host)
+      (if (string/find "*" host)
+        (eprintf "netns: wildcard %s requires proxy mode, skipping\n" host)
+        (run-ok "iptables" "-A" chain "-d" host "-j" "ACCEPT"))))
 
   # Default deny.
   (run-ok "iptables" "-A" chain "-j" "DROP")

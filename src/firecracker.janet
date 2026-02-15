@@ -8,6 +8,7 @@
 (import config :prefix "config/")
 (import mounts :prefix "mounts/")
 (import syscalls)
+(import validate :prefix "validate/")
 
 (def max-output 65536)
 (def timeout-exit-code 124)
@@ -36,35 +37,27 @@
   (def lock-path (string data-dir "/.fc-cid-counter.lock"))
   (def counter-path (string data-dir "/.fc-cid-counter"))
   (mounts/ensure-dir data-dir)
-  (try
-    (syscalls/flock-allocate-counter lock-path counter-path min-cid)
-    ([e]
-      # Fallback to shell if FFI unavailable (e.g. non-Linux)
-      (def script
-        (string
-          "exec 9>" lock-path "; "
-          "flock 9; "
-          "if [ -f " counter-path " ]; then "
-          "  CID=$(cat " counter-path "); "
-          "else "
-          "  CID=" (string min-cid) "; "
-          "fi; "
-          "echo $CID; "
-          "echo $((CID + 1)) > " counter-path "; "
-          "exec 9>&-"))
-      (def proc (os/spawn ["/bin/sh" "-c" script] :p {:out :pipe}))
-      (def out @"")
-      (while true
-        (def chunk (try (ev/read (in proc :out) 4096) ([e] nil)))
-        (when (or (nil? chunk) (= (length chunk) 0)) (break))
-        (buffer/push out chunk))
-      (os/proc-wait proc)
-      (os/proc-close proc)
-      (scan-number (string/trim (string out))))))
+  (syscalls/flock-allocate-counter lock-path counter-path min-cid))
 
 # ---------------------------------------------------------------------------
 # Network — tap device + NAT (not veth like chroot backend)
 # ---------------------------------------------------------------------------
+
+(def max-chain-len 28)  # iptables chain names max 28 chars
+
+(defn- chain-id-hash8 [id]
+  "Stable 8-hex hash suffix for iptables chain uniqueness."
+  (var h 5381)
+  (each ch id
+    (set h (% (+ (* h 33) ch) 4294967296)))
+  (string/format "%08x" h))
+
+(defn- chain-name-for-id [id]
+  "Build bounded chain name with deterministic hash suffix."
+  (def hash8 (chain-id-hash8 id))
+  (def prefix-len (- max-chain-len 3 1 8)) # SQ- + - + 8 hex
+  (def prefix (if (> (length id) prefix-len) (string/slice id 0 prefix-len) id))
+  (string "SQ-" prefix "-" hash8))
 
 (defn fc-setup-network
   "Create tap device and NAT rules for a Firecracker VM."
@@ -73,7 +66,7 @@
   (def host-ip (string/format "10.0.%d.1/30" index))
   (def subnet (string/format "10.0.%d.0/30" index))
   (def hosts (allow-net-hosts allow-net))
-  (def chain (string "SQ-" id))
+  (def chain (chain-name-for-id id))
 
   # Create tap device
   (os/execute ["ip" "tuntap" "add" "dev" tap-name "mode" "tap"] :p)
@@ -92,9 +85,10 @@
     (os/execute ["iptables" "-A" chain "-p" "udp" "--dport" "53" "-j" "ACCEPT"] :p)
     (os/execute ["iptables" "-A" chain "-p" "tcp" "--dport" "53" "-j" "ACCEPT"] :p)
     (each host hosts
-      (if (string/find "*" host)
-        (eprintf "fc-net: wildcard %s requires proxy mode, skipping\n" host)
-        (os/execute ["iptables" "-A" chain "-d" host "-j" "ACCEPT"] :p)))
+      (when (validate/valid-allow-net-host? host)
+        (if (string/find "*" host)
+          (eprintf "fc-net: wildcard %s requires proxy mode, skipping\n" host)
+          (os/execute ["iptables" "-A" chain "-d" host "-j" "ACCEPT"] :p))))
     (os/execute ["iptables" "-A" chain "-j" "DROP"] :p))
 
   @{:tap-name tap-name
@@ -109,7 +103,7 @@
   [id index]
   (def tap-name (string "sq-" id "-tap"))
   (def subnet (string/format "10.0.%d.0/30" index))
-  (def chain (string "SQ-" id))
+  (def chain (chain-name-for-id id))
 
   # Remove optional egress chain.
   (try (os/execute ["iptables" "-D" "FORWARD" "-i" tap-name "-j" chain] :p)

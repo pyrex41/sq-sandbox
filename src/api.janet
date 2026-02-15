@@ -76,8 +76,10 @@
 
   # Read body based on Content-Length — enforce max body size
   (def content-length (or (scan-number (get headers "content-length" "0")) 0))
+  (when (< content-length 0)
+    (return @{:error :bad-request}))
   (when (> content-length max-body-size)
-    (break nil))  # Reject oversized; caller will 413
+    (return @{:error :payload-too-large}))
   (def body-buf (buffer/slice buf body-start))
   (when (< (length body-buf) content-length)
     (def remaining (- content-length (length body-buf)))
@@ -153,6 +155,9 @@
   (var layers (get data "layers" "000-base-alpine"))
   (when (string? layers)
     (set layers (string/split "," (string/trim layers))))
+  (def bad (filter |(not (validate/valid-module? $)) layers))
+  (when (> (length bad) 0)
+    (break (error-response (string/format "invalid layer: %s" (get bad 0)) 400)))
   (def opts @{
     :owner (get data "owner" "anon")
     :task (get data "task" "")
@@ -309,10 +314,11 @@
           (when (nil? req)
             (write-response stream (error-response "bad request" 400))
             (break))
-          # Reject oversized body (Content-Length checked in read-request)
-          (def cl (or (scan-number (get (get req :headers) "content-length" "0")) 0))
-          (when (> cl max-body-size)
+          (when (= (get req :error) :payload-too-large)
             (write-response stream (error-response "payload too large" 413))
+            (break))
+          (when (get req :error)
+            (write-response stream (error-response "bad request" 400))
             (break))
 
           # Auth check

@@ -39,7 +39,8 @@
 
   # Signal handling: graceful shutdown on SIGTERM/SIGINT
   (defn shutdown [sig]
-    (eprintf "\nshutdown: received %s, cleaning up...\n" (string sig))
+    (def sig-str (if (string? sig) sig (string "signal")))
+    (eprintf "\nshutdown: received %s, cleaning up...\n" sig-str)
     (each [id s] (pairs (get mgr :sandboxes))
       (when s
         (eprintf "shutdown: destroying sandbox %s\n" id)

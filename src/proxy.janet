@@ -35,6 +35,9 @@
     (return nil))
   (ensure-proxy-ca config)
   (def data-dir (get config :data-dir))
+  (when (or (not data-dir) (string/find ".." data-dir))
+    (eprintf "proxy: invalid SQUASH_DATA, skipping\n")
+    (return nil))
   (def env @{"SQUASH_DATA" data-dir})
   (var bin (or (os/getenv "SQ_PROXY_BIN") "sq-secret-proxy-https"))
   (when (not (get config :proxy-https))
@@ -45,4 +48,6 @@
   (ev/go
     (fn []
       (eprintf "proxy: starting %s on :8888\n" bin)
-      (os/execute [bin] :ep env))))
+      (def rc (os/execute [bin] :ep env))
+      (when (not= rc 0)
+        (eprintf "proxy: %s exited with %d\n" bin rc)))))

@@ -40,24 +40,36 @@
 
 (defn list-keys [config prefix]
   (when (s3-enabled? config)
-    (def env (merge (s3-env config) {:out :pipe :err :pipe}))
-    (def proc (os/spawn ["sq-s3" "list" prefix] :ep env))
+    (def env (s3-env config))
+    (def proc (os/spawn ["sq-s3" "list" prefix] :ep env :out :pipe :err :pipe))
+    # Drain stderr in background so child never blocks on full pipe
+    (ev/go (fn []
+      (try
+        (forever
+          (def chunk (ev/read (in proc :err) 4096))
+          (when (or (nil? chunk) (= (length chunk) 0)) (break)))
+        ([e] nil))))
     (def out-buf @"")
-    (try (do (def chunk (ev/read (in proc :out) 65536))
-             (when chunk (buffer/push out-buf chunk)))
+    (try
+      (forever
+        (def chunk (ev/read (in proc :out) 4096))
+        (when (or (nil? chunk) (= (length chunk) 0)) (break))
+        (buffer/push out-buf chunk))
       ([e] nil))
     (def exit (os/proc-wait proc))
+    (os/proc-close proc)
     (when (= 0 exit)
       (filter |(> (length $) 0) (string/split "\n" (string out-buf))))))
 
 (defn push-bg [config local-path s3-key]
   "Background push — spawns sq-s3 push in background, non-blocking."
   (when (s3-enabled? config)
-    (def log-file (string (get config :data-dir) "/.s3-push.log"))
+    (def env (s3-env config))
     (ev/go
       (fn []
-        (os/execute ["sq-s3" "push" local-path s3-key]
-          :ep (s3-env config))))))
+        (def rc (os/execute ["sq-s3" "push" local-path s3-key] :ep env))
+        (when (not= rc 0)
+          (eprintf "s3 push-bg failed (rc=%d): %s -> %s\n" rc local-path s3-key))))))
 
 (defn sync-modules [config]
   (when (s3-enabled? config)

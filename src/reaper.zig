@@ -49,7 +49,7 @@ pub fn run(reaper_cfg: ReaperConfig) void {
     log.info("reaper started — scan interval {d}s", .{reaper_cfg.interval_s});
 
     while (true) {
-        std.time.sleep(interval_ns);
+        std.Thread.sleep(interval_ns);
         scanAndReap(reaper_cfg);
     }
 }

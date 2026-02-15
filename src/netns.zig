@@ -216,42 +216,29 @@ fn applyEgressRules(
 /// Resolve a hostname to IP addresses via getaddrinfo. Returns a slice of
 /// allocated IP strings (caller must free both the slice and each element).
 fn resolveHost(allocator: std.mem.Allocator, host: []const u8) ![][]const u8 {
-    // We need a null-terminated copy for the C API
-    const host_z = try allocator.dupeZ(u8, host);
-    defer allocator.free(host_z);
-
-    const hints = std.posix.addrinfo{
-        .flags = 0,
-        .family = posix.AF.INET,
-        .socktype = posix.SOCK.STREAM,
-        .protocol = 0,
-        .addrlen = 0,
-        .addr = null,
-        .canonname = null,
-        .next = null,
-    };
-
-    const result = posix.getaddrinfo(host_z.ptr, null, &hints) catch return error.ResolveFailed;
-    defer posix.freeaddrinfo(result);
-
-    var list = std.ArrayList([]const u8).init(allocator);
+    var list: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (list.items) |item| allocator.free(item);
-        list.deinit();
+        list.deinit(allocator);
     }
 
-    var it: ?*posix.addrinfo = result;
-    while (it) |ai| : (it = ai.next) {
-        if (ai.family != posix.AF.INET) continue;
-        const sockaddr: *const posix.sockaddr.in = @ptrCast(@alignCast(ai.addr.?));
-        const addr_bytes = @as(*const [4]u8, @ptrCast(&sockaddr.addr));
+    const addr_list = std.net.getAddressList(allocator, host, 0) catch return error.ResolveFailed;
+    defer addr_list.deinit();
+
+    for (addr_list.addrs) |addr| {
+        if (addr.any.family != posix.AF.INET) continue;
+        const addr_bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
         const ip_str = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
-            addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3],
+            addr_bytes[0],
+            addr_bytes[1],
+            addr_bytes[2],
+            addr_bytes[3],
         });
-        try list.append(ip_str);
+        try list.append(allocator, ip_str);
     }
 
-    return list.toOwnedSlice();
+    if (list.items.len == 0) return error.ResolveFailed;
+    return list.toOwnedSlice(allocator);
 }
 
 // ── Netns index allocation ───────────────────────────────────────────
@@ -345,9 +332,9 @@ pub fn seedResolvConf(data_dir: []const u8, id: []const u8, index: u8) !void {
 /// Run an external command synchronously. Returns error on non-zero exit.
 fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .close;
-    child.stdout_behavior = .pipe;
-    child.stderr_behavior = .pipe;
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -359,7 +346,7 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 
     const term = try child.wait();
     switch (term) {
-        .exited => |code| {
+        .Exited => |code| {
             if (code != 0) return error.CommandFailed;
         },
         else => return error.CommandFailed,
@@ -375,21 +362,13 @@ fn writeFile(file_path: []const u8, content: []const u8) !void {
 
 /// Open or create a file for locking purposes.
 fn openOrCreateFile(file_path: []const u8) !posix.fd_t {
-    return posix.open(
-        @ptrCast(file_path.ptr),
-        .{ .ACCMODE = .RDWR, .CREAT = true },
+    var buf: [512]u8 = undefined;
+    const z_path = std.fmt.bufPrintZ(&buf, "{s}", .{file_path}) catch return error.PathTooLong;
+    return posix.openZ(
+        z_path,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
         0o644,
-    ) catch |err| {
-        // Fall back: if the path isn't null-terminated, copy to a buffer
-        _ = err;
-        var buf: [512]u8 = undefined;
-        const z_path = std.fmt.bufPrint(&buf, "{s}\x00", .{file_path}) catch return error.PathTooLong;
-        return posix.open(
-            @ptrCast(z_path.ptr),
-            .{ .ACCMODE = .RDWR, .CREAT = true },
-            0o644,
-        );
-    };
+    );
 }
 
 const SmallFileResult = struct {

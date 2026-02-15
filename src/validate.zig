@@ -9,9 +9,10 @@ pub fn validId(s: []const u8) bool {
     return true;
 }
 
-/// Snapshot labels and module names: non-empty, [a-zA-Z0-9_.-]+
+/// Snapshot labels and module names: non-empty, [a-zA-Z0-9_.-]+, not "." or ".."
 pub fn validLabel(s: []const u8) bool {
     if (s.len == 0) return false;
+    if (std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return false;
     for (s) |ch| {
         if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '.' and ch != '-') return false;
     }
@@ -75,6 +76,8 @@ test "validLabel rejects empty string" {
 test "validLabel rejects path traversal" {
     try std.testing.expect(!validLabel("../../etc"));
     try std.testing.expect(!validLabel("../hack"));
+    try std.testing.expect(!validLabel("."));
+    try std.testing.expect(!validLabel(".."));
 }
 
 test "validLabel rejects spaces and special characters" {

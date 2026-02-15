@@ -14,6 +14,7 @@ pub const cgroup = @import("cgroup.zig");
 pub const netns = @import("netns.zig");
 pub const sandbox_test = @import("sandbox_test.zig");
 pub const manager = @import("manager.zig");
+pub const firecracker = @import("firecracker.zig");
 
 const log = std.log.scoped(.squashd);
 
@@ -166,4 +167,5 @@ test {
     _ = netns;
     _ = sandbox_test;
     _ = manager;
+    _ = firecracker;
 }

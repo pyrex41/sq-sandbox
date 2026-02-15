@@ -23,6 +23,7 @@ const mounts_mod = @import("mounts.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cgroup_mod = @import("cgroup.zig");
 const netns_mod = @import("netns.zig");
+const fc_mod = @import("firecracker.zig");
 
 const Config = config_mod.Config;
 const log = std.log.scoped(.api);
@@ -529,12 +530,6 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
         return;
     }
 
-    var mounted_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const merged_path = std.fmt.bufPrint(&mounted_path_buf, "{s}/merged", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error", allocator);
-        return;
-    };
-
     // Read current seq from log directory
     var log_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const log_dir = std.fmt.bufPrint(&log_dir_buf, "{s}/.meta/log", .{sandbox_path}) catch {
@@ -547,6 +542,69 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
 
     // Get timestamps
     const started = std.time.timestamp();
+
+    // Firecracker backend: exec via vsock
+    if (cfg.backend == .firecracker) {
+        const cid = fc_mod.readCid(sandbox_path) catch {
+            try sendJsonError(request, .internal_server_error, "failed to read CID", allocator);
+            return;
+        };
+
+        var vsock_result = fc_mod.execVsock(
+            cid,
+            exec_req.cmd,
+            exec_req.effectiveWorkdir(),
+            exec_req.effectiveTimeout(),
+            allocator,
+        ) catch {
+            try sendJsonError(request, .internal_server_error, "vsock exec failed", allocator);
+            return;
+        };
+        defer vsock_result.deinit(allocator);
+
+        const finished = std.time.timestamp();
+
+        var started_buf2: [32]u8 = undefined;
+        var finished_buf2: [32]u8 = undefined;
+        const started_str2 = json_mod.formatTimestamp(&started_buf2, started) catch "?";
+        const finished_str2 = json_mod.formatTimestamp(&finished_buf2, finished) catch "?";
+
+        // Write exec log to file (best-effort)
+        writeFirecrackerExecLog(
+            log_dir,
+            seq,
+            exec_req.cmd,
+            exec_req.effectiveWorkdir(),
+            vsock_result.exit_code,
+            started_str2,
+            finished_str2,
+            vsock_result.stdout,
+            vsock_result.stderr,
+        );
+
+        updateLastActive(sandbox_path, started);
+
+        const fc_exec_result = json_mod.ExecResult{
+            .seq = seq,
+            .cmd = exec_req.cmd,
+            .workdir = exec_req.effectiveWorkdir(),
+            .exit_code = vsock_result.exit_code,
+            .started = started_str2,
+            .finished = finished_str2,
+            .stdout = vsock_result.stdout,
+            .stderr = vsock_result.stderr,
+        };
+
+        try sendJson(request, .ok, allocator, fc_exec_result);
+        return;
+    }
+
+    // Chroot backend: exec via fork+chroot
+    var mounted_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const merged_path = std.fmt.bufPrint(&mounted_path_buf, "{s}/merged", .{sandbox_path}) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
 
     // Build merged path as null-terminated for exec
     var merged_z_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -686,6 +744,9 @@ fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const
         var label_buf: [32]u8 = undefined;
         const label = generateSnapshotLabel(&label_buf, now);
 
+        if (cfg.backend == .firecracker) {
+            return doFirecrackerSnapshot(request, allocator, sandbox_path, label);
+        }
         return doSnapshot(request, allocator, sandbox_path, label);
     };
     defer parsed.deinit();
@@ -701,6 +762,9 @@ fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const
         return;
     }
 
+    if (cfg.backend == .firecracker) {
+        return doFirecrackerSnapshot(request, allocator, sandbox_path, label);
+    }
     return doSnapshot(request, allocator, sandbox_path, label);
 }
 
@@ -758,6 +822,90 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
         return;
     };
 
+    // Firecracker backend: stop VM, restart with snapshot layer
+    if (cfg.backend == .firecracker) {
+        const cid_val = fc_mod.readCid(sandbox_path) catch {
+            try sendJsonError(request, .internal_server_error, "failed to read CID", allocator);
+            return;
+        };
+        _ = cid_val;
+
+        var meta_buf3: [std.fs.max_path_bytes]u8 = undefined;
+        const meta_dir = std.fmt.bufPrint(&meta_buf3, "{s}/.meta", .{sandbox_path}) catch {
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
+            return;
+        };
+
+        // Stop the VM
+        fc_mod.stopVm(id, meta_dir, allocator);
+
+        // Allocate new CID for restarted VM
+        // Use the parent data dir (two levels up from sandbox/.meta)
+        const restore_layers = readLayers(allocator, sandbox_path) catch &[_][]const u8{};
+        defer {
+            for (restore_layers) |layer| allocator.free(layer);
+            if (restore_layers.len > 0) allocator.free(restore_layers);
+        }
+
+        // Build squashfs paths including the snapshot layer
+        var modules_dir_buf2: [256]u8 = undefined;
+        const modules_dir = cfg.modulesDir(&modules_dir_buf2) catch {
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
+            return;
+        };
+
+        var sqfs_paths: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (sqfs_paths.items) |p| allocator.free(p);
+            sqfs_paths.deinit(allocator);
+        }
+
+        // Add snapshot layer first (highest priority)
+        const snap_path_dup = try allocator.dupe(u8, snap_path);
+        try sqfs_paths.append(allocator, snap_path_dup);
+
+        // Then base layers
+        for (restore_layers) |layer| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}.squashfs", .{ modules_dir, layer });
+            try sqfs_paths.append(allocator, path);
+        }
+
+        // Get CPU/memory from metadata
+        const cpu_meta = readMetaFile(allocator, sandbox_path, "cpu") catch null;
+        defer if (cpu_meta) |s| allocator.free(s);
+        const cpu_val = if (cpu_meta) |s| std.fmt.parseFloat(f64, s) catch 2.0 else 2.0;
+
+        const mem_meta = readMetaFile(allocator, sandbox_path, "memory_mb") catch null;
+        defer if (mem_meta) |s| allocator.free(s);
+        const mem_val = if (mem_meta) |s| std.fmt.parseInt(u64, s, 10) catch 1024 else 1024;
+
+        // Allocate new CID for restarted VM
+        const new_cid = fc_mod.allocateCid(cfg.data_dir, allocator) catch {
+            try sendJsonError(request, .internal_server_error, "CID allocation failed", allocator);
+            return;
+        };
+        fc_mod.writeCid(sandbox_path, new_cid);
+
+        // Restart VM with snapshot layer
+        fc_mod.startVm(id, cpu_val, mem_val, sqfs_paths.items, new_cid, meta_dir, allocator) catch {
+            try sendJsonError(request, .internal_server_error, "VM restart failed", allocator);
+            return;
+        };
+
+        writeMetaFile(sandbox_path, "active_snapshot", label);
+        updateLastActive(sandbox_path, std.time.timestamp());
+
+        const info = readSandboxInfo(allocator, sb_dir_path, id) catch {
+            try sendJsonError(request, .internal_server_error, "failed to read sandbox", allocator);
+            return;
+        };
+        defer freeSandboxInfo(allocator, info);
+
+        try sendJson(request, .ok, allocator, info);
+        return;
+    }
+
+    // Chroot backend: overlay-based restore
     var snapshot_mp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snapshot_mp_path = std.fmt.bufPrint(&snapshot_mp_path_buf, "{s}/images/_snapshot", .{sandbox_path}) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -947,14 +1095,33 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     // Update last_active
     updateLastActive(sandbox_path, std.time.timestamp());
 
-    mountModuleLayer(sandbox_path, mod_path, module) catch {
-        try sendJsonError(request, .internal_server_error, "failed to mount module", allocator);
-        return;
-    };
-    remountOverlayForSandbox(allocator, sandbox_path) catch {
-        try sendJsonError(request, .internal_server_error, "failed to remount overlay", allocator);
-        return;
-    };
+    // Firecracker backend: hot-add drive + vsock remount
+    if (cfg.backend == .firecracker) {
+        const cid = fc_mod.readCid(sandbox_path) catch {
+            try sendJsonError(request, .internal_server_error, "failed to read CID", allocator);
+            return;
+        };
+        var meta_buf2: [std.fs.max_path_bytes]u8 = undefined;
+        const meta_dir = std.fmt.bufPrint(&meta_buf2, "{s}/.meta", .{sandbox_path}) catch {
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
+            return;
+        };
+
+        fc_mod.addDrive(id, module, mod_path, cid, meta_dir, allocator) catch {
+            try sendJsonError(request, .internal_server_error, "failed to add drive", allocator);
+            return;
+        };
+    } else {
+        // Chroot backend: mount squashfs + remount overlay
+        mountModuleLayer(sandbox_path, mod_path, module) catch {
+            try sendJsonError(request, .internal_server_error, "failed to mount module", allocator);
+            return;
+        };
+        remountOverlayForSandbox(allocator, sandbox_path) catch {
+            try sendJsonError(request, .internal_server_error, "failed to remount overlay", allocator);
+            return;
+        };
+    }
 
     const info = readSandboxInfo(allocator, sb_dir_path, id) catch {
         try sendJsonError(request, .internal_server_error, "failed to read sandbox", allocator);
@@ -1018,6 +1185,81 @@ fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocato
     defer allocator.free(body);
 
     try sendJsonBody(request, .ok, body);
+}
+
+// ── Firecracker Snapshot Helper ────────────────────────────────────────
+
+fn doFirecrackerSnapshot(
+    request: *http.Server.Request,
+    allocator: std.mem.Allocator,
+    sandbox_path: []const u8,
+    label: []const u8,
+) !void {
+    // Check for existing snapshot with same label
+    var snap_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const snap_path = std.fmt.bufPrint(&snap_path_buf, "{s}/.meta/snapshots/{s}.squashfs", .{ sandbox_path, label }) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+    if (std.fs.accessAbsolute(snap_path, .{})) |_| {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "exists: {s}", .{label}) catch "snapshot exists";
+        try sendJsonError(request, .bad_request, err_msg, allocator);
+        return;
+    } else |_| {}
+
+    // Ensure snapshots directory exists
+    var snap_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const snap_dir = std.fmt.bufPrint(&snap_dir_buf, "{s}/.meta/snapshots", .{sandbox_path}) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+    std.fs.makeDirAbsolute(snap_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot dir", allocator);
+            return;
+        },
+    };
+
+    // Tell the guest to snapshot via vsock
+    const cid = fc_mod.readCid(sandbox_path) catch {
+        try sendJsonError(request, .internal_server_error, "failed to read CID", allocator);
+        return;
+    };
+
+    // The guest agent runs __squash_snapshot which creates a squashfs of the upper layer
+    var cmd_buf: [256]u8 = undefined;
+    const snapshot_cmd = std.fmt.bufPrint(&cmd_buf, "__squash_snapshot {s}", .{label}) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+
+    var vsock_result = fc_mod.execVsock(cid, snapshot_cmd, "/", 120, allocator) catch {
+        try sendJsonError(request, .internal_server_error, "vsock snapshot failed", allocator);
+        return;
+    };
+    defer vsock_result.deinit(allocator);
+
+    if (vsock_result.exit_code != 0) {
+        try sendJsonError(request, .internal_server_error, "snapshot command failed", allocator);
+        return;
+    }
+
+    // Get file size (the guest should have created the snapshot file)
+    const stat = std.fs.cwd().statFile(snap_path) catch blk: {
+        break :blk std.fs.File.Stat{
+            .inode = 0, .size = 0, .mode = 0, .kind = .file,
+            .atime = 0, .mtime = 0, .ctime = 0,
+        };
+    };
+
+    const result = json_mod.SnapshotResult{
+        .snapshot = label,
+        .size = stat.size,
+    };
+
+    try sendJson(request, .ok, allocator, result);
 }
 
 // ── Snapshot Helper ────────────────────────────────────────────────────
@@ -1413,6 +1655,10 @@ fn provisionSandboxResources(
     memory_mb: u64,
     allow_net: ?[]const []const u8,
 ) !void {
+    if (cfg.backend == .firecracker) {
+        return provisionFirecrackerSandbox(allocator, cfg, sandbox_path, sandbox_id, layers, cpu, memory_mb, allow_net);
+    }
+
     var modules_dir_buf: [256]u8 = undefined;
     const modules_dir = try cfg.modulesDir(&modules_dir_buf);
 
@@ -1442,6 +1688,59 @@ fn provisionSandboxResources(
 
         netns_mod.seedResolvConf(cfg.data_dir, sandbox_id, ns.index) catch {};
     } else |_| {}
+
+    writeMetaFile(sandbox_path, "mounted", "1");
+}
+
+/// Provision a Firecracker sandbox: allocate CID, set up tap, start VM.
+fn provisionFirecrackerSandbox(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    sandbox_path: []const u8,
+    sandbox_id: []const u8,
+    layers: []const []const u8,
+    cpu: f64,
+    memory_mb: u64,
+    allow_net: ?[]const []const u8,
+) !void {
+    // 1. Allocate CID
+    const cid = try fc_mod.allocateCid(cfg.data_dir, allocator);
+    fc_mod.writeCid(sandbox_path, cid);
+
+    // 2. Allocate a network index (reuse the netns index allocator)
+    const net_index: u8 = @intCast(cid % 254 + 1);
+    fc_mod.writeNetIndex(sandbox_path, net_index);
+
+    // 3. Set up tap networking
+    const allow_net_str: ?[]const u8 = if (allow_net) |nets| blk: {
+        if (nets.len > 0) {
+            break :blk nets[0];
+        }
+        break :blk null;
+    } else null;
+    fc_mod.setupNetwork(sandbox_id, net_index, allow_net_str, allocator) catch |err| {
+        log.warn("firecracker network setup failed: {}", .{err});
+    };
+
+    // 4. Build squashfs paths for VM start
+    var modules_dir_buf: [256]u8 = undefined;
+    const modules_dir = try cfg.modulesDir(&modules_dir_buf);
+
+    var sqfs_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (sqfs_paths.items) |p| allocator.free(p);
+        sqfs_paths.deinit(allocator);
+    }
+    for (layers) |layer| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}.squashfs", .{ modules_dir, layer });
+        try sqfs_paths.append(allocator, path);
+    }
+
+    // 5. Start VM
+    var meta_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_dir = try std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{sandbox_path});
+
+    try fc_mod.startVm(sandbox_id, cpu, memory_mb, sqfs_paths.items, cid, meta_dir, allocator);
 
     writeMetaFile(sandbox_path, "mounted", "1");
 }
@@ -1551,6 +1850,14 @@ fn remountOverlayForSandbox(allocator: std.mem.Allocator, sandbox_path: []const 
 pub fn teardownSandboxResources(allocator: std.mem.Allocator, sandbox_path: []const u8, id: []const u8) !void {
     writeMetaFile(sandbox_path, "mounted", "0");
 
+    // Check if this is a firecracker sandbox (has fc.cid metadata)
+    if (fc_mod.readCid(sandbox_path)) |cid| {
+        _ = cid;
+        teardownFirecrackerSandbox(allocator, sandbox_path, id);
+        return;
+    } else |_| {}
+
+    // Chroot backend teardown
     var merged_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (std.fmt.bufPrintZ(&merged_buf, "{s}/merged", .{sandbox_path})) |merged_z| {
         var overlay = mounts_mod.OverlayMount{
@@ -1620,6 +1927,68 @@ pub fn teardownSandboxResources(allocator: std.mem.Allocator, sandbox_path: []co
             runCommandSilent(allocator, &.{ "ip", "link", "delete", veth_host });
         }
         runCommandSilent(allocator, &.{ "ip", "netns", "delete", name });
+    }
+}
+
+/// Write a Firecracker exec log entry to the log directory.
+/// Best-effort — failures are logged but don't fail the exec.
+fn writeFirecrackerExecLog(
+    log_dir: []const u8,
+    seq: u32,
+    cmd: []const u8,
+    workdir: []const u8,
+    exit_code: i32,
+    started_str: []const u8,
+    finished_str: []const u8,
+    stdout_data: []const u8,
+    stderr_data: []const u8,
+) void {
+    // Ensure log directory exists
+    std.fs.makeDirAbsolute(log_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return,
+    };
+
+    // Build log file path
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&path_buf, "{s}/{d:0>4}.json", .{ log_dir, seq }) catch return;
+
+    // Build JSON content using a fixed buffer
+    var buf: [exec_mod.max_output_bytes * 6 * 2 + 4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+
+    exec_mod.writeLogJson(
+        writer,
+        seq,
+        exec_mod.ExecRequest{ .cmd = cmd, .workdir = workdir },
+        exit_code,
+        started_str,
+        finished_str,
+        stdout_data,
+        stderr_data,
+        false,
+    ) catch return;
+
+    const json_bytes = stream.getWritten();
+
+    const file = std.fs.createFileAbsolute(file_path, .{}) catch return;
+    defer file.close();
+    file.writeAll(json_bytes) catch {};
+}
+
+/// Tear down a Firecracker sandbox: stop VM, tear down tap networking.
+fn teardownFirecrackerSandbox(allocator: std.mem.Allocator, sandbox_path: []const u8, id: []const u8) void {
+    var meta_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_dir = std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{sandbox_path}) catch return;
+
+    // Stop the VM
+    fc_mod.stopVm(id, meta_dir, allocator);
+
+    // Tear down tap networking
+    const net_index = fc_mod.readNetIndex(sandbox_path) catch 0;
+    if (net_index > 0) {
+        fc_mod.teardownNetwork(id, net_index, allocator);
     }
 }
 

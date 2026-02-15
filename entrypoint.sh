@@ -3,9 +3,10 @@ set -eu
 BIN="$(cd "$(dirname "$0")/bin" && pwd)"
 export PATH="$BIN:$PATH"
 
-echo "squash v3"
+echo "squash v4"
 
-# Secret proxy — HTTPS mode (Go MITM) or HTTP mode (shell)
+# Generate proxy CA certificate if HTTPS proxy enabled and secrets exist.
+# Must happen before the daemon starts — the Go proxy reads certs at init.
 if [ -f "${SQUASH_DATA:-/data}/secrets.json" ]; then
     if [ "${SQUASH_PROXY_HTTPS:-}" = "1" ]; then
         _proxy_ca_dir="${SQUASH_DATA:-/data}/proxy-ca"
@@ -19,13 +20,18 @@ if [ -f "${SQUASH_DATA:-/data}/secrets.json" ]; then
             chmod 600 "$_proxy_ca_dir/ca.key"
             echo "[entrypoint] generated proxy CA certificate" >&2
         fi
-        sq-secret-proxy-https &
     else
+        # Shell-based HTTP-only secret proxy (no MITM, no TLS)
         sq-secret-proxy &
     fi
 fi
 
+# Tailscale network setup (background — non-blocking)
 [ -n "${TAILSCALE_AUTHKEY:-}" ] && setup-tailscale &
-sq-init
-sq-reaper &
-exec start-api
+
+# The SBCL daemon handles everything:
+#   - Init/recovery (replaces sq-init)
+#   - Reaper thread (replaces sq-reaper)
+#   - HTTP API server (replaces busybox httpd + CGI)
+#   - Go proxy launch (replaces entrypoint proxy start)
+exec squashd

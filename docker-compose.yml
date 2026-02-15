@@ -1,10 +1,12 @@
-# Default: chroot backend (works on any host with Docker)
+# Squash v4 — CL daemon (chroot backend)
 services:
   squash:
     build: .
     privileged: true
     restart: unless-stopped
-    ports: ["8080:8080"]
+    ports:
+      - "8080:8080"
+      - "4005:4005"   # Swank REPL (set SQUASH_SWANK=1 to enable)
     volumes: [squash-data:/data]
     environment:
       SQUASH_AUTH_TOKEN: ${SQUASH_AUTH_TOKEN:-}
@@ -18,6 +20,7 @@ services:
       SQUASH_UPPER_LIMIT_MB: ${SQUASH_UPPER_LIMIT_MB:-512}
       SQUASH_MAX_SANDBOXES: ${SQUASH_MAX_SANDBOXES:-100}
       SQUASH_PROXY_HTTPS: ${SQUASH_PROXY_HTTPS:-}
+      SQUASH_SWANK: ${SQUASH_SWANK:-}
       TAILSCALE_AUTHKEY: ${TAILSCALE_AUTHKEY:-}
       TAILSCALE_HOSTNAME: ${TAILSCALE_HOSTNAME:-squash}
     healthcheck:

@@ -43,15 +43,26 @@
 
 ;;; ── Exec log ───────────────────────────────────────────────────────
 
+(defun sandbox-root-path (sandbox)
+  "Best-effort sandbox root path derived from merged mount path."
+  (let* ((merged (sandbox-merged-path sandbox))
+         (suffix "/merged")
+         (mlen (length merged))
+         (slen (length suffix)))
+    (if (and (> mlen slen)
+             (string= suffix merged :start2 (- mlen slen)))
+        (subseq merged 0 (- mlen slen))
+        merged)))
+
 (defun write-exec-log (sandbox seq cmd workdir exit-code started finished
-                       stdout-str stderr-str)
+                       stdout-str stderr-str &key sandbox-dir)
   "Write a JSON log entry to .meta/log/exec-<seq>.json for the sandbox.
-   Uses the sandbox's overlay merged path to locate .meta."
+   Uses SANDBOX-DIR when provided, otherwise derives from merged path."
   (declare (type fixnum seq exit-code)
            (type (unsigned-byte 64) started finished)
            (type simple-string cmd workdir stdout-str stderr-str))
-  (let* ((merged (sandbox-merged-path sandbox))
-         (log-dir (concatenate 'string merged "/.meta/log"))
+  (let* ((root (or sandbox-dir (sandbox-root-path sandbox)))
+         (log-dir (concatenate 'string root "/.meta/log"))
          (log-path (format nil "~A/exec-~D.json" log-dir seq)))
     (ensure-directories-exist (concatenate 'string log-dir "/"))
     (with-open-file (s log-path :direction :output
@@ -136,6 +147,22 @@
   (when (minusp (%unshare (logior +clone-newns+ +clone-newpid+
                                    +clone-newipc+ +clone-newuts+)))
     (%exit 125))
+
+  ;; After unshare(CLONE_NEWPID), this process is still in the old PID ns.
+  ;; Fork once more so the inner child executes in the new PID namespace.
+  (let ((inner-pid (%fork)))
+    (cond
+      ((minusp inner-pid) (%exit 126))
+      ((plusp inner-pid)
+       (cffi:with-foreign-object (status :int)
+         (%waitpid inner-pid status 0)
+         (let ((raw-status (cffi:mem-aref status :int 0)))
+           (cond
+             ((zerop (logand raw-status #x7f))
+              (%exit (ash (logand raw-status #xff00) -8)))
+             (t
+              (%exit (+ 128 (logand raw-status #x7f))))))))
+      (t nil)))
 
   ;; chroot into the overlay merged directory, then chdir to workdir
   (let ((merged (sandbox-merged-path sandbox)))
@@ -269,7 +296,8 @@
 
 ;;; ── Main entry point ───────────────────────────────────────────────
 
-(defun exec-in-sandbox (sandbox cmd &key (workdir "/") (timeout 300))
+(defun exec-in-sandbox (sandbox cmd &key (workdir "/") (timeout 300)
+                                        sandbox-dir)
   "Execute CMD in SANDBOX via fork/execve.
    Child enters cgroup, network namespace, unshares mount/PID/IPC/UTS,
    chroots into the overlay merged dir, then runs /bin/sh -c CMD.
@@ -335,7 +363,8 @@
                    (ignore-errors
                      (write-exec-log sandbox seq cmd workdir
                                      exit-code started finished
-                                     stdout-str stderr-str))
+                                     stdout-str stderr-str
+                                     :sandbox-dir sandbox-dir))
 
                    (make-exec-result
                     :exit-code exit-code

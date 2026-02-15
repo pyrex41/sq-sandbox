@@ -1,0 +1,39 @@
+# Test container for squashd - includes SBCL and test dependencies
+FROM debian:bookworm-slim
+
+# Install SBCL, Quicklisp dependencies, and build tools
+RUN apt-get update && apt-get install -y \
+    sbcl \
+    curl \
+    git \
+    build-essential \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Quicklisp
+RUN curl -O https://beta.quicklisp.org/quicklisp.lisp \
+    && sbcl --non-interactive --load quicklisp.lisp \
+            --eval '(quicklisp-quickstart:install :path "/root/quicklisp")' \
+            --quit \
+    && rm quicklisp.lisp \
+    && echo '#-quicklisp (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))' > /root/.sbclrc
+
+# Pre-install test dependencies to speed up test runs
+RUN sbcl --non-interactive \
+         --eval '(ql:quickload :fiveam)' \
+         --eval '(ql:quickload :cffi)' \
+         --eval '(ql:quickload :alexandria)' \
+         --quit
+
+# Set up working directory
+WORKDIR /app
+
+# Copy project files
+COPY . /app/
+
+# Default command: run tests
+CMD ["sbcl", "--non-interactive", \
+     "--eval", "(push #P\"/app/\" asdf:*central-registry*)", \
+     "--eval", "(ql:quickload :squashd-tests)", \
+     "--eval", "(in-package :squashd-tests)", \
+     "--eval", "(or (fiveam:run!) (uiop:quit 1))"]

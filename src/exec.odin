@@ -177,6 +177,10 @@ exec_in_sandbox :: proc(
 	c_close(stderr_fds[1])
 	if netns_fd >= 0 { c_close(netns_fd) }
 
+	// Transition to Executing state — save Ready data and restore after waitpid
+	saved_ready := ready^
+	sandbox.state = Executing{pid = i32(pid), started = started}
+
 	// Read stdout/stderr with poll-based timeout
 	stdout_buf: [MAX_OUTPUT]byte
 	stderr_buf: [MAX_OUTPUT]byte
@@ -247,6 +251,9 @@ exec_in_sandbox :: proc(
 	// Wait for child to exit
 	status: c.int
 	c_waitpid(pid, &status, 0)
+
+	// Transition back to Ready state
+	sandbox.state = saved_ready
 
 	// Close read ends
 	c_close(stdout_fds[0])

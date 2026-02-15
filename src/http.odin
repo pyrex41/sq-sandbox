@@ -1,10 +1,12 @@
 package squashd
 
 import "core:fmt"
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 // ---------------------------------------------------------------------------
 // HTTP types
@@ -54,9 +56,10 @@ Thread_Context :: struct {
 // Constants
 // ---------------------------------------------------------------------------
 
-MAX_REQUEST_SIZE :: 65536
-MAX_HEADERS      :: 32
-MAX_PATH_PARAMS  :: 4
+MAX_REQUEST_SIZE    :: 1048576 // 1 MB max request size
+MAX_HEADERS         :: 32
+MAX_PATH_PARAMS     :: 4
+RECV_TIMEOUT_MS     :: 30000   // 30 seconds
 
 // Worker pool size — matches Zig's pool_size for comparable throughput.
 // Tuned for typical 4–8 core machines; scales with CPU count.
@@ -191,14 +194,63 @@ _worker_loop :: proc(ch: ^Conn_Channel) {
 handle_connection :: proc(client: net.TCP_Socket, ctx: ^Thread_Context) {
 	defer net.close(client)
 
-	buf: [MAX_REQUEST_SIZE]byte
-	n, recv_err := net.recv_tcp(client, buf[:])
-	if recv_err != nil || n <= 0 {
+	// Set receive timeout so we don't block forever on slow/malicious clients
+	net.set_option(client, .Receive_Timeout, time.Duration(RECV_TIMEOUT_MS) * time.Millisecond)
+
+	// Read loop: accumulate data until we have full headers + body
+	buf := make([]byte, MAX_REQUEST_SIZE, context.temp_allocator)
+	total: int = 0
+	header_end: int = -1
+	content_length: int = 0
+
+	for {
+		if total >= MAX_REQUEST_SIZE {
+			send_json_error(client, 413, "request too large")
+			return
+		}
+
+		n, recv_err := net.recv_tcp(client, buf[total:])
+		if recv_err != nil || n <= 0 {
+			if total == 0 {
+				return // Connection closed before any data
+			}
+			break // Use whatever we have
+		}
+		total += n
+
+		// Check if we have complete headers (look for \r\n\r\n)
+		if header_end < 0 {
+			// Search for header terminator in newly received region
+			search_start := 0
+			if total - n >= 3 {
+				search_start = total - n - 3
+			}
+			s := string(buf[search_start:total])
+			idx := strings.index(s, "\r\n\r\n")
+			if idx >= 0 {
+				header_end = search_start + idx + 4 // points past \r\n\r\n
+
+				// Parse Content-Length from the headers we have
+				header_str := string(buf[:header_end])
+				content_length = _parse_content_length(header_str)
+			}
+		}
+
+		// If we have headers, check if body is complete
+		if header_end >= 0 {
+			body_received := total - header_end
+			if body_received >= content_length {
+				break // Full request received
+			}
+		}
+	}
+
+	if total <= 0 {
 		return
 	}
 
 	req: Http_Request
-	if !parse_http_request(buf[:n], &req) {
+	if !parse_http_request(buf[:total], &req) {
 		send_json_error(client, 400, "bad request")
 		return
 	}
@@ -226,6 +278,37 @@ handle_connection :: proc(client: net.TCP_Socket, ctx: ^Thread_Context) {
 	}
 
 	send_json_error(client, 404, "not found")
+}
+
+// Parse Content-Length from raw header string. Returns 0 if not found.
+_parse_content_length :: proc(headers: string) -> int {
+	rest := headers
+	for {
+		line_end := strings.index(rest, "\r\n")
+		if line_end < 0 || line_end == 0 {
+			break
+		}
+		line := rest[:line_end]
+		rest = rest[line_end + 2:]
+
+		colon := strings.index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		name := line[:colon]
+		if strings.equal_fold(name, "Content-Length") {
+			val_str := strings.trim_space(line[colon + 1:])
+			val := 0
+			for ch in val_str {
+				if ch < '0' || ch > '9' {
+					return 0
+				}
+				val = val * 10 + int(ch - '0')
+			}
+			return val
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------

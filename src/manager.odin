@@ -197,36 +197,45 @@ manager_create_sandbox :: proc(
 	id: string,
 	opts: Create_Options,
 ) -> (^Managed_Sandbox, Manager_Create_Error) {
-	// Check capacity
-	if manager_at_capacity(mgr) {
+	// Hold global_lock for capacity check, duplicate check, AND slot reservation
+	// to prevent TOCTOU races between concurrent create requests.
+	sync.mutex_lock(&mgr.global_lock)
+
+	if len(mgr.sandboxes) >= mgr.config.max_sandboxes {
+		sync.mutex_unlock(&mgr.global_lock)
 		return nil, .At_Capacity
 	}
 
-	// Check for duplicate
-	if manager_get(mgr, id) != nil {
+	if mgr.sandboxes[id] != nil {
+		sync.mutex_unlock(&mgr.global_lock)
 		return nil, .Already_Exists
 	}
 
 	// Build sandbox directory path
 	sdir := manager_sandbox_dir(mgr, id)
 
-	// Initialize Managed_Sandbox with arena
+	// Initialize Managed_Sandbox with arena (placeholder in Creating state)
 	ms := managed_sandbox_init(id, sdir, opts, mgr.allocator)
 
-	// Run sandbox_create using the per-sandbox arena allocator
+	// Reserve the slot with the placeholder before releasing the lock
+	mgr.sandboxes[ms.sandbox.id] = ms
+	sync.mutex_unlock(&mgr.global_lock)
+
+	// Slow I/O (sandbox_create) runs outside the global lock
 	sa := managed_sandbox_allocator(ms)
 	context.allocator = sa
 
 	create_err := sandbox_create(mgr.config, &ms.sandbox, opts, sa)
 	if create_err != .None {
-		// Creation failed — arena cleanup frees all sandbox allocations
+		// Creation failed — remove placeholder from map
+		sync.mutex_lock(&mgr.global_lock)
+		delete_key(&mgr.sandboxes, ms.sandbox.id)
+		sync.mutex_unlock(&mgr.global_lock)
+
 		mem.dynamic_arena_destroy(&ms.arena)
 		free(ms, mgr.allocator)
 		return nil, .Create_Failed
 	}
-
-	// Register in the manager's map
-	manager_register(mgr, ms)
 
 	return ms, .None
 }

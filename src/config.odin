@@ -52,6 +52,9 @@ config_from_env :: proc(allocator := context.allocator) -> Config {
 
 	port_str := get_env("SQUASH_PORT", "8080")
 	port_val, _ := strconv.parse_int(port_str, 10)
+	if port_val < 1 || port_val > 65535 {
+		port_val = 8080
+	}
 
 	upper_str := get_env("SQUASH_UPPER_LIMIT_MB", "512")
 	upper_val, _ := strconv.parse_u64_of_base(upper_str, 10)

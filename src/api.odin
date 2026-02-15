@@ -99,6 +99,11 @@ _handle_list_sandboxes :: proc(_: ^Http_Request, resp: ^Http_Response) {
 	sync.mutex_unlock(&_api_manager.global_lock)
 
 	strings.write_byte(&b, ']')
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] list sandboxes response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -155,6 +160,11 @@ _handle_create_sandbox :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		b := strings.builder_from_bytes(buf[:])
 		_write_sandbox_json(&b, &ms.sandbox)
 		sync.mutex_unlock(&ms.lock)
+		if _builder_overflowed(&b, len(buf)) {
+			fmt.eprintln("[api] create sandbox response truncated — buffer overflow")
+			_json_error(resp, 500, "response too large")
+			return
+		}
 		_json_body(resp, 201, strings.to_string(b))
 	case .At_Capacity:
 		_json_error(resp, 400, fmt.tprintf("sandbox limit reached (%d)", _api_config.max_sandboxes))
@@ -183,6 +193,11 @@ _handle_get_sandbox :: proc(req: ^Http_Request, resp: ^Http_Response) {
 	b := strings.builder_from_bytes(buf[:])
 	_write_sandbox_json(&b, &ms.sandbox)
 	sync.mutex_unlock(&ms.lock)
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] get sandbox response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -264,6 +279,11 @@ _handle_exec :: proc(req: ^Http_Request, resp: ^Http_Response) {
 	strings.write_string(&b, `,"stderr":`)
 	_write_json_string(&b, result.stderr)
 	strings.write_string(&b, "}")
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] exec response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -311,6 +331,11 @@ _handle_logs :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		strings.write_string(&b, string(content))
 	}
 	strings.write_byte(&b, ']')
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] logs response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -400,6 +425,11 @@ _handle_restore :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		_json_error(resp, 500, "restore failed")
 		return
 	}
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] restore response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -455,6 +485,11 @@ _handle_activate :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		_json_error(resp, 500, "activate failed")
 		return
 	}
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] activate response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -480,6 +515,11 @@ _handle_list_modules :: proc(_: ^Http_Request, resp: ^Http_Response) {
 		strings.write_string(&b, `,"location":"local"}`)
 	}
 	strings.write_byte(&b, ']')
+	if _builder_overflowed(&b, len(buf)) {
+		fmt.eprintln("[api] list modules response truncated — buffer overflow")
+		_json_error(resp, 500, "response too large")
+		return
+	}
 	_json_body(resp, 200, strings.to_string(b))
 }
 
@@ -603,7 +643,17 @@ _require_json :: proc(req: ^Http_Request, resp: ^Http_Response) -> bool {
 }
 
 _json_error :: proc(resp: ^Http_Response, status: int, message: string) {
-	_json_body(resp, status, fmt.tprintf(`{"error":"%s"}`, message))
+	buf: [1024]byte
+	b := strings.builder_from_bytes(buf[:])
+	strings.write_string(&b, `{"error":`)
+	_write_json_string(&b, message)
+	strings.write_byte(&b, '}')
+	_json_body(resp, status, strings.to_string(b))
+}
+
+// Check if a fixed-size builder overflowed. Returns true if truncated.
+_builder_overflowed :: proc(b: ^strings.Builder, buf_len: int) -> bool {
+	return strings.builder_len(b^) >= buf_len
 }
 
 _json_body :: proc(resp: ^Http_Response, status: int, body: string) {

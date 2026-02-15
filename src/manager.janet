@@ -56,7 +56,7 @@
   # Tear down outside lock
   (sandbox/destroy-sandbox sb)
   (def sdir (config/sandboxes-dir (get manager :config)))
-  (try (os/shell (string "rm -rf " sdir "/" id)) ([e] nil))
+  (try (os/execute ["rm" "-rf" (string sdir "/" id)] :p) ([e] nil))
   sb)
 
 (defn manager-get [manager id]
@@ -136,7 +136,7 @@
 (defn format-timestamp-label []
   (def t (os/date))
   (string/format "%04d%02d%02d-%02d%02d%02d"
-    (get t :year) (+ 1 (get t :month-day 0)) (get t :month-day)
+    (get t :year) (+ 1 (get t :month)) (+ 1 (get t :month-day))
     (get t :hours) (get t :minutes) (get t :seconds)))
 
 (defn manager-snapshot [manager id label]
@@ -190,7 +190,7 @@
     (try (mounts/unmount-squashfs (get mounts :snapshot-mount)) ([e] nil)))
   (def upper-data (string sdir "/upper/data"))
   (def upper-work (string sdir "/upper/work"))
-  (try (os/shell (string "rm -rf " upper-data " " upper-work)) ([e] nil))
+  (try (os/execute ["rm" "-rf" upper-data upper-work] :p) ([e] nil))
   (mounts/ensure-dir upper-data)
   (mounts/ensure-dir upper-work)
   (def snap-mp (string sdir "/images/_snapshot"))

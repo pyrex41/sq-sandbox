@@ -14,7 +14,7 @@
   (def cgroup-path (string cgroup-root "/squashd-" id))
 
   # Create cgroup directory
-  (os/shell (string "mkdir -p " cgroup-path))
+  (os/execute ["mkdir" "-p" cgroup-path] :p)
 
   # cpu.max: "<quota> <period>"
   (def quota (math/round (* cpu-cores cgroup-period-us)))

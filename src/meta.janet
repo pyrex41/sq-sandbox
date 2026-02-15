@@ -4,7 +4,7 @@
 
 (defn write-sandbox-meta [sandbox-dir meta]
   (def path (string sandbox-dir "/.meta/sandbox.json"))
-  (os/shell (string "mkdir -p " sandbox-dir "/.meta"))
+  (os/execute ["mkdir" "-p" (string sandbox-dir "/.meta")] :p)
   (spit path (json/encode meta)))
 
 (defn read-sandbox-meta [sandbox-dir]

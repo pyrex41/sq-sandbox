@@ -30,7 +30,7 @@
 (def status-texts
   {200 "OK" 201 "Created" 204 "No Content"
    400 "Bad Request" 401 "Unauthorized" 404 "Not Found"
-   409 "Conflict" 413 "Payload Too Large"
+   409 "Conflict" 413 "Payload Too Large" 415 "Unsupported Media Type"
    500 "Internal Server Error" 503 "Service Unavailable"})
 
 # ── HTTP request parsing ──────────────────────────────────────────────
@@ -303,6 +303,13 @@
           (when (not (check-auth req config))
             (write-response stream (error-response "unauthorized" 401))
             (break))
+
+          # Content-Type check for POST/PUT
+          (when (or (= (get req :method) "POST") (= (get req :method) "PUT"))
+            (def ct (get (get req :headers) "content-type" ""))
+            (when (not (string/find "application/json" ct))
+              (write-response stream (error-response "unsupported media type" 415))
+              (break)))
 
           # Dispatch and handle errors from handlers
           (def response

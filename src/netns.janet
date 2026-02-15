@@ -94,8 +94,11 @@
   [id allow-net]
   (def index (allocate-index))
   (def name (string "squash-" id))
-  (def veth-host (string "sq-" id "-h"))
-  (def veth-sandbox (string "sq-" id "-s"))
+  # Linux veth names max 15 chars: "sq-" (3) + short-id (10) + "-h" (2) = 15
+  (def max-id-len 10)
+  (def short-id (if (> (length id) max-id-len) (string/slice id 0 max-id-len) id))
+  (def veth-host (string "sq-" short-id "-h"))
+  (def veth-sandbox (string "sq-" short-id "-s"))
   (def subnet (string/format "10.200.%d.0/30" index))
   (def host-addr (string/format "10.200.%d.1/30" index))
   (def sandbox-addr (string/format "10.200.%d.2/30" index))

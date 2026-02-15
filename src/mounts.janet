@@ -5,7 +5,7 @@
 
 (defn ensure-dir [path]
   "Create directory and parents. Ignores if exists."
-  (os/shell (string "mkdir -p " path)))
+  (os/execute ["mkdir" "-p" path] :p))
 
 (defn mount-squashfs [source-path mount-point]
   "Mount squashfs read-only. Returns table with :mount-point :active."

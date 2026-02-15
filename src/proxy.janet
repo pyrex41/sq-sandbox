@@ -19,13 +19,13 @@
   (when (os/stat ca-crt)
     (return nil))
   (mounts/ensure-dir ca-dir)
-  (def rc (os/execute (array "openssl" "req" "-new" "-newkey" "ec"
-                             "-pkeyopt" "ec_paramgen_curve:prime256v1"
-                             "-days" "3650" "-nodes" "-x509"
-                             "-subj" "/CN=sq-secret-proxy CA"
-                             "-keyout" (string ca-dir "/ca.key")
-                             "-out" ca-crt)
-               :p true))
+  (def rc (os/execute ["openssl" "req" "-new" "-newkey" "ec"
+                       "-pkeyopt" "ec_paramgen_curve:prime256v1"
+                       "-days" "3650" "-nodes" "-x509"
+                       "-subj" "/CN=sq-secret-proxy CA"
+                       "-keyout" (string ca-dir "/ca.key")
+                       "-out" ca-crt]
+               :p))
   (when (= rc 0)
     (eprintf "proxy: generated CA at %s\n" ca-crt)))
 
@@ -39,10 +39,10 @@
   (var bin (or (os/getenv "SQ_PROXY_BIN") "sq-secret-proxy-https"))
   (when (not (get config :proxy-https))
     (set bin (or (os/getenv "SQ_PROXY_BIN") "sq-secret-proxy")))
-  (when (not (os/which bin))
+  (when (not= 0 (os/execute ["which" bin] :p))
     (eprintf "proxy: %s not found, skipping\n" bin)
     (return nil))
   (ev/go
     (fn []
       (eprintf "proxy: starting %s on :8888\n" bin)
-      (os/execute (array bin) :e env :p true))))
+      (os/execute [bin] :ep env))))

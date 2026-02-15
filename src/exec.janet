@@ -111,7 +111,7 @@
     (def log-dir (string sdir "/.meta/log"))
     (try
       (do
-        (os/shell (string "mkdir -p " log-dir))
+        (os/execute ["mkdir" "-p" log-dir] :p)
         (spit (string log-dir "/" (string/format "%04d" seq) ".json")
           (json/encode @{
             :seq seq :cmd cmd :workdir workdir

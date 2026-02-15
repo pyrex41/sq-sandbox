@@ -35,17 +35,19 @@
 
 # ── HTTP request parsing ──────────────────────────────────────────────
 
+(def max-header-size 8192)
+(def max-body-size 1048576)  # 1 MiB
+
 (defn- read-request
   "Read and parse an HTTP request from stream. Returns table or nil."
   [stream]
   (def buf @"")
-  (def max-header-size 8192)
 
   # Read until we find end of headers (\r\n\r\n)
   (while (nil? (string/find "\r\n\r\n" (string buf)))
-    (when (> (length buf) max-header-size) (break))
+    (when (> (length buf) max-header-size) (break nil))
     (def chunk (try (ev/read stream 4096) ([e] nil)))
-    (when (or (nil? chunk) (= (length chunk) 0)) (break))
+    (when (or (nil? chunk) (= (length chunk) 0)) (break nil))
     (buffer/push buf chunk))
 
   (def sep (string/find "\r\n\r\n" (string buf)))
@@ -72,8 +74,10 @@
         (string/ascii-lower (string/trim (string/slice line 0 colon)))
         (string/trim (string/slice line (+ colon 1))))))
 
-  # Read body based on Content-Length
+  # Read body based on Content-Length — enforce max body size
   (def content-length (or (scan-number (get headers "content-length" "0")) 0))
+  (when (> content-length max-body-size)
+    (break nil))  # Reject oversized; caller will 413
   (def body-buf (buffer/slice buf body-start))
   (when (< (length body-buf) content-length)
     (def remaining (- content-length (length body-buf)))
@@ -124,13 +128,15 @@
 
 (defn- handle-health [config manager]
   (try
-    (json-response @{
-      :status "ok"
-      :backend "chroot"
-      :sandboxes (manager/manager-sandbox-count manager)
-      :modules (length (modules/list-modules config))
-      :base_ready (modules/base-module-exists? config)
-    } 200)
+    (do
+      (def backend (if (= (get config :backend) "firecracker") "firecracker" "chroot"))
+      (json-response @{
+        :status "ok"
+        :backend backend
+        :sandboxes (manager/manager-sandbox-count manager)
+        :modules (length (modules/list-modules config))
+        :base_ready (modules/base-module-exists? config)
+      } 200))
     ([e] (json-response @{:status "ok"} 200))))
 
 (defn- handle-list-sandboxes [manager]
@@ -171,10 +177,15 @@
 (defn- handle-exec [id req manager]
   (def data (parse-json-body req))
   (def cmd (get data "cmd"))
-  (when (not cmd) (break (error-response "cmd required")))
+  (when (not (validate/valid-cmd? cmd))
+    (break (error-response "cmd required, max 64KiB" 400)))
+  (def workdir (get data "workdir" "/"))
+  (when (not (validate/valid-workdir? workdir))
+    (break (error-response "workdir must be absolute path, no .." 400)))
+  (def timeout (validate/clamp-timeout (get data "timeout" 300) 1 3600))
   (def result (manager/manager-exec manager id cmd @{
-    :workdir (get data "workdir" "/")
-    :timeout (get data "timeout" 300)
+    :workdir workdir
+    :timeout timeout
   }))
   (json-response @{
     :exit_code (get result :exit_code)
@@ -297,6 +308,11 @@
           (def req (read-request stream))
           (when (nil? req)
             (write-response stream (error-response "bad request" 400))
+            (break))
+          # Reject oversized body (Content-Length checked in read-request)
+          (def cl (or (scan-number (get (get req :headers) "content-length" "0")) 0))
+          (when (> cl max-body-size)
+            (write-response stream (error-response "payload too large" 413))
             (break))
 
           # Auth check

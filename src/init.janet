@@ -9,6 +9,17 @@
 (import netns)
 (import lock)
 
+(defn- fc-backend? [config]
+  (= (get config :backend) "firecracker"))
+
+(defn- read-int-file
+  "Read integer from file, or nil on failure."
+  [path]
+  (try
+    (when (os/stat path)
+      (scan-number (string/trim (slurp path))))
+    ([e] nil)))
+
 (defn scan-sandbox-dirs [data-dir]
   (def sb-dir (string data-dir "/sandboxes"))
   (def result @[])
@@ -41,40 +52,75 @@
 (defn recover-sandbox [manager id data-dir]
   "Attempt to recover sandbox. Returns sandbox or nil."
   (def sandbox-dir (string data-dir "/sandboxes/" id))
+  (def cfg (get manager :config))
   (def meta-data (meta/read-sandbox-meta sandbox-dir))
   (when (not meta-data)
     (eprintf "init: %s has no metadata, skipping\n" id)
     (return nil))
-  (var layers (get meta-data "layers" @["000-base-alpine"]))
-  (when (string? layers)
-    (set layers @[layers]))
-  (def mounts (remount-sandbox (get manager :config) sandbox-dir id layers))
-  (when (not mounts)
-    (try (os/execute ["rm" "-rf" sandbox-dir] :p) ([e] nil))
-    (return nil))
-  (def cg (try (cgroup/create-cgroup id (get meta-data "cpu" 2) (get meta-data "memory_mb" 1024)) ([e] nil)))
-  (def ns (try (netns/setup-netns id (get meta-data "allow_net")) ([e] nil)))
-  (when ns
-    (def etc-dir (string sandbox-dir "/upper/data/etc"))
-    (mounts/ensure-dir etc-dir)
-    (spit (string etc-dir "/resolv.conf")
-          (string "nameserver " (string/format "10.200.%d.1" (get ns :index)) "\n")))
-  (def sandbox @{
-    :id id
-    :dir sandbox-dir
-    :state :ready
-    :mounts mounts
-    :cgroup cg
-    :netns ns
-    :created (get meta-data "created" (math/floor (os/time)))
-    :last-active (math/floor (os/time))
-    :exec-count 0
-    :max-lifetime-s (get meta-data "max_lifetime_s" 0)
-  })
-  (lock/with-lock (get manager :lock)
-    (put (get manager :sandboxes) id sandbox))
-  (eprintf "init: recovered %s\n" id)
-  sandbox)
+  (if (fc-backend? cfg)
+    (do
+      # Firecracker recovery: no host overlay/cgroup/netns reconstruction.
+      (def cid (or (get meta-data "cid")
+                   (read-int-file (string sandbox-dir "/.meta/cid"))))
+      (when (not cid)
+        (eprintf "init: %s missing Firecracker CID, skipping\n" id)
+        (return nil))
+      (def index (% cid 255))
+      (var layers (get meta-data "layers" @["000-base-alpine"]))
+      (when (string? layers)
+        (set layers @[layers]))
+      (def sandbox @{
+        :id id
+        :dir sandbox-dir
+        :state :ready
+        :backend :firecracker
+        :cid cid
+        :net-info @{:index index}
+        :layers layers
+        :cpu (get meta-data "cpu" 2)
+        :memory-mb (get meta-data "memory_mb" 1024)
+        :created (get meta-data "created" (math/floor (os/time)))
+        :last-active (math/floor (os/time))
+        :exec-count 0
+        :owner (get meta-data "owner" "anon")
+        :task (get meta-data "task" "")
+        :max-lifetime-s (get meta-data "max_lifetime_s" 0)
+      })
+      (lock/with-lock (get manager :lock)
+        (put (get manager :sandboxes) id sandbox))
+      (eprintf "init: recovered firecracker %s\n" id)
+      sandbox)
+    (do
+      (var layers (get meta-data "layers" @["000-base-alpine"]))
+      (when (string? layers)
+        (set layers @[layers]))
+      (def mounts (remount-sandbox cfg sandbox-dir id layers))
+      (when (not mounts)
+        (try (os/execute ["rm" "-rf" sandbox-dir] :p) ([e] nil))
+        (return nil))
+      (def cg (try (cgroup/create-cgroup id (get meta-data "cpu" 2) (get meta-data "memory_mb" 1024)) ([e] nil)))
+      (def ns (try (netns/setup-netns id (get meta-data "allow_net")) ([e] nil)))
+      (when ns
+        (def etc-dir (string sandbox-dir "/upper/data/etc"))
+        (mounts/ensure-dir etc-dir)
+        (spit (string etc-dir "/resolv.conf")
+              (string "nameserver " (string/format "10.200.%d.1" (get ns :index)) "\n")))
+      (def sandbox @{
+        :id id
+        :dir sandbox-dir
+        :state :ready
+        :mounts mounts
+        :cgroup cg
+        :netns ns
+        :created (get meta-data "created" (math/floor (os/time)))
+        :last-active (math/floor (os/time))
+        :exec-count 0
+        :max-lifetime-s (get meta-data "max_lifetime_s" 0)
+      })
+      (lock/with-lock (get manager :lock)
+        (put (get manager :sandboxes) id sandbox))
+      (eprintf "init: recovered %s\n" id)
+      sandbox)))
 
 (defn init-recover [config manager]
   "Main init entry. Returns [recovered failed]."

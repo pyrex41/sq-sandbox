@@ -15,11 +15,18 @@
   (def val (os/getenv name))
   (and val (or (= val "1") (= (string/ascii-lower val) "true"))))
 
+(defn data-dir-from-env []
+  "Prefer SQUASH_DATA_DIR, fall back to legacy SQUASH_DATA."
+  (def preferred (os/getenv "SQUASH_DATA_DIR"))
+  (if (and preferred (> (length preferred) 0))
+    preferred
+    (env-or "SQUASH_DATA" "/data")))
+
 (defn config-from-env
   "Create config table from environment variables."
   []
   @{
-    :data-dir (env-or "SQUASH_DATA" "/data")
+    :data-dir (data-dir-from-env)
     :port (env-int "SQUASH_PORT" 8080)
     :max-sandboxes (env-int "SQUASH_MAX_SANDBOXES" 100)
     :upper-limit-mb (env-int "SQUASH_UPPER_LIMIT_MB" 512)
@@ -42,3 +49,26 @@
 
 (defn proxy-ca-dir [config]
   (string (get config :data-dir) "/proxy-ca"))
+
+# ── Validation (fail-fast at startup) ───────────────────────────────────────
+
+(defn validate-config! [config]
+  "Validate config. Throws on invalid values. Call at startup."
+  (def port (get config :port 8080))
+  (when (or (< port 1) (> port 65535))
+    (error (string/format "SQUASH_PORT must be 1-65535, got %d" port)))
+  (def max-sb (get config :max-sandboxes 100))
+  (when (or (< max-sb 1) (> max-sb 10000))
+    (error (string/format "SQUASH_MAX_SANDBOXES must be 1-10000, got %d" max-sb)))
+  (def upper (get config :upper-limit-mb 512))
+  (when (or (< upper 16) (> upper 32768))
+    (error (string/format "SQUASH_UPPER_LIMIT_MB must be 16-32768, got %d" upper)))
+  (def backend (get config :backend "chroot"))
+  (when (not (or (= backend "chroot") (= backend "firecracker")))
+    (error (string/format "SQUASH_BACKEND must be chroot or firecracker, got %s" backend)))
+  (def data-dir (get config :data-dir))
+  (when (or (not data-dir) (= (length data-dir) 0))
+    (error "SQUASH_DATA/SQUASH_DATA_DIR must be set"))
+  (when (string/find ".." data-dir)
+    (error "data-dir must not contain .."))
+  config)

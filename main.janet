@@ -15,11 +15,12 @@
 
 (defn main [&]
   (def cfg (config/config-from-env))
+  (config/validate-config! cfg)
   (def mgr (manager/make-manager cfg))
 
   # Ensure data dirs exist
-  (os/shell (string "mkdir -p " (get cfg :data-dir) "/sandboxes "
-                    (get cfg :data-dir) "/modules"))
+  (os/execute ["mkdir" "-p" (string (get cfg :data-dir) "/sandboxes")] :p)
+  (os/execute ["mkdir" "-p" (string (get cfg :data-dir) "/modules")] :p)
 
   # S3 sync modules (if configured)
   (when (s3/s3-enabled? cfg)

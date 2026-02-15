@@ -1,52 +1,66 @@
 # Firecracker backend — VM lifecycle via sq-firecracker CLI + vsock exec.
 #
 # Delegates heavy lifting to the sq-firecracker helper binary.
-# Host-side: tap networking, CID allocation, drive hot-add.
+# Host-side: tap networking, CID allocation (native flock), drive hot-add.
 # Guest-side: vsock JSON protocol for exec, remount, snapshot.
 
 (import json)
 (import config :prefix "config/")
 (import mounts :prefix "mounts/")
+(import syscalls)
 
 (def max-output 65536)
 (def timeout-exit-code 124)
+(def min-cid 100)
+
+(defn- allow-net-hosts
+  "Normalize allow-net input into an array of host strings."
+  [allow-net]
+  (def hosts @[])
+  (when allow-net
+    (if (string? allow-net)
+      (array/push hosts allow-net)
+      (each host allow-net
+        (when (string? host)
+          (array/push hosts host)))))
+  hosts)
 
 # ---------------------------------------------------------------------------
-# CID allocation — atomic counter with flock
+# CID allocation — native flock(2) via FFI, no shell
 # ---------------------------------------------------------------------------
 
 (defn allocate-cid
-  "Allocate a unique CID for a Firecracker VM. Uses flock for atomicity."
+  "Allocate a unique CID for a Firecracker VM. Uses flock(2) for atomicity."
   [config]
   (def data-dir (get config :data-dir))
   (def lock-path (string data-dir "/.fc-cid-counter.lock"))
   (def counter-path (string data-dir "/.fc-cid-counter"))
-
-  # flock + read/increment/write in a single shell-free pipeline
-  # We use a small helper script via /bin/sh -c since flock requires fd ops.
-  # But the actual counter logic is safe — no user input in the command.
-  (def script
-    (string
-      "exec 9>" lock-path "; "
-      "flock 9; "
-      "if [ -f " counter-path " ]; then "
-      "  CID=$(cat " counter-path "); "
-      "else "
-      "  CID=100; "
-      "fi; "
-      "echo $CID; "
-      "echo $((CID + 1)) > " counter-path "; "
-      "exec 9>&-"))
-
-  (def proc (os/spawn ["/bin/sh" "-c" script] :p {:out :pipe}))
-  (def out @"")
-  (while true
-    (def chunk (try (ev/read (in proc :out) 4096) ([e] nil)))
-    (when (or (nil? chunk) (= (length chunk) 0)) (break))
-    (buffer/push out chunk))
-  (os/proc-wait proc)
-  (os/proc-close proc)
-  (scan-number (string/trim (string out))))
+  (mounts/ensure-dir data-dir)
+  (try
+    (syscalls/flock-allocate-counter lock-path counter-path min-cid)
+    ([e]
+      # Fallback to shell if FFI unavailable (e.g. non-Linux)
+      (def script
+        (string
+          "exec 9>" lock-path "; "
+          "flock 9; "
+          "if [ -f " counter-path " ]; then "
+          "  CID=$(cat " counter-path "); "
+          "else "
+          "  CID=" (string min-cid) "; "
+          "fi; "
+          "echo $CID; "
+          "echo $((CID + 1)) > " counter-path "; "
+          "exec 9>&-"))
+      (def proc (os/spawn ["/bin/sh" "-c" script] :p {:out :pipe}))
+      (def out @"")
+      (while true
+        (def chunk (try (ev/read (in proc :out) 4096) ([e] nil)))
+        (when (or (nil? chunk) (= (length chunk) 0)) (break))
+        (buffer/push out chunk))
+      (os/proc-wait proc)
+      (os/proc-close proc)
+      (scan-number (string/trim (string out))))))
 
 # ---------------------------------------------------------------------------
 # Network — tap device + NAT (not veth like chroot backend)
@@ -58,28 +72,52 @@
   (def tap-name (string "sq-" id "-tap"))
   (def host-ip (string/format "10.0.%d.1/30" index))
   (def subnet (string/format "10.0.%d.0/30" index))
+  (def hosts (allow-net-hosts allow-net))
+  (def chain (string "SQ-" id))
 
   # Create tap device
   (os/execute ["ip" "tuntap" "add" "dev" tap-name "mode" "tap"] :p)
   (os/execute ["ip" "addr" "add" host-ip "dev" tap-name] :p)
   (os/execute ["ip" "link" "set" tap-name "up"] :p)
 
-  # NAT for outbound traffic
-  (when allow-net
-    (os/execute ["iptables" "-t" "nat" "-A" "POSTROUTING"
-                 "-s" subnet "-j" "MASQUERADE"] :p))
+  # NAT for outbound traffic (always needed).
+  (os/execute ["iptables" "-t" "nat" "-A" "POSTROUTING"
+               "-s" subnet "-j" "MASQUERADE"] :p)
+
+  # Optional egress allow-list chain.
+  (when (> (length hosts) 0)
+    (os/execute ["iptables" "-N" chain] :p)
+    (os/execute ["iptables" "-I" "FORWARD" "-i" tap-name "-j" chain] :p)
+    (os/execute ["iptables" "-A" chain "-m" "conntrack" "--ctstate" "ESTABLISHED,RELATED" "-j" "ACCEPT"] :p)
+    (os/execute ["iptables" "-A" chain "-p" "udp" "--dport" "53" "-j" "ACCEPT"] :p)
+    (os/execute ["iptables" "-A" chain "-p" "tcp" "--dport" "53" "-j" "ACCEPT"] :p)
+    (each host hosts
+      (if (string/find "*" host)
+        (eprintf "fc-net: wildcard %s requires proxy mode, skipping\n" host)
+        (os/execute ["iptables" "-A" chain "-d" host "-j" "ACCEPT"] :p)))
+    (os/execute ["iptables" "-A" chain "-j" "DROP"] :p))
 
   @{:tap-name tap-name
     :index index
     :host-ip host-ip
     :subnet subnet
-    :allow-net allow-net})
+    :allow-net allow-net
+    :chain (if (> (length hosts) 0) chain nil)})
 
 (defn fc-teardown-network
   "Remove tap device and NAT rules."
   [id index]
   (def tap-name (string "sq-" id "-tap"))
   (def subnet (string/format "10.0.%d.0/30" index))
+  (def chain (string "SQ-" id))
+
+  # Remove optional egress chain.
+  (try (os/execute ["iptables" "-D" "FORWARD" "-i" tap-name "-j" chain] :p)
+    ([e] nil))
+  (try (os/execute ["iptables" "-F" chain] :p)
+    ([e] nil))
+  (try (os/execute ["iptables" "-X" chain] :p)
+    ([e] nil))
 
   # Remove NAT rule (best-effort)
   (try (os/execute ["iptables" "-t" "nat" "-D" "POSTROUTING"

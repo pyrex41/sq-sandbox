@@ -23,6 +23,7 @@
     :port (env-int "SQUASH_PORT" 8080)
     :max-sandboxes (env-int "SQUASH_MAX_SANDBOXES" 100)
     :upper-limit-mb (env-int "SQUASH_UPPER_LIMIT_MB" 512)
+    :backend (env-or "SQUASH_BACKEND" "chroot")
     :auth-token (env-or "SQUASH_AUTH_TOKEN" nil)
     :s3-bucket (env-or "SQUASH_S3_BUCKET" nil)
     :s3-endpoint (env-or "SQUASH_S3_ENDPOINT" nil)

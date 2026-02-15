@@ -6,6 +6,7 @@
 
 (import config)
 (import manager)
+(import firecracker)
 (import api)
 (import init)
 (import reaper)

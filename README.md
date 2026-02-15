@@ -329,12 +329,22 @@ and how much is implemented in-language vs. delegated to external tools.
 | Odin | Shell | Delegates to `sq-s3` script (sigv4.odin exists but unwired) |
 | Janet | Shell | Delegates to `sq-s3` via `os/execute` / `os/spawn` |
 
+### Binary Sizes (measured)
+
+| Language | Binary | Stripped | Notes |
+|----------|--------|---------|-------|
+| Odin | 838 KB | — | ELF aarch64-linux, not yet stripped |
+| Zig | 2.7 MB | 2.3 MB | Mach-O arm64 |
+| Rust | 22 MB | 17 MB | Mach-O arm64, many deps (tokio, aws-sdk, rustls) |
+| CL | ~20 MB | N/A | SBCL image (runtime + compiler + libs, zstd compressed) |
+| Janet | 71 KB src | N/A | Interpreted; requires ~1MB Janet runtime |
+
 ### Trade-offs
 
 | Criterion | Best fit |
 |-----------|----------|
-| Smallest codebase | Janet (~1.9k LOC) |
-| Smallest binary | Zig, Odin (~2-5MB static) |
+| Smallest codebase | Janet (~1.9k LOC, 71KB source) |
+| Smallest binary | Odin (838KB), Zig (2.3MB stripped) |
 | Most self-contained | Rust (native S3 + native HTTPS proxy) |
 | Lowest dependency surface | Zig, Odin |
 | Fastest iteration / REPL | Common Lisp (Swank + live image) |

@@ -334,10 +334,10 @@ and how much is implemented in-language vs. delegated to external tools.
 | Criterion | Best fit |
 |-----------|----------|
 | Smallest codebase | Janet (~1.9k LOC) |
+| Smallest binary | Zig, Odin (~2-5MB static) |
 | Most self-contained | Rust (native S3 + native HTTPS proxy) |
 | Lowest dependency surface | Zig, Odin |
 | Fastest iteration / REPL | Common Lisp (Swank + live image) |
 | Strongest typing | Rust, Zig |
 | Simplest deployment | Janet (single interpreter) |
 | Production hardening | Rust (tracing, error types, async, RAII) |
-| Smallest binary | CL (~12-15MB compressed SBCL image) |

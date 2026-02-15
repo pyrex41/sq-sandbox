@@ -15,6 +15,7 @@
   (port           8080     :type fixnum)
   (max-sandboxes  100      :type fixnum)
   (upper-limit-mb 512      :type fixnum)
+  (backend        :chroot  :type keyword)
   (auth-token     nil      :type (or null simple-string))
   (s3-bucket      nil      :type (or null simple-string))
   (s3-region      "us-east-2" :type simple-string)
@@ -53,6 +54,13 @@
   (let ((val (uiop:getenv name)))
     (and val (or (string= val "1") (string-equal val "true")))))
 
+(defun parse-backend (val)
+  "Parse backend string to keyword. Returns :CHROOT or :FIRECRACKER."
+  (let ((s (string-downcase (or val "chroot"))))
+    (cond
+      ((string= s "firecracker") :firecracker)
+      (t :chroot))))
+
 (defun config-from-env ()
   "Create a config struct from environment variables.
    Environment variables:
@@ -60,6 +68,7 @@
      SQUASH_PORT         — HTTP port (default 8080)
      SQUASH_MAX_SANDBOXES — max concurrent sandboxes (default 100)
      SQUASH_UPPER_LIMIT_MB — tmpfs upper layer size in MB (default 512)
+     SQUASH_BACKEND      — sandbox backend: chroot or firecracker (default chroot)
      SQUASH_AUTH_TOKEN   — bearer token for API auth (optional)
      SQUASH_S3_BUCKET    — S3 bucket for module sync (optional)
      SQUASH_S3_REGION    — S3 region (default us-east-2)
@@ -74,6 +83,7 @@
    :port           (env-int "SQUASH_PORT" 8080)
    :max-sandboxes  (env-int "SQUASH_MAX_SANDBOXES" 100)
    :upper-limit-mb (env-int "SQUASH_UPPER_LIMIT_MB" 512)
+   :backend        (parse-backend (env-or "SQUASH_BACKEND" "chroot"))
    :auth-token     (env-or "SQUASH_AUTH_TOKEN" nil)
    :s3-bucket      (env-or "SQUASH_S3_BUCKET" nil)
    :s3-region      (env-or "SQUASH_S3_REGION" "us-east-2")

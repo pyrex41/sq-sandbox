@@ -8,7 +8,7 @@
 ;;;
 ;;; COLD PATH — runs once at startup.
 
-(declaim (optimize (speed 1) (safety 3) (debug 3)))
+(declaim (optimize (speed 2) (safety 1) (debug 0)))
 
 (defvar *manager* nil
   "The global sandbox manager instance.")
@@ -142,15 +142,33 @@
 ;;; ── Image building ────────────────────────────────────────────────────
 
 (defun build-image (&key (output "squashd"))
-  "Save a standalone executable image.
+  "Save a production executable image with maximum optimization.
    Call this after loading the squashd system:
      (ql:quickload \"squashd\")
      (squashd::build-image)"
+  ;; Strip debug info and reduce safety for smaller, faster binary
+  (sb-ext:restrict-compiler-policy 'debug 0)
+  (sb-ext:restrict-compiler-policy 'safety 1)
   ;; Full GC before save to compact heap
   (sb-ext:gc :full t)
   (sb-ext:save-lisp-and-die output
     :toplevel #'squashd:main
     :executable t
-    :compression t    ; zstd compression — shrinks image from ~50MB to ~20MB
+    :compression 9    ; near-max zstd compression — saves ~1.5MB over default
     :purify t         ; move immutable data to read-only space (helps fork COW)
+    :save-runtime-options t))
+
+(defun build-image-dev (&key (output "squashd-dev"))
+  "Save a development executable image with full debug info.
+   Preserves debug-friendly settings for interactive development.
+   Call this after loading the squashd system:
+     (ql:quickload \"squashd\")
+     (squashd::build-image-dev)"
+  ;; Full GC before save to compact heap
+  (sb-ext:gc :full t)
+  (sb-ext:save-lisp-and-die output
+    :toplevel #'squashd:main
+    :executable t
+    :compression t    ; default zstd compression
+    :purify t
     :save-runtime-options t))

@@ -28,6 +28,7 @@
                (:file "netns")
                (:file "exec")
                (:file "sandbox")
+               (:file "firecracker")
                (:file "manager")
                (:file "meta")
                (:file "modules")

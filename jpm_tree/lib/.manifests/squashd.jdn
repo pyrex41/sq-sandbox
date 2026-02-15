@@ -1,0 +1,1 @@
+{:dependencies @["https://github.com/janet-lang/json.git" "https://github.com/janet-lang/ev.git"] :version "4.0.0" :paths @[] :url "git@github.com:pyrex41/sq-sandbox.git" :tag "2f11c45bda4bedfc215b0b602e391c8b5b3f8e20" :type :git}

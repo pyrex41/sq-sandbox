@@ -1,42 +1,224 @@
-# Manager — sandbox registry, per-sandbox lock
-# Uses a table for sandboxes, ev/mutex for concurrency.
+# Manager — sandbox registry with fiber-safe locking.
+#
+# Uses channel-based lock from lock.janet for fiber-friendly
+# mutual exclusion inside net/server handlers.
 
 (import sandbox :prefix "sandbox/")
+(import exec)
+(import mounts :prefix "mounts/")
+(import config :prefix "config/")
+(import validate :prefix "validate/")
+(import modules :prefix "modules/")
+(import json)
+(import lock)
+(import s3)
 
 (defn make-manager [config]
   @{
     :config config
     :sandboxes @{}
-    :lock (ev/lock)
+    :lock (lock/make-lock)
   })
 
 (defn manager-create [manager id opts]
   "Create sandbox. Returns sandbox or throws."
-  (ev/with-lock (get manager :lock)
+  (lock/with-lock (get manager :lock)
     (when (get (get manager :sandboxes) id)
       (error (string/format "sandbox already exists: %s" id)))
     (def count (length (keys (get manager :sandboxes))))
     (when (>= count (get (get manager :config) :max-sandboxes))
-      (error (string/format "sandbox limit reached: %d" (get (get manager :config) :max-sandboxes))))
-    (def sandbox (sandbox/create-sandbox (get manager :config) id opts))
-    (put (get manager :sandboxes) id sandbox)
-    sandbox))
+      (error (string/format "sandbox limit reached: %d"
+               (get (get manager :config) :max-sandboxes))))
+    # Reserve slot to prevent TOCTOU race
+    (put (get manager :sandboxes) id :creating))
+  # Create outside lock (slow I/O: mounts, netns, cgroup)
+  (try
+    (do
+      (def sb (sandbox/create-sandbox (get manager :config) id opts))
+      (lock/with-lock (get manager :lock)
+        (put (get manager :sandboxes) id sb))
+      sb)
+    ([e]
+      (lock/with-lock (get manager :lock)
+        (put (get manager :sandboxes) id nil))
+      (error e))))
 
 (defn manager-destroy [manager id]
-  "Destroy sandbox by id."
-  (ev/with-lock (get manager :lock)
-    (def sandbox (get (get manager :sandboxes) id))
-    (when sandbox
-      (sandbox/destroy-sandbox sandbox)
-      (put (get manager :sandboxes) id nil)
-      (put (get manager :sandboxes) id nil))
-    sandbox))
+  "Destroy sandbox by id. Removes from registry first, tears down outside lock."
+  (var sb nil)
+  (lock/with-lock (get manager :lock)
+    (set sb (get (get manager :sandboxes) id))
+    (when (not sb)
+      (error (string/format "sandbox not found: %s" id)))
+    (when (= sb :creating)
+      (error (string/format "sandbox is still being created: %s" id)))
+    (put (get manager :sandboxes) id nil))
+  # Tear down outside lock
+  (sandbox/destroy-sandbox sb)
+  (def sdir (config/sandboxes-dir (get manager :config)))
+  (try (os/shell (string "rm -rf " sdir "/" id)) ([e] nil))
+  sb)
 
 (defn manager-get [manager id]
-  (get (get manager :sandboxes) id))
+  (def sb (get (get manager :sandboxes) id))
+  (when (= sb :creating) nil)
+  sb)
 
 (defn manager-list [manager]
   (def result @[])
   (each [k v] (pairs (get manager :sandboxes))
-    (when v (array/push result v)))
+    (when (and v (not= v :creating))
+      (array/push result v)))
+  result)
+
+(defn manager-exec [manager id cmd opts]
+  "Execute cmd in sandbox."
+  (var sb nil)
+  (lock/with-lock (get manager :lock)
+    (set sb (get (get manager :sandboxes) id))
+    (when (not sb)
+      (error (string/format "sandbox not found: %s" id)))
+    (when (= sb :creating)
+      (error (string/format "sandbox is still being created: %s" id))))
+  (def sdir (config/sandboxes-dir (get manager :config)))
+  (exec/exec-in-sandbox sb cmd (merge opts @{:sandbox-dir (string sdir "/" id)})))
+
+(defn manager-sandbox-count [manager]
+  (var n 0)
+  (each [_ v] (pairs (get manager :sandboxes))
+    (when (and v (not= v :creating)) (++ n)))
+  n)
+
+(defn sandbox-to-info [s]
+  (when (and s (not= s :creating))
+    @{
+      :id (get s :id)
+      :state (string (get s :state))
+      :created (get s :created)
+      :last_active (get s :last-active)
+      :exec_count (get s :exec-count 0)
+      :max_lifetime_s (get s :max-lifetime-s 0)
+    }))
+
+(defn manager-activate-module [manager id module-name]
+  "Add module layer to sandbox. Remounts overlay."
+  (var sb nil)
+  (lock/with-lock (get manager :lock)
+    (set sb (get (get manager :sandboxes) id))
+    (when (or (not sb) (= sb :creating))
+      (error (string/format "sandbox not found: %s" id))))
+  (def cfg (get manager :config))
+  (def mod-path (string (config/modules-dir cfg) "/" module-name ".squashfs"))
+  (when (not (modules/module-exists? cfg module-name))
+    # Try S3 pull
+    (def s3-key (string "modules/" module-name ".squashfs"))
+    (mounts/ensure-dir (config/modules-dir cfg))
+    (when (not (s3/pull cfg s3-key mod-path))
+      (error (string/format "module not found: %s" module-name))))
+  (def sdir (get sb :dir))
+  (def mp (string sdir "/images/" module-name ".squashfs"))
+  (when (os/stat mp)
+    (error (string/format "already active: %s" module-name)))
+  (def sqfs-mount (mounts/mount-squashfs mod-path mp))
+  (def mounts (get sb :mounts))
+  (def sqfs (get mounts :squashfs-mounts))
+  (array/push sqfs sqfs-mount)
+  (def lower (map |(get $ :mount-point) sqfs))
+  (def overlay (get mounts :overlay))
+  (mounts/unmount-overlay overlay)
+  (def new-overlay (mounts/mount-overlay
+                     lower
+                     (string sdir "/upper/data")
+                     (string sdir "/upper/work")
+                     (string sdir "/merged")))
+  (put mounts :overlay new-overlay))
+
+(defn format-timestamp-label []
+  (def t (os/date))
+  (string/format "%04d%02d%02d-%02d%02d%02d"
+    (get t :year) (+ 1 (get t :month-day 0)) (get t :month-day)
+    (get t :hours) (get t :minutes) (get t :seconds)))
+
+(defn manager-snapshot [manager id label]
+  "Create snapshot. Returns [label size-bytes]."
+  (var sb nil)
+  (lock/with-lock (get manager :lock)
+    (set sb (get (get manager :sandboxes) id))
+    (when (or (not sb) (= sb :creating))
+      (error (string/format "sandbox not found: %s" id))))
+  (def lbl (or label (format-timestamp-label)))
+  (when (not (validate/valid-label? lbl))
+    (error "label: alphanumeric/dash/underscore/dot only"))
+  (def sdir (get sb :dir))
+  (def snapdir (string sdir "/snapshots"))
+  (def snapfile (string snapdir "/" lbl ".squashfs"))
+  (when (os/stat snapfile)
+    (error (string/format "snapshot exists: %s" lbl)))
+  (mounts/ensure-dir snapdir)
+  (def upper-data (string sdir "/upper/data"))
+  (def rc (os/execute ["mksquashfs" upper-data snapfile
+                       "-comp" "gzip" "-b" "256K" "-noappend" "-quiet"] :p))
+  (when (not= rc 0)
+    (error (string/format "mksquashfs failed: %s" snapfile)))
+  (def st (try (os/stat snapfile) ([e] nil)))
+  (def size (if st (get st :size 0) 0))
+  # S3 push in background
+  (def s3-key (string "snapshots/" id "/" lbl ".squashfs"))
+  (s3/push-bg (get manager :config) snapfile s3-key)
+  [lbl size])
+
+(defn manager-restore [manager id label]
+  "Restore sandbox from snapshot."
+  (var sb nil)
+  (lock/with-lock (get manager :lock)
+    (set sb (get (get manager :sandboxes) id))
+    (when (or (not sb) (= sb :creating))
+      (error (string/format "sandbox not found: %s" id))))
+  (when (not (validate/valid-label? label))
+    (error "label: alphanumeric/dash/underscore/dot only"))
+  (def sdir (get sb :dir))
+  (def snapfile (string sdir "/snapshots/" label ".squashfs"))
+  (when (not (os/stat snapfile))
+    # Try S3 pull
+    (def s3-key (string "snapshots/" id "/" label ".squashfs"))
+    (mounts/ensure-dir (string sdir "/snapshots"))
+    (when (not (s3/pull (get manager :config) s3-key snapfile))
+      (error (string/format "snapshot not found: %s" label))))
+  (def mounts (get sb :mounts))
+  (mounts/unmount-overlay (get mounts :overlay))
+  (when (get mounts :snapshot-mount)
+    (try (mounts/unmount-squashfs (get mounts :snapshot-mount)) ([e] nil)))
+  (def upper-data (string sdir "/upper/data"))
+  (def upper-work (string sdir "/upper/work"))
+  (try (os/shell (string "rm -rf " upper-data " " upper-work)) ([e] nil))
+  (mounts/ensure-dir upper-data)
+  (mounts/ensure-dir upper-work)
+  (def snap-mp (string sdir "/images/_snapshot"))
+  (def snap-mount (mounts/mount-squashfs snapfile snap-mp))
+  (put mounts :snapshot-mount snap-mount)
+  (def lower @[])
+  (array/push lower snap-mp)
+  (each m (get mounts :squashfs-mounts)
+    (array/push lower (get m :mount-point)))
+  (def new-overlay (mounts/mount-overlay lower upper-data upper-work (string sdir "/merged")))
+  (put mounts :overlay new-overlay))
+
+(defn manager-exec-logs [manager id]
+  "Return exec log entries as sorted array."
+  (lock/with-lock (get manager :lock)
+    (when (not (get (get manager :sandboxes) id))
+      (error (string/format "sandbox not found: %s" id))))
+  (def sdir (string (config/sandboxes-dir (get manager :config)) "/" id))
+  (def log-dir (string sdir "/.meta/log"))
+  (def result @[])
+  (try
+    (do
+      (each f (sort (os/dir log-dir))
+        (when (string/has-suffix? f ".json")
+          (try
+            (do
+              (def content (slurp (string log-dir "/" f)))
+              (when content (array/push result (json/decode content))))
+            ([e] nil)))))
+    ([e] nil))
   result)

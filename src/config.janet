@@ -25,6 +25,7 @@
     :upper-limit-mb (env-int "SQUASH_UPPER_LIMIT_MB" 512)
     :auth-token (env-or "SQUASH_AUTH_TOKEN" nil)
     :s3-bucket (env-or "SQUASH_S3_BUCKET" nil)
+    :s3-endpoint (env-or "SQUASH_S3_ENDPOINT" nil)
     :s3-region (env-or "SQUASH_S3_REGION" "us-east-1")
     :s3-prefix (env-or "SQUASH_S3_PREFIX" "")
     :proxy-https (env-bool "SQUASH_PROXY_HTTPS")

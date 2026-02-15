@@ -3,6 +3,7 @@ package squashd
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 
@@ -243,7 +244,12 @@ _handle_exec :: proc(req: ^Http_Request, resp: ^Http_Response) {
 	}
 
 	sync.mutex_lock(&ms.lock)
-	result, exec_err := exec_in_sandbox(&ms.sandbox, exec_req)
+	result, exec_err: Exec_Result, Exec_Error
+	if _api_config.backend == .Firecracker {
+		result, exec_err = exec_in_sandbox_firecracker(&ms.sandbox, exec_req)
+	} else {
+		result, exec_err = exec_in_sandbox(&ms.sandbox, exec_req)
+	}
 	sync.mutex_unlock(&ms.lock)
 
 	if exec_err != .None {
@@ -365,7 +371,35 @@ _handle_snapshot :: proc(req: ^Http_Request, resp: ^Http_Response) {
 
 	snap_path := snapshot_file_path(ms.sandbox.dir, label)
 	sync.mutex_lock(&ms.lock)
-	size, ok := snapshot_create(&ms.sandbox, label)
+
+	size: u64
+	ok: bool
+	if _api_config.backend == .Firecracker {
+		// Firecracker: ask guest agent to snapshot via vsock
+		cid, cid_ok := read_fc_cid(ms.sandbox.dir)
+		if !cid_ok {
+			sync.mutex_unlock(&ms.lock)
+			_json_error(resp, 500, "failed to read CID")
+			return
+		}
+		fc_err := firecracker_snapshot_via_vsock(cid)
+		if fc_err != .None {
+			sync.mutex_unlock(&ms.lock)
+			_json_error(resp, 500, "failed to create snapshot")
+			return
+		}
+		// Guest agent writes snapshot — check if file exists and get size
+		ok = os.exists(snap_path)
+		if ok {
+			info, info_err := os.stat(snap_path)
+			if info_err == nil {
+				size = u64(info.size)
+			}
+		}
+	} else {
+		size, ok = snapshot_create(&ms.sandbox, label)
+	}
+
 	if ok {
 		_ = os.write_entire_file(fmt.tprintf("%s/.meta/active_snapshot", ms.sandbox.dir), transmute([]byte)label)
 		update_last_active(ms.sandbox.dir)
@@ -416,7 +450,15 @@ _handle_restore :: proc(req: ^Http_Request, resp: ^Http_Response) {
 	}
 	_ = os.write_entire_file(fmt.tprintf("%s/.meta/active_snapshot", ms.sandbox.dir), transmute([]byte)body.label)
 	update_last_active(ms.sandbox.dir)
-	ok := _rebuild_mounts_for_metadata(ms)
+
+	ok: bool
+	if _api_config.backend == .Firecracker {
+		// Firecracker: stop VM + restart with snapshot layer
+		ok = _firecracker_restore(ms, snap_path)
+	} else {
+		ok = _rebuild_mounts_for_metadata(ms)
+	}
+
 	buf: [4096]byte
 	b := strings.builder_from_bytes(buf[:])
 	_write_sandbox_json(&b, &ms.sandbox)
@@ -475,7 +517,15 @@ _handle_activate :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		_ = os.write_entire_file(fmt.tprintf("%s/.meta/layers", ms.sandbox.dir), transmute([]byte)body.module)
 	}
 	update_last_active(ms.sandbox.dir)
-	ok := _rebuild_mounts_for_metadata(ms)
+
+	ok: bool
+	if _api_config.backend == .Firecracker {
+		// Firecracker: hot-add drive + vsock remount
+		ok = _firecracker_activate(ms, body.module)
+	} else {
+		ok = _rebuild_mounts_for_metadata(ms)
+	}
+
 	buf: [4096]byte
 	b := strings.builder_from_bytes(buf[:])
 	_write_sandbox_json(&b, &ms.sandbox)
@@ -660,6 +710,76 @@ _json_body :: proc(resp: ^Http_Response, status: int, body: string) {
 	resp.status = status
 	response_set_header(resp, "Content-Type", "application/json")
 	response_set_body_string(resp, body)
+}
+
+// ---------------------------------------------------------------------------
+// Firecracker-specific API helpers
+// ---------------------------------------------------------------------------
+
+// Activate a module in a Firecracker sandbox: hot-add drive + vsock remount.
+// Caller must hold ms.lock.
+_firecracker_activate :: proc(ms: ^Managed_Sandbox, module: string) -> bool {
+	cid, cid_ok := read_fc_cid(ms.sandbox.dir)
+	if !cid_ok {
+		fmt.eprintln("[api-fc] activate: failed to read CID")
+		return false
+	}
+
+	sqfs_path := fmt.tprintf("%s/%s.squashfs", modules_dir(_api_config), module)
+	fc_err := firecracker_add_drive(ms.sandbox.id, module, sqfs_path, cid, fmt.tprintf("%s/.meta", ms.sandbox.dir))
+	if fc_err != .None {
+		fmt.printfln("[api-fc] activate: drive add failed for %s", module)
+		return false
+	}
+
+	return true
+}
+
+// Restore a snapshot in a Firecracker sandbox: stop VM + restart with snapshot layer.
+// Caller must hold ms.lock.
+_firecracker_restore :: proc(ms: ^Managed_Sandbox, snap_path: string) -> bool {
+	meta_dir := fmt.tprintf("%s/.meta", ms.sandbox.dir)
+
+	// Read current FC metadata before stopping
+	cid, cid_ok := read_fc_cid(ms.sandbox.dir)
+	if !cid_ok {
+		fmt.eprintln("[api-fc] restore: failed to read CID")
+		return false
+	}
+
+	// Stop the current VM
+	firecracker_stop_vm(ms.sandbox.id, meta_dir)
+
+	// Rebuild squashfs path list including snapshot
+	layers := _read_layers(ms.sandbox.dir)
+	mods := modules_dir(_api_config)
+	sqfs_paths := make([dynamic]string, 0, len(layers) + 1, context.temp_allocator)
+	for layer in layers {
+		append(&sqfs_paths, fmt.tprintf("%s/%s.squashfs", mods, layer))
+	}
+	// Add snapshot as an additional layer
+	append(&sqfs_paths, snap_path)
+
+	// Read resource limits from metadata
+	cpu_val := _read_meta_string(ms.sandbox.dir, "cpu", "2.0")
+	mem_val := _read_meta_string(ms.sandbox.dir, "memory_mb", "1024")
+	cpu: f64 = 2.0
+	mem: int = 1024
+	if parsed, ok := strconv.parse_f64(cpu_val); ok {
+		cpu = parsed
+	}
+	if parsed, ok := strconv.parse_int(mem_val, 10); ok {
+		mem = parsed
+	}
+
+	// Restart VM with snapshot layer
+	vm_err := firecracker_start_vm(ms.sandbox.id, cpu, mem, sqfs_paths[:], cid, meta_dir)
+	if vm_err != .None {
+		fmt.printfln("[api-fc] restore: VM restart failed for %s", ms.sandbox.id)
+		return false
+	}
+
+	return true
 }
 
 _s3_enabled :: proc(config: ^Config) -> bool {

@@ -264,6 +264,128 @@ sandbox_create :: proc(
 }
 
 // ---------------------------------------------------------------------------
+// sandbox_create_firecracker — Firecracker-backend sandbox creation
+//
+// Sequence:
+//   1. Create directory tree (.meta/ only — FS layers are in-VM)
+//   2. Allocate CID for vsock communication
+//   3. Set up tap networking
+//   4. Build squashfs path list from modules
+//   5. Start VM via sq-firecracker CLI
+//   6. Write metadata files
+// ---------------------------------------------------------------------------
+
+sandbox_create_firecracker :: proc(
+	config: ^Config,
+	sandbox: ^Sandbox,
+	opts: Create_Options,
+	allocator := context.allocator,
+) -> (err: Create_Error) {
+	sdir := sandbox.dir
+	mods := modules_dir(config)
+
+	// 1. Create directory tree
+	_ensure_dir_recursive(sdir)
+	meta_dir := fmt.tprintf("%s/.meta", sdir)
+	_ensure_dir_recursive(meta_dir)
+	_ensure_dir_recursive(fmt.tprintf("%s/.meta/log", sdir))
+	defer if err != .None {
+		_remove_dir_recursive(sdir)
+	}
+
+	// 2. Allocate CID
+	cid, cid_err := allocate_cid(config.data_dir)
+	if cid_err != .None {
+		fmt.printfln("[sandbox-fc] %s: CID allocation failed", sandbox.id)
+		return .Meta_Failed
+	}
+
+	// Use CID - 100 as tap index for deterministic mapping
+	tap_index := int(cid) - 100
+
+	// 3. Set up tap networking
+	net_err := firecracker_setup_network(sandbox.id, tap_index, opts.allow_net)
+	if net_err != .None {
+		fmt.printfln("[sandbox-fc] %s: network setup failed", sandbox.id)
+		return .Netns_Failed
+	}
+	defer if err != .None {
+		firecracker_teardown_network(sandbox.id, tap_index)
+	}
+
+	// 4. Build squashfs path list
+	sqfs_paths := make([dynamic]string, 0, len(opts.layers), context.temp_allocator)
+	for layer in opts.layers {
+		sqfs_path := fmt.tprintf("%s/%s.squashfs", mods, layer)
+		if !os.exists(sqfs_path) {
+			if !_try_s3_pull_module(config, layer, sqfs_path) {
+				fmt.printfln("[sandbox-fc] %s: module not found: %s", sandbox.id, layer)
+				return .Squashfs_Failed
+			}
+		}
+		append(&sqfs_paths, sqfs_path)
+	}
+
+	// 5. Start VM
+	memory_mb := int(opts.memory_mb)
+	if memory_mb == 0 { memory_mb = 1024 }
+	cpu := opts.cpu
+	if cpu <= 0 { cpu = 2.0 }
+
+	vm_err := firecracker_start_vm(sandbox.id, cpu, memory_mb, sqfs_paths[:], cid, meta_dir)
+	if vm_err != .None {
+		fmt.printfln("[sandbox-fc] %s: VM start failed", sandbox.id)
+		return .Overlay_Failed
+	}
+	defer if err != .None {
+		firecracker_stop_vm(sandbox.id, meta_dir)
+	}
+
+	// 6. Write metadata
+	meta_err := write_meta(sdir, sandbox.id, opts, 0)
+	if meta_err != .None {
+		fmt.printfln("[sandbox-fc] %s: metadata write failed", sandbox.id)
+		return .Meta_Failed
+	}
+
+	// Write FC-specific metadata (best-effort)
+	_ = _write_meta_file(meta_dir, "fc.cid", fmt.tprintf("%d", cid))
+	_ = _write_meta_file(meta_dir, "fc.tap_index", fmt.tprintf("%d", tap_index))
+	_ = _write_meta_file(meta_dir, "backend", "firecracker")
+
+	// Transition to Ready with empty mounts (they exist inside the VM)
+	mounts := Sandbox_Mounts{
+		sqfs_mounts = make([dynamic]Squashfs_Mount, allocator),
+	}
+	sandbox_set_ready(sandbox, mounts, nil, nil)
+	fmt.printfln("[sandbox-fc] %s: created (cid=%d)", sandbox.id, cid)
+
+	return .None
+}
+
+// ---------------------------------------------------------------------------
+// sandbox_destroy_firecracker — Firecracker teardown. Idempotent.
+//
+// Order:
+//   1. Stop VM via sq-firecracker stop
+//   2. Tear down tap networking
+// ---------------------------------------------------------------------------
+
+sandbox_destroy_firecracker :: proc(s: ^Sandbox) {
+	meta_dir := fmt.tprintf("%s/.meta", s.dir)
+
+	// Stop VM
+	firecracker_stop_vm(s.id, meta_dir)
+
+	// Tear down networking
+	if tap_index, ok := read_fc_tap_index(s.dir); ok {
+		firecracker_teardown_network(s.id, tap_index)
+	}
+
+	s.state = Destroying{}
+}
+
+// ---------------------------------------------------------------------------
 // sandbox_destroy — reverse-order teardown. Idempotent.
 //
 // Order (reverse of creation):

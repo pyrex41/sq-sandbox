@@ -225,7 +225,12 @@ manager_create_sandbox :: proc(
 	sa := managed_sandbox_allocator(ms)
 	context.allocator = sa
 
-	create_err := sandbox_create(mgr.config, &ms.sandbox, opts, sa)
+	create_err: Create_Error
+	if mgr.config.backend == .Firecracker {
+		create_err = sandbox_create_firecracker(mgr.config, &ms.sandbox, opts, sa)
+	} else {
+		create_err = sandbox_create(mgr.config, &ms.sandbox, opts, sa)
+	}
 	if create_err != .None {
 		// Creation failed — remove placeholder from map
 		sync.mutex_lock(&mgr.global_lock)
@@ -268,8 +273,12 @@ manager_destroy_sandbox :: proc(mgr: ^Sandbox_Manager, id: string) {
 	// Acquire per-sandbox lock for teardown
 	sync.mutex_lock(&ms.lock)
 
-	// Tear down all sandbox resources (mounts, cgroup, netns)
-	sandbox_destroy(&ms.sandbox)
+	// Tear down all sandbox resources — dispatch by backend
+	if mgr.config.backend == .Firecracker {
+		sandbox_destroy_firecracker(&ms.sandbox)
+	} else {
+		sandbox_destroy(&ms.sandbox)
+	}
 
 	// Remove the sandbox directory tree
 	_remove_dir_recursive(ms.sandbox.dir)

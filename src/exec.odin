@@ -487,6 +487,61 @@ _write_json_string :: proc(b: ^strings.Builder, s: string) {
 // ISO 8601 timestamp formatting
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// exec_in_sandbox_firecracker — exec via vsock for Firecracker backend
+//
+// Reads CID from .meta/fc.cid, sends command through socat to the guest
+// agent, parses the JSON response. Writes execution log identical to the
+// chroot path for API compatibility.
+// ---------------------------------------------------------------------------
+
+exec_in_sandbox_firecracker :: proc(
+	sandbox: ^Sandbox,
+	req: Exec_Request,
+	allocator := context.allocator,
+) -> (Exec_Result, Exec_Error) {
+	_, is_ready := &sandbox.state.(Ready)
+	if !is_ready {
+		return {}, .Not_Ready
+	}
+
+	// Read CID from metadata
+	cid, cid_ok := read_fc_cid(sandbox.dir)
+	if !cid_ok {
+		fmt.printfln("[exec-fc] %s: failed to read CID", sandbox.id)
+		return {}, .Pipe_Failed
+	}
+
+	timeout := int(req.timeout) if req.timeout > 0 else 300
+	workdir := req.workdir if len(req.workdir) > 0 else "/"
+
+	result, fc_err := firecracker_exec(cid, req.cmd, workdir, timeout, allocator)
+	if fc_err != .None {
+		fmt.printfln("[exec-fc] %s: vsock exec failed", sandbox.id)
+		return {}, .Pipe_Failed
+	}
+
+	// Write execution log for API compatibility
+	seq := sandbox_next_log_seq(sandbox)
+	result.seq = seq
+	write_exec_log(
+		sandbox,
+		seq,
+		req,
+		result.exit_code,
+		result.started,
+		result.finished,
+		transmute([]byte)result.stdout,
+		transmute([]byte)result.stderr,
+	)
+
+	return result, .None
+}
+
+// ---------------------------------------------------------------------------
+// ISO 8601 timestamp formatting
+// ---------------------------------------------------------------------------
+
 _format_iso8601 :: proc(t: time.Time) -> string {
 	y, mon, d := time.date(t)
 	h, m, s := time.clock(t)

@@ -13,6 +13,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const reaper = @import("reaper.zig");
 const validate = @import("validate.zig");
+const api = @import("api.zig");
 const log = std.log.scoped(.manager);
 
 /// Per-sandbox metadata stored in the manager.
@@ -231,15 +232,23 @@ pub const SandboxManager = struct {
         return metas[0..i];
     }
 
-    /// Destroy callback for the reaper. Unregisters the sandbox.
-    /// Actual resource teardown (mounts, netns, cgroup) happens in the
-    /// caller's destroy path — the reaper just triggers removal.
+    /// Destroy callback for the reaper. Tears down kernel resources
+    /// (mounts, cgroups, netns) and then removes on-disk state.
     pub fn reaperDestroyFn(id: []const u8) void {
         const mgr = global_instance orelse return;
-        const id_copy = std.heap.page_allocator.dupe(u8, id) catch return;
-        defer std.heap.page_allocator.free(id_copy);
+        const alloc = std.heap.page_allocator;
+        const id_copy = alloc.dupe(u8, id) catch return;
+        defer alloc.free(id_copy);
         log.info("reaper destroying sandbox {s}", .{id_copy});
-        mgr.unregister(id);
+        mgr.unregister(id_copy);
+
+        // Build sandbox path for resource teardown
+        var sandbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sandbox_path = std.fmt.bufPrint(&sandbox_buf, "{s}/sandboxes/{s}", .{ global_data_dir, id_copy }) catch {
+            teardownSandboxFiles(id_copy);
+            return;
+        };
+        api.teardownSandboxResources(alloc, sandbox_path, id_copy) catch {};
         teardownSandboxFiles(id_copy);
     }
 
@@ -315,8 +324,13 @@ pub fn destroyAll(mgr: *SandboxManager) void {
         break :blk i;
     };
 
+    const alloc = std.heap.page_allocator;
     for (ids_buf[0..id_count]) |id| {
         log.info("shutdown: destroying sandbox {s}", .{id});
+        var sandbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&sandbox_buf, "{s}/sandboxes/{s}", .{ SandboxManager.global_data_dir, id })) |sandbox_path| {
+            api.teardownSandboxResources(alloc, sandbox_path, id) catch {};
+        } else |_| {}
         teardownSandboxFiles(id);
         mgr.unregister(id);
     }

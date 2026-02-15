@@ -28,6 +28,9 @@ const Config = config_mod.Config;
 const log = std.log.scoped(.api);
 const is_linux = builtin.os.tag == .linux;
 
+/// Atomic shutdown flag, set by signal handler.
+pub var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 /// Number of worker threads in the connection pool.
 /// Override via SQUASH_HTTP_POOL_SIZE env var (default 8).
 fn poolSize() usize {
@@ -118,8 +121,9 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 // ── Server ─────────────────────────────────────────────────────────────
 
-/// Start the HTTP server with a thread pool. Blocks forever, accepting connections.
-pub fn startServer(cfg: *const Config) !void {
+/// Start the HTTP server with a thread pool.
+/// Returns when shutdown_requested is set (via signal handler).
+pub fn startServer(cfg: *const Config, allocator: std.mem.Allocator) !void {
     const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, cfg.port);
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -131,27 +135,37 @@ pub fn startServer(cfg: *const Config) !void {
 
     var pool: std.Thread.Pool = undefined;
     try pool.init(.{
-        .allocator = std.heap.page_allocator,
+        .allocator = allocator,
         .n_jobs = pool_size,
     });
     defer pool.deinit();
 
-    while (true) {
+    while (!shutdown_requested.load(.acquire)) {
         const conn = listener.accept() catch |err| {
+            // accept may fail with EINTR when signal fires — check flag
+            if (shutdown_requested.load(.acquire)) break;
             log.warn("accept error: {}", .{err});
             continue;
         };
 
-        pool.spawn(handleConnection, .{ conn, cfg }) catch |err| {
+        pool.spawn(handleConnection, .{ conn, cfg, allocator }) catch |err| {
             log.warn("pool dispatch error: {}", .{err});
             conn.stream.close();
         };
     }
+
+    log.info("server shutting down", .{});
 }
 
 /// Handle a single TCP connection (may serve multiple requests via keep-alive).
-fn handleConnection(conn: net.Server.Connection, cfg: *const Config) void {
+fn handleConnection(conn: net.Server.Connection, cfg: *const Config, allocator: std.mem.Allocator) void {
     defer conn.stream.close();
+
+    // Set 30-second read timeout to prevent slowloris-style attacks.
+    const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
+    std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {
+        log.debug("failed to set SO_RCVTIMEO, proceeding without timeout", .{});
+    };
 
     var recv_buf: [8192]u8 = undefined;
     var send_buf: [8192]u8 = undefined;
@@ -168,7 +182,7 @@ fn handleConnection(conn: net.Server.Connection, cfg: *const Config) void {
             log.debug("receiveHead error: {}", .{err});
             return;
         };
-        handleRequest(&request, cfg) catch |err| {
+        handleRequest(&request, cfg, allocator) catch |err| {
             log.debug("handleRequest error: {}", .{err});
             return;
         };
@@ -176,7 +190,7 @@ fn handleConnection(conn: net.Server.Connection, cfg: *const Config) void {
 }
 
 /// Process a single HTTP request: auth check, route, dispatch.
-fn handleRequest(request: *http.Server.Request, cfg: *const Config) !void {
+fn handleRequest(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
     const route = matchRoute(request.head.method, request.head.target);
 
     // Auth check — skip for health endpoint
@@ -188,25 +202,25 @@ fn handleRequest(request: *http.Server.Request, cfg: *const Config) !void {
     if (needs_auth) {
         if (cfg.auth_token) |token| {
             if (!checkAuth(request, token)) {
-                try sendJsonError(request, .unauthorized, "unauthorized");
+                try sendJsonError(request, .unauthorized, "unauthorized", allocator);
                 return;
             }
         }
     }
 
     switch (route) {
-        .health => try handleHealth(request, cfg),
-        .list_sandboxes => try handleListSandboxes(request, cfg),
-        .create_sandbox => try handleCreateSandbox(request, cfg),
-        .get_sandbox => |id| try handleGetSandbox(request, cfg, id),
-        .delete_sandbox => |id| try handleDeleteSandbox(request, cfg, id),
-        .exec_sandbox => |id| try handleExec(request, cfg, id),
-        .exec_logs => |id| try handleExecLogs(request, cfg, id),
-        .snapshot_sandbox => |id| try handleSnapshot(request, cfg, id),
-        .restore_sandbox => |id| try handleRestore(request, cfg, id),
-        .activate_sandbox => |id| try handleActivate(request, cfg, id),
-        .list_modules => try handleListModules(request, cfg),
-        .not_found => try sendJsonError(request, .not_found, "not found"),
+        .health => try handleHealth(request, cfg, allocator),
+        .list_sandboxes => try handleListSandboxes(request, cfg, allocator),
+        .create_sandbox => try handleCreateSandbox(request, cfg, allocator),
+        .get_sandbox => |id| try handleGetSandbox(request, cfg, id, allocator),
+        .delete_sandbox => |id| try handleDeleteSandbox(request, cfg, id, allocator),
+        .exec_sandbox => |id| try handleExec(request, cfg, id, allocator),
+        .exec_logs => |id| try handleExecLogs(request, cfg, id, allocator),
+        .snapshot_sandbox => |id| try handleSnapshot(request, cfg, id, allocator),
+        .restore_sandbox => |id| try handleRestore(request, cfg, id, allocator),
+        .activate_sandbox => |id| try handleActivate(request, cfg, id, allocator),
+        .list_modules => try handleListModules(request, cfg, allocator),
+        .not_found => try sendJsonError(request, .not_found, "not found", allocator),
     }
 }
 
@@ -231,8 +245,7 @@ fn checkAuth(request: *const http.Server.Request, expected_token: []const u8) bo
 
 // ── Endpoint Handlers ──────────────────────────────────────────────────
 
-fn handleHealth(request: *http.Server.Request, cfg: *const Config) !void {
-    const allocator = std.heap.page_allocator;
+fn handleHealth(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
 
     // Count sandboxes and modules from filesystem
     const sandbox_count = countDirEntries(cfg, "sandboxes");
@@ -254,12 +267,11 @@ fn handleHealth(request: *http.Server.Request, cfg: *const Config) !void {
     try sendJson(request, .ok, allocator, health);
 }
 
-fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config) !void {
-    const allocator = std.heap.page_allocator;
+fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -287,7 +299,7 @@ fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config) !void 
     }
 
     const body = json_mod.stringify(allocator, list.items) catch {
-        try sendJsonError(request, .internal_server_error, "serialization error");
+        try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
     defer allocator.free(body);
@@ -295,13 +307,12 @@ fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config) !void 
     try sendJsonBody(request, .ok, body);
 }
 
-fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void {
-    const allocator = std.heap.page_allocator;
+fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
 
-    if (!requireJsonContentType(request)) return;
+    if (!requireJsonContentType(request, allocator)) return;
 
     const parsed = readJsonBody(json_mod.CreateRequest, request, allocator) catch {
-        try sendJsonError(request, .bad_request, "invalid JSON body");
+        try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
     defer parsed.deinit();
@@ -310,17 +321,17 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
 
     // Validate sandbox id
     if (req.id.len == 0) {
-        try sendJsonError(request, .bad_request, "id required");
+        try sendJsonError(request, .bad_request, "id required", allocator);
         return;
     }
     if (!validate.validId(req.id)) {
-        try sendJsonError(request, .bad_request, "id: alphanumeric/dash/underscore only");
+        try sendJsonError(request, .bad_request, "id: alphanumeric/dash/underscore only", allocator);
         return;
     }
 
     // Validate layers if provided
     const layers = req.parseLayers(allocator) catch {
-        try sendJsonError(request, .bad_request, "invalid layers format");
+        try sendJsonError(request, .bad_request, "invalid layers format", allocator);
         return;
     };
     defer json_mod.freeLayers(allocator, layers);
@@ -328,7 +339,7 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
     // Validate each layer exists as a module
     var mod_dir_buf: [256]u8 = undefined;
     const mod_dir_path = cfg.modulesDir(&mod_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -336,7 +347,7 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
         if (!validate.validLabel(layer)) {
             var err_buf: [256]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "invalid layer name: {s}", .{layer}) catch "invalid layer name";
-            try sendJsonError(request, .bad_request, err_msg);
+            try sendJsonError(request, .bad_request, err_msg, allocator);
             return;
         }
         // Check module exists on disk
@@ -345,7 +356,7 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
         std.fs.accessAbsolute(mod_path, .{}) catch {
             var err_buf: [256]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "module not found: {s}", .{layer}) catch "module not found";
-            try sendJsonError(request, .bad_request, err_msg);
+            try sendJsonError(request, .bad_request, err_msg, allocator);
             return;
         };
     }
@@ -353,7 +364,7 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
     // Build sandbox directory path
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -362,27 +373,27 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
     if (current_count >= cfg.max_sandboxes) {
         var err_buf: [128]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "sandbox limit reached ({d})", .{cfg.max_sandboxes}) catch "sandbox limit reached";
-        try sendJsonError(request, .bad_request, err_msg);
+        try sendJsonError(request, .bad_request, err_msg, allocator);
         return;
     }
 
     // Create sandbox directory structure
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, req.id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Check if already exists
     std.fs.accessAbsolute(sandbox_path, .{}) catch |err| {
         if (err != error.FileNotFound) {
-            try sendJsonError(request, .internal_server_error, "filesystem error");
+            try sendJsonError(request, .internal_server_error, "filesystem error", allocator);
             return;
         }
         // FileNotFound is good — sandbox doesn't exist yet
         // Create sandbox directory and metadata
         createSandboxOnDisk(allocator, sandbox_path, &req, layers) catch {
-            try sendJsonError(request, .internal_server_error, "failed to create sandbox");
+            try sendJsonError(request, .internal_server_error, "failed to create sandbox", allocator);
             return;
         };
 
@@ -399,14 +410,14 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
             ) catch {
                 teardownSandboxResources(allocator, sandbox_path, req.id) catch {};
                 std.fs.deleteTreeAbsolute(sandbox_path) catch {};
-                try sendJsonError(request, .internal_server_error, "failed to create sandbox");
+                try sendJsonError(request, .internal_server_error, "failed to create sandbox", allocator);
                 return;
             };
         }
 
         // Read back and return the sandbox info
         const info = readSandboxInfo(allocator, sb_dir_path, req.id) catch {
-            try sendJsonError(request, .internal_server_error, "failed to read sandbox");
+            try sendJsonError(request, .internal_server_error, "failed to read sandbox", allocator);
             return;
         };
         defer freeSandboxInfo(allocator, info);
@@ -418,22 +429,21 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config) !void 
     // If we get here, sandbox already exists
     var err_buf: [256]u8 = undefined;
     const err_msg = std.fmt.bufPrint(&err_buf, "already exists: {s}", .{req.id}) catch "already exists";
-    try sendJsonError(request, .bad_request, err_msg);
+    try sendJsonError(request, .bad_request, err_msg, allocator);
 }
 
-fn handleGetSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+fn handleGetSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     const info = readSandboxInfo(allocator, sb_dir_path, id) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
     defer freeSandboxInfo(allocator, info);
@@ -441,16 +451,16 @@ fn handleGetSandbox(request: *http.Server.Request, cfg: *const Config, id: []con
     try sendJson(request, .ok, allocator, info);
 }
 
-fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
+fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -458,15 +468,15 @@ fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []
     std.fs.accessAbsolute(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
 
     // Best-effort teardown before deleting on-disk state.
-    teardownSandboxResources(std.heap.page_allocator, sandbox_path, id) catch {};
+    teardownSandboxResources(allocator, sandbox_path, id) catch {};
 
     std.fs.deleteTreeAbsolute(sandbox_path) catch {
-        try sendJsonError(request, .internal_server_error, "failed to delete sandbox");
+        try sendJsonError(request, .internal_server_error, "failed to delete sandbox", allocator);
         return;
     };
 
@@ -476,33 +486,32 @@ fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []
     });
 }
 
-fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
 
-    if (!requireJsonContentType(request)) return;
+    if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Check sandbox exists
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
 
     // Parse request body
     const parsed = readJsonBody(json_mod.ExecRequestJson, request, allocator) catch {
-        try sendJsonError(request, .bad_request, "invalid JSON body");
+        try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
     defer parsed.deinit();
@@ -510,26 +519,26 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8)
     const exec_req = parsed.value;
 
     if (exec_req.cmd.len == 0) {
-        try sendJsonError(request, .bad_request, "cmd required");
+        try sendJsonError(request, .bad_request, "cmd required", allocator);
         return;
     }
 
     // Check if sandbox is mounted
     if (!isSandboxMounted(allocator, sandbox_path)) {
-        try sendJsonError(request, .bad_request, "not mounted");
+        try sendJsonError(request, .bad_request, "not mounted", allocator);
         return;
     }
 
     var mounted_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const merged_path = std.fmt.bufPrint(&mounted_path_buf, "{s}/merged", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Read current seq from log directory
     var log_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const log_dir = std.fmt.bufPrint(&log_dir_buf, "{s}/.meta/log", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -542,7 +551,7 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8)
     // Build merged path as null-terminated for exec
     var merged_z_buf: [std.fs.max_path_bytes]u8 = undefined;
     const merged_z = std.fmt.bufPrintZ(&merged_z_buf, "{s}", .{merged_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -574,7 +583,7 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8)
     };
 
     const result = exec_mod.execInSandbox(allocator, exec_ctx, exec_request) catch {
-        try sendJsonError(request, .internal_server_error, "exec failed");
+        try sendJsonError(request, .internal_server_error, "exec failed", allocator);
         return;
     };
     defer {
@@ -605,31 +614,30 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8)
     try sendJson(request, .ok, allocator, exec_result);
 }
 
-fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Check sandbox exists
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
 
     var log_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const log_dir = std.fmt.bufPrint(&log_dir_buf, "{s}/.meta/log", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -640,7 +648,7 @@ fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const
     defer exec_mod.freeExecLogs(allocator, logs);
 
     const body = json_mod.stringify(allocator, logs) catch {
-        try sendJsonError(request, .internal_server_error, "serialization error");
+        try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
     defer allocator.free(body);
@@ -648,27 +656,26 @@ fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const
     try sendJsonBody(request, .ok, body);
 }
 
-fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
 
-    if (!requireJsonContentType(request)) return;
+    if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Check sandbox exists
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
 
@@ -686,44 +693,43 @@ fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const
     const label = parsed.value.label;
 
     if (label.len == 0) {
-        try sendJsonError(request, .bad_request, "label required");
+        try sendJsonError(request, .bad_request, "label required", allocator);
         return;
     }
     if (!validate.validLabel(label)) {
-        try sendJsonError(request, .bad_request, "label: alphanumeric/dash/underscore/dot only");
+        try sendJsonError(request, .bad_request, "label: alphanumeric/dash/underscore/dot only", allocator);
         return;
     }
 
     return doSnapshot(request, allocator, sandbox_path, label);
 }
 
-fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
 
-    if (!requireJsonContentType(request)) return;
+    if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Check sandbox exists
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
 
     // Parse request body
     const parsed = readJsonBody(json_mod.RestoreRequest, request, allocator) catch {
-        try sendJsonError(request, .bad_request, "invalid JSON body");
+        try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
     defer parsed.deinit();
@@ -731,30 +737,30 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
     const label = parsed.value.label;
 
     if (label.len == 0) {
-        try sendJsonError(request, .bad_request, "label required");
+        try sendJsonError(request, .bad_request, "label required", allocator);
         return;
     }
     if (!validate.validLabel(label)) {
-        try sendJsonError(request, .bad_request, "label: alphanumeric/dash/underscore/dot only");
+        try sendJsonError(request, .bad_request, "label: alphanumeric/dash/underscore/dot only", allocator);
         return;
     }
 
     // Check snapshot exists
     var snap_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snap_path = std.fmt.bufPrint(&snap_path_buf, "{s}/.meta/snapshots/{s}.squashfs", .{ sandbox_path, label }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(snap_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{label}) catch "snapshot not found";
-        try sendJsonError(request, .bad_request, err_msg);
+        try sendJsonError(request, .bad_request, err_msg, allocator);
         return;
     };
 
     var snapshot_mp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snapshot_mp_path = std.fmt.bufPrint(&snapshot_mp_path_buf, "{s}/images/_snapshot", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.makeDirAbsolute(snapshot_mp_path) catch {};
@@ -763,19 +769,19 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
     var upper_data_buf: [std.fs.max_path_bytes]u8 = undefined;
     var upper_work_buf: [std.fs.max_path_bytes]u8 = undefined;
     const merged_path = std.fmt.bufPrintZ(&merged_buf, "{s}/merged", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     const upper_data = std.fmt.bufPrintZ(&upper_data_buf, "{s}/upper/data", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     const upper_work = std.fmt.bufPrintZ(&upper_work_buf, "{s}/upper/work", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     const snapshot_mp = std.fmt.bufPrintZ(&snapshot_mp_path_buf, "{s}", .{snapshot_mp_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -795,12 +801,12 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
         idx -= 1;
         const layer = layers[idx];
         const mount_path = std.fmt.allocPrint(allocator, "{s}/images/{s}.squashfs", .{ sandbox_path, layer }) catch {
-            try sendJsonError(request, .internal_server_error, "path error");
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
             return;
         };
         lower_layers.append(allocator, mount_path) catch {
             allocator.free(mount_path);
-            try sendJsonError(request, .internal_server_error, "path error");
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
             return;
         };
     }
@@ -836,7 +842,7 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
         prev_snapshot_ptr,
         &overlay,
     ) catch {
-        try sendJsonError(request, .internal_server_error, "restore failed");
+        try sendJsonError(request, .internal_server_error, "restore failed", allocator);
         return;
     };
 
@@ -844,7 +850,7 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
     updateLastActive(sandbox_path, std.time.timestamp());
 
     const info = readSandboxInfo(allocator, sb_dir_path, id) catch {
-        try sendJsonError(request, .internal_server_error, "failed to read sandbox");
+        try sendJsonError(request, .internal_server_error, "failed to read sandbox", allocator);
         return;
     };
     defer freeSandboxInfo(allocator, info);
@@ -852,33 +858,32 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
     try sendJson(request, .ok, allocator, info);
 }
 
-fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
 
-    if (!requireJsonContentType(request)) return;
+    if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     // Check sandbox exists
     var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
-        try sendJsonError(request, .not_found, err_msg);
+        try sendJsonError(request, .not_found, err_msg, allocator);
         return;
     };
 
     // Parse request body
     const parsed = readJsonBody(json_mod.ActivateRequest, request, allocator) catch {
-        try sendJsonError(request, .bad_request, "invalid JSON body");
+        try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
     defer parsed.deinit();
@@ -886,29 +891,29 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     const module = parsed.value.module;
 
     if (module.len == 0) {
-        try sendJsonError(request, .bad_request, "module required");
+        try sendJsonError(request, .bad_request, "module required", allocator);
         return;
     }
     if (!validate.validModule(module)) {
-        try sendJsonError(request, .bad_request, "module: alphanumeric/dash/underscore/dot only");
+        try sendJsonError(request, .bad_request, "module: alphanumeric/dash/underscore/dot only", allocator);
         return;
     }
 
     // Check module exists
     var mod_dir_buf: [256]u8 = undefined;
     const mod_dir_path = cfg.modulesDir(&mod_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     var mod_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const mod_path = std.fmt.bufPrint(&mod_path_buf, "{s}/{s}.squashfs", .{ mod_dir_path, module }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.accessAbsolute(mod_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "module not found: {s}", .{module}) catch "module not found";
-        try sendJsonError(request, .bad_request, err_msg);
+        try sendJsonError(request, .bad_request, err_msg, allocator);
         return;
     };
 
@@ -923,7 +928,7 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
             if (trimmed.len > 0 and eql(trimmed, module)) {
                 var err_buf: [256]u8 = undefined;
                 const err_msg = std.fmt.bufPrint(&err_buf, "already active: {s}", .{module}) catch "already active";
-                try sendJsonError(request, .bad_request, err_msg);
+                try sendJsonError(request, .bad_request, err_msg, allocator);
                 return;
             }
         }
@@ -931,7 +936,7 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
         // Append the new module to layers
         var new_layers_buf: [4096]u8 = undefined;
         const new_layers = std.fmt.bufPrint(&new_layers_buf, "{s}\n{s}", .{ std.mem.trim(u8, content, "\n \r"), module }) catch {
-            try sendJsonError(request, .internal_server_error, "path error");
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
             return;
         };
         writeMetaFile(sandbox_path, "layers", new_layers);
@@ -943,16 +948,16 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     updateLastActive(sandbox_path, std.time.timestamp());
 
     mountModuleLayer(sandbox_path, mod_path, module) catch {
-        try sendJsonError(request, .internal_server_error, "failed to mount module");
+        try sendJsonError(request, .internal_server_error, "failed to mount module", allocator);
         return;
     };
     remountOverlayForSandbox(allocator, sandbox_path) catch {
-        try sendJsonError(request, .internal_server_error, "failed to remount overlay");
+        try sendJsonError(request, .internal_server_error, "failed to remount overlay", allocator);
         return;
     };
 
     const info = readSandboxInfo(allocator, sb_dir_path, id) catch {
-        try sendJsonError(request, .internal_server_error, "failed to read sandbox");
+        try sendJsonError(request, .internal_server_error, "failed to read sandbox", allocator);
         return;
     };
     defer freeSandboxInfo(allocator, info);
@@ -960,12 +965,11 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     try sendJson(request, .ok, allocator, info);
 }
 
-fn handleListModules(request: *http.Server.Request, cfg: *const Config) !void {
-    const allocator = std.heap.page_allocator;
+fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
 
     var mod_dir_buf: [256]u8 = undefined;
     const mod_dir_path = cfg.modulesDir(&mod_dir_buf) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -1008,7 +1012,7 @@ fn handleListModules(request: *http.Server.Request, cfg: *const Config) !void {
     }
 
     const body = json_mod.stringify(allocator, list.items) catch {
-        try sendJsonError(request, .internal_server_error, "serialization error");
+        try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
     defer allocator.free(body);
@@ -1027,33 +1031,33 @@ fn doSnapshot(
     // Check for existing snapshot with same label
     var snap_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snap_path = std.fmt.bufPrint(&snap_path_buf, "{s}/.meta/snapshots/{s}.squashfs", .{ sandbox_path, label }) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
     if (std.fs.accessAbsolute(snap_path, .{})) |_| {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "exists: {s}", .{label}) catch "snapshot exists";
-        try sendJsonError(request, .bad_request, err_msg);
+        try sendJsonError(request, .bad_request, err_msg, allocator);
         return;
     } else |_| {}
 
     var snap_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snap_dir = std.fmt.bufPrint(&snap_dir_buf, "{s}/.meta/snapshots", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
     std.fs.makeDirAbsolute(snap_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot dir");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot dir", allocator);
             return;
         },
     };
 
     var upper_data_buf: [std.fs.max_path_bytes]u8 = undefined;
     const upper_data = std.fmt.bufPrint(&upper_data_buf, "{s}/upper/data", .{sandbox_path}) catch {
-        try sendJsonError(request, .internal_server_error, "path error");
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
 
@@ -1062,62 +1066,62 @@ fn doSnapshot(
     defer argv_list.deinit(allocator);
 
     argv_list.append(allocator, "mksquashfs") catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
     argv_list.append(allocator, upper_data) catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
     argv_list.append(allocator, snap_path) catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
     argv_list.append(allocator, "-comp") catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
     if (use_zstd) {
         argv_list.append(allocator, "zstd") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
         argv_list.append(allocator, "-Xcompression-level") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
         argv_list.append(allocator, "3") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
         argv_list.append(allocator, "-b") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
         argv_list.append(allocator, "128K") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
     } else {
         argv_list.append(allocator, "gzip") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
         argv_list.append(allocator, "-b") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
         argv_list.append(allocator, "256K") catch {
-            try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+            try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
             return;
         };
     }
     argv_list.append(allocator, "-noappend") catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
     argv_list.append(allocator, "-quiet") catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
 
@@ -1125,7 +1129,7 @@ fn doSnapshot(
         .allocator = allocator,
         .argv = argv_list.items,
     }) catch {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     };
     defer {
@@ -1133,7 +1137,7 @@ fn doSnapshot(
         allocator.free(cmd.stderr);
     }
     if (cmd.term.Exited != 0) {
-        try sendJsonError(request, .internal_server_error, "failed to create snapshot");
+        try sendJsonError(request, .internal_server_error, "failed to create snapshot", allocator);
         return;
     }
 
@@ -1161,10 +1165,10 @@ fn doSnapshot(
 // ── Content-Type Enforcement ───────────────────────────────────────────
 
 /// Check Content-Type and send 415 error if missing. Returns true if valid.
-fn requireJsonContentType(request: *http.Server.Request) bool {
+fn requireJsonContentType(request: *http.Server.Request, allocator: std.mem.Allocator) bool {
     if (request.head.method == .POST) {
         if (!hasJsonContentType(request)) {
-            sendJsonError(request, .unsupported_media_type, "Content-Type must be application/json") catch {};
+            sendJsonError(request, .unsupported_media_type, "Content-Type must be application/json", allocator) catch {};
             return false;
         }
     }
@@ -1174,8 +1178,8 @@ fn requireJsonContentType(request: *http.Server.Request) bool {
 // ── Response Helpers ───────────────────────────────────────────────────
 
 /// Send a JSON error response: {"error":"<message>"}
-fn sendJsonError(request: *http.Server.Request, status: http.Status, message: []const u8) !void {
-    const body = json_mod.errorJson(std.heap.page_allocator, message) catch {
+fn sendJsonError(request: *http.Server.Request, status: http.Status, message: []const u8, allocator: std.mem.Allocator) !void {
+    const body = json_mod.errorJson(allocator, message) catch {
         // Last-resort fallback
         try request.respond("{\"error\":\"internal error\"}", .{
             .status = .internal_server_error,
@@ -1185,7 +1189,7 @@ fn sendJsonError(request: *http.Server.Request, status: http.Status, message: []
         });
         return;
     };
-    defer std.heap.page_allocator.free(body);
+    defer allocator.free(body);
 
     try request.respond(body, .{
         .status = status,
@@ -1198,7 +1202,7 @@ fn sendJsonError(request: *http.Server.Request, status: http.Status, message: []
 /// Send a serializable value as JSON with the given status.
 fn sendJson(request: *http.Server.Request, status: http.Status, allocator: std.mem.Allocator, value: anytype) !void {
     const body = json_mod.stringify(allocator, value) catch {
-        try sendJsonError(request, .internal_server_error, "serialization error");
+        try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
     defer allocator.free(body);
@@ -1544,7 +1548,7 @@ fn remountOverlayForSandbox(allocator: std.mem.Allocator, sandbox_path: []const 
     writeMetaFile(sandbox_path, "mounted", "1");
 }
 
-fn teardownSandboxResources(allocator: std.mem.Allocator, sandbox_path: []const u8, id: []const u8) !void {
+pub fn teardownSandboxResources(allocator: std.mem.Allocator, sandbox_path: []const u8, id: []const u8) !void {
     writeMetaFile(sandbox_path, "mounted", "0");
 
     var merged_buf: [std.fs.max_path_bytes]u8 = undefined;

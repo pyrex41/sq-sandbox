@@ -17,6 +17,22 @@ pub const manager = @import("manager.zig");
 
 const log = std.log.scoped(.squashd);
 
+/// Signal handler: sets the atomic shutdown flag so the accept loop exits.
+fn handleSignal(_: c_int) callconv(.c) void {
+    api.shutdown_requested.store(true, .release);
+}
+
+/// Install SIGTERM and SIGINT handlers for graceful shutdown.
+fn installSignalHandlers() void {
+    const handler: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &handler, null);
+    std.posix.sigaction(std.posix.SIG.INT, &handler, null);
+}
+
 pub fn main() !void {
     // Use GeneralPurposeAllocator for the daemon lifetime. It catches
     // double-free and use-after-free in debug builds, while being
@@ -65,9 +81,15 @@ pub fn main() !void {
     reaper_thread.detach();
     log.info("reaper thread started", .{});
 
-    // 6. Start HTTP server (blocks forever, accepting connections)
+    // 6. Install signal handlers for graceful shutdown
+    installSignalHandlers();
+
+    // 7. Start HTTP server (returns on SIGTERM/SIGINT)
     log.info("starting HTTP server on port {d}", .{cfg.port});
-    try api.startServer(&cfg);
+    try api.startServer(&cfg, allocator);
+
+    // 8. Cleanup runs via defers (destroyAll, mgr.deinit, gpa.deinit)
+    log.info("graceful shutdown complete", .{});
 }
 
 // ── Proxy and Tailscale startup ──────────────────────────────────────

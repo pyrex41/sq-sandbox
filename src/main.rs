@@ -100,5 +100,11 @@ async fn main() {
         init_result.module_count, init_result.sandbox_count, port
     );
 
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutdown signal received, draining connections");
+        })
+        .await
+        .expect("server error");
 }

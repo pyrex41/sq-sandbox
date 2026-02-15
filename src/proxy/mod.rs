@@ -57,6 +57,7 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
 pub struct ProxyState {
     pub secrets: Option<SecretsFile>,
     pub certs: CertCache,
+    pub client: reqwest::Client,
     pub active_conns: AtomicI64,
     pub conn_semaphore: tokio::sync::Semaphore,
 }
@@ -74,9 +75,15 @@ impl ProxyState {
         let ca = CaAuthority::load_or_generate(&ca_dir)?;
         let certs = CertCache::new(ca);
 
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to build reqwest client");
+
         Ok(Self {
             secrets,
             certs,
+            client,
             active_conns: AtomicI64::new(0),
             conn_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNS),
         })

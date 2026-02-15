@@ -4,6 +4,7 @@ mod models;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware as axum_mw;
 use axum::routing::{get, post};
 use axum::Router;
@@ -58,6 +59,8 @@ pub fn router(
         .merge(api_routes)
         // Content-Type enforcement applies to all POST requests
         .layer(axum_mw::from_fn(middleware::require_json_content_type))
+        // Limit request body size to 1MB
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         // Serve static files from /app/static as fallback for unmatched routes
         .fallback_service(ServeDir::new("/app/static"))
         .with_state(state)

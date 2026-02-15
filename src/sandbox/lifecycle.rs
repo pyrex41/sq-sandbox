@@ -18,6 +18,18 @@
 //! - **destroy**: acquire mutex → Ready→Destroying → (ephemeral auto-snapshot) →
 //!   drop mounts → drop cgroup → drop netns → rm dirs → remove from manager
 
+/// Parameters for creating a new sandbox.
+pub struct CreateParams {
+    pub id: String,
+    pub owner: String,
+    pub task: String,
+    pub layers: Vec<String>,
+    pub cpu: f64,
+    pub memory_mb: u64,
+    pub max_lifetime_s: u64,
+    pub allow_net: Vec<String>,
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
@@ -42,19 +54,9 @@ mod linux {
     use crate::sandbox::{Sandbox, SandboxError, SandboxHandle, SandboxState};
     use crate::validate;
 
-    // ── Create ──────────────────────────────────────────────────────────
+    use super::CreateParams;
 
-    /// Parameters for creating a new sandbox.
-    pub struct CreateParams {
-        pub id: String,
-        pub owner: String,
-        pub task: String,
-        pub layers: Vec<String>,
-        pub cpu: f64,
-        pub memory_mb: u64,
-        pub max_lifetime_s: u64,
-        pub allow_net: Vec<String>,
-    }
+    // ── Create ──────────────────────────────────────────────────────────
 
     /// Create a new sandbox with the full 16-step lifecycle.
     ///
@@ -781,17 +783,7 @@ mod stubs {
     use crate::sandbox::{Sandbox, SandboxError, SandboxHandle, SandboxState};
     use crate::validate;
 
-    /// Parameters for creating a new sandbox.
-    pub struct CreateParams {
-        pub id: String,
-        pub owner: String,
-        pub task: String,
-        pub layers: Vec<String>,
-        pub cpu: f64,
-        pub memory_mb: u64,
-        pub max_lifetime_s: u64,
-        pub allow_net: Vec<String>,
-    }
+    use super::CreateParams;
 
     pub async fn create_sandbox(
         manager: &SandboxManager,

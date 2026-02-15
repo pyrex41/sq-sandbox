@@ -1,4 +1,5 @@
-pub mod backend;
+// NOTE: Backend abstraction (SandboxBackend trait) is deferred; lifecycle
+// module handles chroot operations directly for now.
 pub mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod exec;

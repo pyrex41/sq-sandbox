@@ -268,12 +268,7 @@ async fn handle_http(
         }
     }
 
-    // Build reqwest request
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-
+    // Build reqwest request using shared client
     let method = match req.method.to_ascii_uppercase().as_str() {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -291,7 +286,7 @@ async fn handle_http(
         },
     };
 
-    let mut builder = client.request(method, &req.uri);
+    let mut builder = state.client.request(method, &req.uri);
     for (name, value) in &headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
@@ -504,12 +499,7 @@ async fn tls_mitm(
         replace_headers(&mut headers, host, state);
         strip_hop_by_hop(&mut headers);
 
-        // Forward to upstream
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-
+        // Forward to upstream using shared client
         let method = match req.method.to_ascii_uppercase().as_str() {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
@@ -524,7 +514,7 @@ async fn tls_mitm(
             },
         };
 
-        let mut builder = client.request(method, &url);
+        let mut builder = state.client.request(method, &url);
         for (name, value) in &headers {
             builder = builder.header(name.as_str(), value.as_str());
         }

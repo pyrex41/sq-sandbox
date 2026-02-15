@@ -325,7 +325,25 @@ _child_exec :: proc(
 	}
 
 	// Create new mount/PID/IPC/UTS namespaces
-	c_unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS)
+	if c_unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS) != 0 {
+		c_exit(126)
+	}
+
+	// After unshare(CLONE_NEWPID), this process remains in the old PID namespace.
+	// Fork again so the inner child runs as PID 1 in the new namespace.
+	inner_pid := c_fork()
+	if inner_pid < 0 {
+		c_exit(126)
+	}
+	if inner_pid > 0 {
+		status: c.int
+		c_waitpid(inner_pid, &status, 0)
+		if status & 0x7f == 0 {
+			c_exit((status >> 8) & 0xff)
+		} else {
+			c_exit(128 + (status & 0x7f))
+		}
+	}
 
 	// chroot into the merged overlay filesystem
 	merged_c := _to_cstr(ready.mounts.overlay.merged_path)

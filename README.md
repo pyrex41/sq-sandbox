@@ -283,3 +283,61 @@ etc. — anything that supports privileged containers.
   tree. Protect with `SQUASH_AUTH_TOKEN` and network-level access control.
 
 Not for untrusted multi-tenant. No GPU passthrough. No live migration between backends.
+
+## Language Implementations
+
+The sandbox daemon is implemented in five languages on parallel branches. All
+share the same core model (squashfs + overlayfs, cgroups, netns, secrets
+injection) and expose the same HTTP API, but differ in runtime, dependencies,
+and how much is implemented in-language vs. delegated to external tools.
+
+| Implementation | Branch | LOC (src) | Runtime | HTTP Stack |
+|----------------|--------|-----------|---------|------------|
+| **Rust** | `feat/rust` | ~11k | Async (Tokio) | Axum + Tower |
+| **Zig** | `feat/zig` | ~10k | Sync, thread pool | std.http (custom routing) |
+| **Odin** | `feat/odin` | ~5k | Sync, thread pool | Custom (worker pool + bounded channels) |
+| **Common Lisp** | `feat/cl` | ~3.5k | SBCL + bordeaux-threads | Clack/Woo (libev) + Ningle |
+| **Janet** | `feat/janet` | ~1.9k | Fibers (ev/go) | net/server (stdlib) |
+
+### Feature Matrix
+
+| Feature | Rust | Zig | Odin | CL | Janet |
+|---------|------|-----|------|----|-------|
+| Chroot backend | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Firecracker backend | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Native S3 (in-language) | ✓ | ✓ | — | ✓ | — |
+| S3 via shell (`sq-s3`) | — | — | ✓ | — | ✓ |
+| Native HTTPS proxy | ✓ | — | — | — | — |
+| HTTPS proxy (Go sidecar) | — | ✓ | ✓ | ✓ | ✓ |
+| Auth middleware | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Cgroup v2 limits | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Network namespace | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Egress filtering | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Init/recovery | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Reaper | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Graceful shutdown | ✓ | ✓ | — | ✓ | — |
+| Request body limits | ✓ | ✓ | — | ✓ | ✓ |
+| SigV4 signing (in-lang) | — | ✓ | ✓ | ✓ | — |
+
+### S3 Integration
+
+| Impl | Approach | Notes |
+|------|----------|-------|
+| Rust | Native | aws-sdk-s3, async |
+| Zig | Native | Custom SigV4 + std.http, atomic pulls, flock |
+| CL | Native | Ironclad (SHA256/HMAC) + Dexador, SigV4 |
+| Odin | Shell | Delegates to `sq-s3` script (sigv4.odin exists but unwired) |
+| Janet | Shell | Delegates to `sq-s3` via `os/execute` / `os/spawn` |
+
+### Trade-offs
+
+| Criterion | Best fit |
+|-----------|----------|
+| Smallest codebase | Janet (~1.9k LOC) |
+| Most self-contained | Rust (native S3 + native HTTPS proxy) |
+| Lowest dependency surface | Zig, Odin |
+| Fastest iteration / REPL | Common Lisp (Swank + live image) |
+| Strongest typing | Rust, Zig |
+| Simplest deployment | Janet (single interpreter) |
+| Production hardening | Rust (tracing, error types, async, RAII) |
+| Smallest binary | CL (~12-15MB compressed SBCL image) |

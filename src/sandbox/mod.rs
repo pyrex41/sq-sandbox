@@ -4,6 +4,8 @@ pub mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod exec_types;
+#[cfg(target_os = "linux")]
+pub mod firecracker;
 pub mod lifecycle;
 pub mod manager;
 pub mod meta;

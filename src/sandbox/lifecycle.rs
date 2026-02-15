@@ -40,12 +40,13 @@ mod linux {
     use chrono::Utc;
     use tracing::{debug, info, warn};
 
-    use crate::config::Config;
+    use crate::config::{Backend, Config};
     use crate::modules;
     use crate::s3::S3Store;
     use crate::sandbox::cgroup::CgroupHandle;
     use crate::sandbox::exec::{self, ExecContext};
     use crate::sandbox::exec_types::{ExecRequest, ExecResult};
+    use crate::sandbox::firecracker;
     use crate::sandbox::manager::SandboxManager;
     use crate::sandbox::meta::{self, SandboxMetadata};
     use crate::sandbox::mounts::SandboxMounts;
@@ -147,44 +148,85 @@ mod linux {
         meta::write_metadata(&meta_dir, &metadata)
             .map_err(|e| SandboxError::Meta(format!("write metadata: {}", e)))?;
 
-        // 7-9. Mount layers, tmpfs, and overlay
-        let mounts = mount_sandbox_layers(
-            &sandbox_dir,
-            &params.layers,
-            &modules_dir,
-            config.upper_limit_mb,
-            None, // no active snapshot for new sandboxes
-        )?;
+        // Backend-specific setup
+        let (cgroup, netns, mounts, sandbox_metadata) = match config.backend {
+            Backend::Firecracker => {
+                // Firecracker path: allocate CID, setup tap network, start VM
+                let cid = firecracker::allocate_cid(&config.data_dir)?;
+                let net_index = (cid % 255) as u8;
 
-        // 10. Set up cgroups
-        let cgroup =
-            CgroupHandle::create(&params.id, params.cpu, params.memory_mb)
-                .map_err(|e| SandboxError::Cgroup(e.to_string()))?;
+                firecracker::setup_network(
+                    &params.id,
+                    net_index,
+                    allow_net.as_deref(),
+                )?;
 
-        // 11. Set up network namespace
-        let sandboxes_dir = config.sandboxes_dir();
-        let netns = setup_netns(
-            &params.id,
-            &config.data_dir,
-            &sandboxes_dir,
-            &meta_dir,
-            allow_net.as_deref(),
-        )?;
+                // Collect squashfs paths for the VM
+                let squashfs_paths: Vec<PathBuf> = params
+                    .layers
+                    .iter()
+                    .map(|layer| modules::module_path(&modules_dir, layer))
+                    .collect();
 
-        // 12. Seed DNS resolv.conf in the merged directory
-        seed_dns_resolv_conf(&merged_dir);
+                firecracker::start_vm(
+                    &params.id,
+                    params.cpu,
+                    params.memory_mb,
+                    &squashfs_paths,
+                    cid,
+                    &meta_dir,
+                )?;
 
-        // 13-14. Inject proxy env vars and CA certs
-        if config.proxy_https {
-            inject_proxy_env(&merged_dir, config);
-            inject_ca_certs(&merged_dir, config);
-        }
+                // Write network index to metadata
+                let mut md = metadata;
+                md.netns_index = Some(net_index);
+                fs::write(meta_dir.join("fc_net_index"), net_index.to_string())?;
 
-        // Update metadata with netns index if netns was set up
-        let mut sandbox_metadata = metadata;
-        if let Some(ref ns) = netns {
-            sandbox_metadata.netns_index = Some(ns.index());
-        }
+                (None, None, None, md)
+            }
+            Backend::Chroot => {
+                // 7-9. Mount layers, tmpfs, and overlay
+                let mounts = mount_sandbox_layers(
+                    &sandbox_dir,
+                    &params.layers,
+                    &modules_dir,
+                    config.upper_limit_mb,
+                    None, // no active snapshot for new sandboxes
+                )?;
+
+                // 10. Set up cgroups
+                let cgroup =
+                    CgroupHandle::create(&params.id, params.cpu, params.memory_mb)
+                        .map_err(|e| SandboxError::Cgroup(e.to_string()))?;
+
+                // 11. Set up network namespace
+                let sandboxes_dir = config.sandboxes_dir();
+                let netns = setup_netns(
+                    &params.id,
+                    &config.data_dir,
+                    &sandboxes_dir,
+                    &meta_dir,
+                    allow_net.as_deref(),
+                )?;
+
+                // 12. Seed DNS resolv.conf in the merged directory
+                seed_dns_resolv_conf(&merged_dir);
+
+                // 13-14. Inject proxy env vars and CA certs
+                if config.proxy_https {
+                    inject_proxy_env(&merged_dir, config);
+                    inject_ca_certs(&merged_dir, config);
+                }
+
+                // Update metadata with netns index if netns was set up
+                let mut md = metadata;
+                if let Some(ref ns) = netns {
+                    md.netns_index = Some(ns.index());
+                }
+
+                (cgroup, netns, Some(mounts), md)
+            }
+        };
 
         let sandbox = Sandbox {
             id: params.id.clone(),
@@ -193,7 +235,7 @@ mod linux {
             metadata: sandbox_metadata,
             cgroup,
             netns,
-            mounts: Some(mounts),
+            mounts,
         };
 
         // 15. Insert into manager (checks limit atomically)
@@ -368,6 +410,7 @@ mod linux {
     /// Execute a command inside a sandbox, coordinating state transitions and serialization.
     pub async fn sandbox_exec(
         manager: &SandboxManager,
+        config: &Config,
         sandbox_id: &str,
         cmd: String,
         workdir: String,
@@ -378,41 +421,59 @@ mod linux {
 
         sandbox.transition(SandboxState::Executing)?;
 
-        let merged_path = sandbox.merged_path();
-        let sandbox_dir = sandbox.dir.clone();
         let sb_id = sandbox.id.clone();
-        let cgroup_path = sandbox.cgroup.as_ref().map(|cg| cg.path().clone());
 
-        let netns_file = sandbox.netns.as_ref().map(|ns| {
-            let netns_path = PathBuf::from(format!("/run/netns/{}", ns.name()));
-            std::fs::File::open(&netns_path)
-        });
+        let result = match config.backend {
+            Backend::Firecracker => {
+                let meta_dir = sandbox.meta_dir();
+                let cid = firecracker::read_cid(&meta_dir)?;
+                let cmd_clone = cmd.clone();
+                let workdir_clone = workdir.clone();
 
-        let netns_fd = match netns_file {
-            Some(Ok(ref f)) => Some(f.as_raw_fd()),
-            Some(Err(ref e)) => {
-                let _ = sandbox.transition(SandboxState::Ready);
-                return Err(SandboxError::Netns(format!("failed to open netns fd: {}", e)));
+                tokio::task::spawn_blocking(move || {
+                    firecracker::exec_vsock(cid, &cmd_clone, &workdir_clone, timeout)
+                })
+                .await
+                .map_err(|e| SandboxError::Exec(format!("spawn_blocking failed: {}", e)))?
+                .map_err(|e| SandboxError::Exec(e.to_string()))?
             }
-            None => None,
+            Backend::Chroot => {
+                let merged_path = sandbox.merged_path();
+                let sandbox_dir = sandbox.dir.clone();
+                let cgroup_path = sandbox.cgroup.as_ref().map(|cg| cg.path().clone());
+
+                let netns_file = sandbox.netns.as_ref().map(|ns| {
+                    let netns_path = PathBuf::from(format!("/run/netns/{}", ns.name()));
+                    std::fs::File::open(&netns_path)
+                });
+
+                let netns_fd = match netns_file {
+                    Some(Ok(ref f)) => Some(f.as_raw_fd()),
+                    Some(Err(ref e)) => {
+                        let _ = sandbox.transition(SandboxState::Ready);
+                        return Err(SandboxError::Netns(format!("failed to open netns fd: {}", e)));
+                    }
+                    None => None,
+                };
+
+                let ctx = ExecContext {
+                    sandbox_id: sb_id.clone(),
+                    merged_path,
+                    sandbox_dir,
+                    netns_fd,
+                    cgroup_path,
+                };
+
+                let req = exec::ExecRequest { cmd, workdir, timeout };
+
+                debug!(sandbox_id = %sb_id, cmd = %req.cmd, "executing in sandbox");
+
+                tokio::task::spawn_blocking(move || exec::exec_in_sandbox(&ctx, &req))
+                    .await
+                    .map_err(|e| SandboxError::Exec(format!("spawn_blocking failed: {}", e)))?
+                    .map_err(|e| SandboxError::Exec(e.to_string()))?
+            }
         };
-
-        let ctx = ExecContext {
-            sandbox_id: sb_id.clone(),
-            merged_path,
-            sandbox_dir,
-            netns_fd,
-            cgroup_path,
-        };
-
-        let req = exec::ExecRequest { cmd, workdir, timeout };
-
-        debug!(sandbox_id = %sb_id, cmd = %req.cmd, "executing in sandbox");
-
-        let result = tokio::task::spawn_blocking(move || exec::exec_in_sandbox(&ctx, &req))
-            .await
-            .map_err(|e| SandboxError::Exec(format!("spawn_blocking failed: {}", e)))?
-            .map_err(|e| SandboxError::Exec(e.to_string()))?;
 
         sandbox.metadata.last_active = Utc::now();
         sandbox.transition(SandboxState::Ready)?;
@@ -455,57 +516,80 @@ mod linux {
             )));
         }
 
-        // Mount the new squashfs layer
-        let source = modules::module_path(&modules_dir, module_name);
-        let target = sandbox_dir.join(format!("images/{}.squashfs", module_name));
-        fs::create_dir_all(&target).map_err(|e| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            SandboxError::Mount(format!("create mount target: {}", e))
-        })?;
+        match config.backend {
+            Backend::Firecracker => {
+                let meta_dir = sandbox.meta_dir();
+                let cid = firecracker::read_cid(&meta_dir)?;
+                let source = modules::module_path(&modules_dir, module_name);
 
-        use crate::sandbox::mounts::SquashfsMount;
-        let new_layer = SquashfsMount::mount(&source, &target).map_err(|e| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            SandboxError::Mount(format!("mount module {}: {}", module_name, e))
-        })?;
+                firecracker::add_drive(
+                    &sb_id,
+                    module_name,
+                    &source,
+                    cid,
+                    &meta_dir,
+                )
+                .map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    e
+                })?;
+            }
+            Backend::Chroot => {
+                // Mount the new squashfs layer
+                let source = modules::module_path(&modules_dir, module_name);
+                let target = sandbox_dir.join(format!("images/{}.squashfs", module_name));
+                fs::create_dir_all(&target).map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Mount(format!("create mount target: {}", e))
+                })?;
 
-        let mut old_mounts = sandbox.mounts.take().ok_or_else(|| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            SandboxError::Mount("sandbox has no mounts".to_string())
-        })?;
+                use crate::sandbox::mounts::SquashfsMount;
+                let new_layer = SquashfsMount::mount(&source, &target).map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Mount(format!("mount module {}: {}", module_name, e))
+                })?;
 
-        if let Err(e) = old_mounts.overlay.unmount() {
-            warn!(sandbox_id = %sb_id, error = %e, "failed to unmount overlay for activate");
+                let mut old_mounts = sandbox.mounts.take().ok_or_else(|| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Mount("sandbox has no mounts".to_string())
+                })?;
+
+                if let Err(e) = old_mounts.overlay.unmount() {
+                    warn!(sandbox_id = %sb_id, error = %e, "failed to unmount overlay for activate");
+                }
+
+                let mut updated_layers_chroot: Vec<String> = sandbox.metadata.layers.clone();
+                updated_layers_chroot.push(module_name.to_string());
+
+                // Rebuild overlay with new layer set
+                let merged_dir = sandbox_dir.join("merged");
+                let upper_data = sandbox_dir.join("upper").join("data");
+                let upper_work = sandbox_dir.join("upper").join("work");
+                let images_dir = sandbox_dir.join("images");
+
+                let mut lower_dirs = Vec::new();
+                if old_mounts.snapshot.is_some() {
+                    lower_dirs.push(images_dir.join("_snapshot"));
+                }
+                for layer in updated_layers_chroot.iter().rev() {
+                    lower_dirs.push(images_dir.join(format!("{}.squashfs", layer)));
+                }
+
+                use crate::sandbox::mounts::OverlayMount;
+                let overlay = OverlayMount::mount(&merged_dir, lower_dirs, &upper_data, &upper_work)
+                    .map_err(|e| {
+                        let _ = sandbox.transition(SandboxState::Ready);
+                        SandboxError::Mount(format!("remount overlay: {}", e))
+                    })?;
+
+                old_mounts.layers.push(new_layer);
+                old_mounts.overlay = overlay;
+                sandbox.mounts = Some(old_mounts);
+            }
         }
 
         let mut updated_layers: Vec<String> = sandbox.metadata.layers.clone();
         updated_layers.push(module_name.to_string());
-
-        // Rebuild overlay with new layer set
-        let merged_dir = sandbox_dir.join("merged");
-        let upper_data = sandbox_dir.join("upper").join("data");
-        let upper_work = sandbox_dir.join("upper").join("work");
-        let images_dir = sandbox_dir.join("images");
-
-        let mut lower_dirs = Vec::new();
-        if old_mounts.snapshot.is_some() {
-            lower_dirs.push(images_dir.join("_snapshot"));
-        }
-        for layer in updated_layers.iter().rev() {
-            lower_dirs.push(images_dir.join(format!("{}.squashfs", layer)));
-        }
-
-        use crate::sandbox::mounts::OverlayMount;
-        let overlay = OverlayMount::mount(&merged_dir, lower_dirs, &upper_data, &upper_work)
-            .map_err(|e| {
-                let _ = sandbox.transition(SandboxState::Ready);
-                SandboxError::Mount(format!("remount overlay: {}", e))
-            })?;
-
-        old_mounts.layers.push(new_layer);
-        old_mounts.overlay = overlay;
-        sandbox.mounts = Some(old_mounts);
-
         sandbox.metadata.layers = updated_layers.clone();
         sandbox.metadata.last_active = Utc::now();
 
@@ -524,6 +608,7 @@ mod linux {
     /// Create a snapshot of the sandbox's writable upper layer.
     pub async fn snapshot_sandbox(
         manager: &SandboxManager,
+        config: &Config,
         sandbox_id: &str,
         label: Option<&str>,
         s3: Option<&S3Store>,
@@ -547,22 +632,62 @@ mod linux {
             None => Utc::now().format("snap-%Y%m%d-%H%M%S").to_string(),
         };
 
-        let use_zstd = snap::kernel_supports_zstd();
+        let (snap_path, size) = match config.backend {
+            Backend::Firecracker => {
+                let meta_dir = sandbox.meta_dir();
+                let cid = firecracker::read_cid(&meta_dir)?;
+                let label_clone = label.clone();
 
-        let label_clone = label.clone();
-        let sandbox_dir_clone = sandbox_dir.clone();
-        let (snap_path, size) = tokio::task::spawn_blocking(move || {
-            snap::create_snapshot(&sandbox_dir_clone, &label_clone, use_zstd)
-        })
-        .await
-        .map_err(|e| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            SandboxError::Snapshot(format!("spawn_blocking: {}", e))
-        })?
-        .map_err(|e| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            e
-        })?;
+                // Tell guest agent to create a snapshot via vsock
+                let result = tokio::task::spawn_blocking(move || {
+                    firecracker::exec_vsock(
+                        cid,
+                        &format!("__squash_snapshot {}", label_clone),
+                        "/",
+                        120,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Snapshot(format!("spawn_blocking: {}", e))
+                })?
+                .map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Snapshot(e.to_string())
+                })?;
+
+                if result.exit_code != 0 {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    return Err(SandboxError::Snapshot(format!(
+                        "guest snapshot failed (exit {}): {}",
+                        result.exit_code, result.stderr
+                    )));
+                }
+
+                let snap_path = sandbox_dir.join(format!("snapshots/{}.squashfs", label));
+                let size = fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
+                (snap_path, size)
+            }
+            Backend::Chroot => {
+                let use_zstd = snap::kernel_supports_zstd();
+
+                let label_clone = label.clone();
+                let sandbox_dir_clone = sandbox_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    snap::create_snapshot(&sandbox_dir_clone, &label_clone, use_zstd)
+                })
+                .await
+                .map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Snapshot(format!("spawn_blocking: {}", e))
+                })?
+                .map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    e
+                })?
+            }
+        };
 
         sandbox.metadata.active_snapshot = Some(label.clone());
         sandbox.metadata.last_active = Utc::now();
@@ -605,69 +730,104 @@ mod linux {
             return Err(SandboxError::Snapshot(format!("snapshot '{}' not found", label)));
         }
 
-        let mut old_mounts = sandbox.mounts.take().ok_or_else(|| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            SandboxError::Mount("sandbox has no mounts".to_string())
-        })?;
+        match config.backend {
+            Backend::Firecracker => {
+                // Firecracker restore: stop VM, restart with snapshot as additional layer
+                let meta_dir = sandbox.meta_dir();
+                let cid = firecracker::read_cid(&meta_dir)?;
 
-        // Unmount overlay
-        if let Err(e) = old_mounts.overlay.unmount() {
-            warn!(sandbox_id = %sb_id, error = %e, "failed to unmount overlay for restore");
+                firecracker::stop_vm(&sb_id, &meta_dir).map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    e
+                })?;
+
+                // Collect squashfs paths: snapshot + original layers
+                let mut squashfs_paths: Vec<PathBuf> = vec![snap_path.clone()];
+                let modules_dir = config.modules_dir();
+                for layer in &sandbox.metadata.layers {
+                    squashfs_paths.push(modules::module_path(&modules_dir, layer));
+                }
+
+                firecracker::start_vm(
+                    &sb_id,
+                    sandbox.metadata.cpu,
+                    sandbox.metadata.memory_mb,
+                    &squashfs_paths,
+                    cid,
+                    &meta_dir,
+                )
+                .map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    e
+                })?;
+            }
+            Backend::Chroot => {
+                let mut old_mounts = sandbox.mounts.take().ok_or_else(|| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Mount("sandbox has no mounts".to_string())
+                })?;
+
+                // Unmount overlay
+                if let Err(e) = old_mounts.overlay.unmount() {
+                    warn!(sandbox_id = %sb_id, error = %e, "failed to unmount overlay for restore");
+                }
+
+                // Clear upper/data and upper/work
+                let upper_data = sandbox_dir.join("upper").join("data");
+                let upper_work = sandbox_dir.join("upper").join("work");
+                if upper_data.is_dir() {
+                    let _ = fs::remove_dir_all(&upper_data);
+                    let _ = fs::create_dir_all(&upper_data);
+                }
+                if upper_work.is_dir() {
+                    let _ = fs::remove_dir_all(&upper_work);
+                    let _ = fs::create_dir_all(&upper_work);
+                }
+
+                // Unmount old snapshot if present
+                if let Some(ref mut old_snap) = old_mounts.snapshot {
+                    let _ = old_snap.unmount();
+                }
+
+                // Mount new snapshot
+                let images_dir = sandbox_dir.join("images");
+                let snap_target = images_dir.join("_snapshot");
+                let _ = fs::create_dir_all(&snap_target);
+
+                use crate::sandbox::mounts::SquashfsMount;
+                let new_snap = SquashfsMount::mount(&snap_path, &snap_target).map_err(|e| {
+                    let _ = sandbox.transition(SandboxState::Ready);
+                    SandboxError::Mount(format!("mount snapshot {}: {}", label, e))
+                })?;
+
+                // Rebuild overlay with snapshot as top lowerdir
+                let merged_dir = sandbox_dir.join("merged");
+                let mut lower_dirs = Vec::new();
+                lower_dirs.push(snap_target.clone());
+                for layer in sandbox.metadata.layers.iter().rev() {
+                    lower_dirs.push(images_dir.join(format!("{}.squashfs", layer)));
+                }
+
+                use crate::sandbox::mounts::OverlayMount;
+                let overlay = OverlayMount::mount(&merged_dir, lower_dirs, &upper_data, &upper_work)
+                    .map_err(|e| {
+                        let _ = sandbox.transition(SandboxState::Ready);
+                        SandboxError::Mount(format!("remount overlay after restore: {}", e))
+                    })?;
+
+                old_mounts.snapshot = Some(new_snap);
+                old_mounts.overlay = overlay;
+                sandbox.mounts = Some(old_mounts);
+
+                // Re-inject config
+                let merged_dir = sandbox_dir.join("merged");
+                if config.proxy_https {
+                    inject_proxy_env(&merged_dir, config);
+                    inject_ca_certs(&merged_dir, config);
+                }
+                seed_dns_resolv_conf(&merged_dir);
+            }
         }
-
-        // Clear upper/data and upper/work
-        let upper_data = sandbox_dir.join("upper").join("data");
-        let upper_work = sandbox_dir.join("upper").join("work");
-        if upper_data.is_dir() {
-            let _ = fs::remove_dir_all(&upper_data);
-            let _ = fs::create_dir_all(&upper_data);
-        }
-        if upper_work.is_dir() {
-            let _ = fs::remove_dir_all(&upper_work);
-            let _ = fs::create_dir_all(&upper_work);
-        }
-
-        // Unmount old snapshot if present
-        if let Some(ref mut old_snap) = old_mounts.snapshot {
-            let _ = old_snap.unmount();
-        }
-
-        // Mount new snapshot
-        let images_dir = sandbox_dir.join("images");
-        let snap_target = images_dir.join("_snapshot");
-        let _ = fs::create_dir_all(&snap_target);
-
-        use crate::sandbox::mounts::SquashfsMount;
-        let new_snap = SquashfsMount::mount(&snap_path, &snap_target).map_err(|e| {
-            let _ = sandbox.transition(SandboxState::Ready);
-            SandboxError::Mount(format!("mount snapshot {}: {}", label, e))
-        })?;
-
-        // Rebuild overlay with snapshot as top lowerdir
-        let merged_dir = sandbox_dir.join("merged");
-        let mut lower_dirs = Vec::new();
-        lower_dirs.push(snap_target.clone());
-        for layer in sandbox.metadata.layers.iter().rev() {
-            lower_dirs.push(images_dir.join(format!("{}.squashfs", layer)));
-        }
-
-        use crate::sandbox::mounts::OverlayMount;
-        let overlay = OverlayMount::mount(&merged_dir, lower_dirs, &upper_data, &upper_work)
-            .map_err(|e| {
-                let _ = sandbox.transition(SandboxState::Ready);
-                SandboxError::Mount(format!("remount overlay after restore: {}", e))
-            })?;
-
-        old_mounts.snapshot = Some(new_snap);
-        old_mounts.overlay = overlay;
-        sandbox.mounts = Some(old_mounts);
-
-        // Re-inject config
-        if config.proxy_https {
-            inject_proxy_env(&merged_dir, config);
-            inject_ca_certs(&merged_dir, config);
-        }
-        seed_dns_resolv_conf(&merged_dir);
 
         sandbox.metadata.active_snapshot = Some(label.to_string());
         sandbox.metadata.last_active = Utc::now();
@@ -705,41 +865,95 @@ mod linux {
             let sb_id = sandbox.id.clone();
             let sandbox_dir = sandbox.dir.clone();
 
-            // Ephemeral auto-snapshot before teardown
-            if config.ephemeral {
-                let upper_data = sandbox_dir.join("upper").join("data");
-                if upper_data.is_dir() {
-                    let use_zstd = snap::kernel_supports_zstd();
-                    let label = format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"));
-                    let sandbox_dir_clone = sandbox_dir.clone();
-                    let label_clone = label.clone();
-
-                    match tokio::task::spawn_blocking(move || {
-                        snap::create_snapshot(&sandbox_dir_clone, &label_clone, use_zstd)
-                    })
-                    .await
-                    {
-                        Ok(Ok((snap_path, _size))) => {
-                            info!(sandbox_id = %sb_id, label = %label, "ephemeral auto-snapshot created");
-                            if let Some(s3) = s3 {
-                                let s3_key = format!("snapshots/{}/{}.squashfs", sb_id, label);
-                                s3.push_bg(snap_path, s3_key);
+            match config.backend {
+                Backend::Firecracker => {
+                    // Ephemeral auto-snapshot via guest agent
+                    if config.ephemeral {
+                        let meta_dir = sandbox.meta_dir();
+                        if let Ok(cid) = firecracker::read_cid(&meta_dir) {
+                            let label = format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+                            let label_clone = label.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                firecracker::exec_vsock(
+                                    cid,
+                                    &format!("__squash_snapshot {}", label_clone),
+                                    "/",
+                                    120,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(Ok(result)) if result.exit_code == 0 => {
+                                    info!(sandbox_id = %sb_id, label = %label, "ephemeral auto-snapshot created");
+                                    if let Some(s3) = s3 {
+                                        let snap_path = sandbox_dir.join(format!("snapshots/{}.squashfs", label));
+                                        let s3_key = format!("snapshots/{}/{}.squashfs", sb_id, label);
+                                        s3.push_bg(snap_path, s3_key);
+                                    }
+                                }
+                                Ok(Ok(result)) => {
+                                    warn!(sandbox_id = %sb_id, exit_code = result.exit_code, "ephemeral auto-snapshot failed");
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(sandbox_id = %sb_id, error = %e, "ephemeral auto-snapshot failed");
+                                }
+                                Err(e) => {
+                                    warn!(sandbox_id = %sb_id, error = %e, "ephemeral auto-snapshot task failed");
+                                }
                             }
                         }
-                        Ok(Err(e)) => {
-                            warn!(sandbox_id = %sb_id, error = %e, "ephemeral auto-snapshot failed");
-                        }
-                        Err(e) => {
-                            warn!(sandbox_id = %sb_id, error = %e, "ephemeral auto-snapshot task failed");
+                    }
+
+                    // Stop VM
+                    let meta_dir = sandbox.meta_dir();
+                    let _ = firecracker::stop_vm(&sb_id, &meta_dir);
+
+                    // Teardown tap network
+                    let net_index_path = meta_dir.join("fc_net_index");
+                    if let Ok(raw) = fs::read_to_string(&net_index_path) {
+                        if let Ok(idx) = raw.trim().parse::<u8>() {
+                            let _ = firecracker::teardown_network(&sb_id, idx);
                         }
                     }
                 }
-            }
+                Backend::Chroot => {
+                    // Ephemeral auto-snapshot before teardown
+                    if config.ephemeral {
+                        let upper_data = sandbox_dir.join("upper").join("data");
+                        if upper_data.is_dir() {
+                            let use_zstd = snap::kernel_supports_zstd();
+                            let label = format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+                            let sandbox_dir_clone = sandbox_dir.clone();
+                            let label_clone = label.clone();
 
-            // Drop resources in reverse order
-            sandbox.mounts.take();
-            sandbox.cgroup.take();
-            sandbox.netns.take();
+                            match tokio::task::spawn_blocking(move || {
+                                snap::create_snapshot(&sandbox_dir_clone, &label_clone, use_zstd)
+                            })
+                            .await
+                            {
+                                Ok(Ok((snap_path, _size))) => {
+                                    info!(sandbox_id = %sb_id, label = %label, "ephemeral auto-snapshot created");
+                                    if let Some(s3) = s3 {
+                                        let s3_key = format!("snapshots/{}/{}.squashfs", sb_id, label);
+                                        s3.push_bg(snap_path, s3_key);
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(sandbox_id = %sb_id, error = %e, "ephemeral auto-snapshot failed");
+                                }
+                                Err(e) => {
+                                    warn!(sandbox_id = %sb_id, error = %e, "ephemeral auto-snapshot task failed");
+                                }
+                            }
+                        }
+                    }
+
+                    // Drop resources in reverse order
+                    sandbox.mounts.take();
+                    sandbox.cgroup.take();
+                    sandbox.netns.take();
+                }
+            }
 
             // Remove sandbox directory
             if sandbox_dir.is_dir() {
@@ -774,7 +988,7 @@ mod stubs {
 
     use chrono::Utc;
 
-    use crate::config::Config;
+    use crate::config::{Backend, Config};
     use crate::modules;
     use crate::s3::S3Store;
     use crate::sandbox::exec_types::ExecResult;
@@ -790,6 +1004,12 @@ mod stubs {
         config: &Config,
         params: CreateParams,
     ) -> Result<SandboxHandle, SandboxError> {
+        if config.backend == Backend::Firecracker {
+            return Err(SandboxError::Exec(
+                "firecracker backend not supported on this platform".to_string(),
+            ));
+        }
+
         if !validate::valid_id(&params.id) {
             return Err(SandboxError::InvalidId(params.id));
         }
@@ -850,6 +1070,7 @@ mod stubs {
 
     pub async fn sandbox_exec(
         _manager: &SandboxManager,
+        _config: &Config,
         _sandbox_id: &str,
         _cmd: String,
         _workdir: String,
@@ -895,6 +1116,7 @@ mod stubs {
 
     pub async fn snapshot_sandbox(
         manager: &SandboxManager,
+        _config: &Config,
         sandbox_id: &str,
         label: Option<&str>,
         _s3: Option<&S3Store>,
@@ -1100,7 +1322,8 @@ mod tests {
         sb.state = SandboxState::Creating;
         mgr.insert(sb).unwrap();
 
-        let result = sandbox_exec(&mgr, "exec-test", "echo hi".into(), "/".into(), 10).await;
+        let config = Config::default();
+        let result = sandbox_exec(&mgr, &config, "exec-test", "echo hi".into(), "/".into(), 10).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1113,7 +1336,8 @@ mod tests {
     #[tokio::test]
     async fn test_exec_not_found() {
         let mgr = SandboxManager::new(0);
-        let result = sandbox_exec(&mgr, "ghost", "echo".into(), "/".into(), 10).await;
+        let config = Config::default();
+        let result = sandbox_exec(&mgr, &config, "ghost", "echo".into(), "/".into(), 10).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1126,7 +1350,8 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_not_found() {
         let mgr = SandboxManager::new(0);
-        let result = snapshot_sandbox(&mgr, "ghost", None, None).await;
+        let config = Config::default();
+        let result = snapshot_sandbox(&mgr, &config, "ghost", None, None).await;
         assert!(result.is_err());
     }
 
@@ -1272,7 +1497,8 @@ mod tests {
         let mgr = SandboxManager::new(0);
         mgr.insert(make_ready_sandbox("snap-test")).unwrap();
 
-        let result = snapshot_sandbox(&mgr, "snap-test", Some("../evil"), None).await;
+        let config = Config::default();
+        let result = snapshot_sandbox(&mgr, &config, "snap-test", Some("../evil"), None).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

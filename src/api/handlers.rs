@@ -219,6 +219,7 @@ pub async fn exec_in_sandbox(
 
     let result = lifecycle::sandbox_exec(
         &state.sandbox_manager,
+        &state.config,
         &id,
         body.cmd,
         body.workdir,
@@ -294,6 +295,7 @@ pub async fn snapshot_sandbox(
 
     let (label, size) = lifecycle::snapshot_sandbox(
         &state.sandbox_manager,
+        &state.config,
         &id,
         body.label.as_deref(),
         state.s3.as_deref(),

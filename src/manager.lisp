@@ -349,31 +349,33 @@
           (error 'sandbox-error :id id
                  :message (format nil "already active: ~A" module-name)))
         (mount-squashfs mod-path mp)
-        ;; Remount overlay with the new layer
-        (let* ((mounts (sandbox-mounts sandbox))
-               (old-overlay (sandbox-mounts-overlay mounts))
-               (old-sqfs (sandbox-mounts-squashfs-mounts mounts))
-               ;; Build new squashfs array with new mount appended
-               (new-sqfs (let ((arr (make-array (1+ (length old-sqfs)))))
-                           (loop for i below (length old-sqfs)
-                                 do (setf (aref arr i) (aref old-sqfs i)))
-                           (setf (aref arr (length old-sqfs))
-                                 (make-squashfs-mount :mount-point mp))
-                           arr))
-               ;; Build new lowerdir
-               (lower-components (loop for m across new-sqfs
-                                       collect (squashfs-mount-mount-point m)))
-               (upper-path (format nil "~A/upper" sandbox-dir))
-               (merged-path (overlay-mount-merged-path old-overlay)))
-          ;; Unmount old overlay
-          (unmount-overlay old-overlay)
-          ;; Mount new overlay
-          (let ((new-overlay (mount-overlay lower-components
-                                            (format nil "~A/data" upper-path)
-                                            (format nil "~A/work" upper-path)
-                                            merged-path)))
-            (setf (sandbox-mounts-squashfs-mounts mounts) new-sqfs
-                  (sandbox-mounts-overlay mounts) new-overlay)))))))
+        ;; Remount overlay with the new layer — hold manager lock during
+        ;; unmount/remount to prevent concurrent exec seeing broken state.
+        (bt:with-lock-held ((manager-lock manager))
+          (let* ((mounts (sandbox-mounts sandbox))
+                 (old-overlay (sandbox-mounts-overlay mounts))
+                 (old-sqfs (sandbox-mounts-squashfs-mounts mounts))
+                 ;; Build new squashfs array with new mount appended
+                 (new-sqfs (let ((arr (make-array (1+ (length old-sqfs)))))
+                             (loop for i below (length old-sqfs)
+                                   do (setf (aref arr i) (aref old-sqfs i)))
+                             (setf (aref arr (length old-sqfs))
+                                   (make-squashfs-mount :mount-point mp))
+                             arr))
+                 ;; Build new lowerdir
+                 (lower-components (loop for m across new-sqfs
+                                         collect (squashfs-mount-mount-point m)))
+                 (upper-path (format nil "~A/upper" sandbox-dir))
+                 (merged-path (overlay-mount-merged-path old-overlay)))
+            ;; Unmount old overlay
+            (unmount-overlay old-overlay)
+            ;; Mount new overlay
+            (let ((new-overlay (mount-overlay lower-components
+                                              (format nil "~A/data" upper-path)
+                                              (format nil "~A/work" upper-path)
+                                              merged-path)))
+              (setf (sandbox-mounts-squashfs-mounts mounts) new-sqfs
+                    (sandbox-mounts-overlay mounts) new-overlay))))))))
 
 ;;; ── Snapshot ──────────────────────────────────────────────────────────
 

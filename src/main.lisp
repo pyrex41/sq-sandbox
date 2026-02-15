@@ -80,8 +80,16 @@
                          :worker-num 4
                          :debug nil
                          :use-default-middlewares nil))
+    ;; Wire SIGTERM/SIGINT to graceful shutdown
+    (sb-sys:enable-interrupt sb-unix:sigterm
+      #'(lambda (sig info context)
+          (declare (ignore sig info context))
+          (shutdown)))
+    (sb-sys:enable-interrupt sb-unix:sigint
+      #'(lambda (sig info context)
+          (declare (ignore sig info context))
+          (shutdown)))
     ;; Block forever — the reaper and HTTP server run in background threads.
-    ;; SIGTERM/SIGINT will terminate the process via SBCL's default handlers.
     (bt:wait-on-semaphore (bt:make-semaphore :name "main-block"))))
 
 ;;; ── Go proxy management ───────────────────────────────────────────────

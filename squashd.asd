@@ -31,7 +31,6 @@
                (:file "manager")
                (:file "meta")
                (:file "modules")
-               (:file "snapshot")
                (:file "secrets")
                (:file "s3")
                (:file "reaper")

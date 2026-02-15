@@ -39,6 +39,7 @@
   (stderr    "" :type simple-string)
   (started   0  :type (unsigned-byte 64))
   (finished  0  :type (unsigned-byte 64))
+  (duration-ms 0 :type fixnum)
   (seq       0  :type fixnum))
 
 ;;; ── Exec log ───────────────────────────────────────────────────────
@@ -55,10 +56,10 @@
         merged)))
 
 (defun write-exec-log (sandbox seq cmd workdir exit-code started finished
-                       stdout-str stderr-str &key sandbox-dir)
+                       duration-ms stdout-str stderr-str &key sandbox-dir)
   "Write a JSON log entry to .meta/log/exec-<seq>.json for the sandbox.
    Uses SANDBOX-DIR when provided, otherwise derives from merged path."
-  (declare (type fixnum seq exit-code)
+  (declare (type fixnum seq exit-code duration-ms)
            (type (unsigned-byte 64) started finished)
            (type simple-string cmd workdir stdout-str stderr-str))
   (let* ((root (or sandbox-dir (sandbox-root-path sandbox)))
@@ -76,7 +77,7 @@
               :|exit_code| exit-code
               :|started| started
               :|finished| finished
-              :|duration_ms| (the fixnum (* (- finished started) 1000))
+              :|duration_ms| duration-ms
               :|stdout| stdout-str
               :|stderr| stderr-str))
        s))))
@@ -173,15 +174,23 @@
 
   ;; execve /bin/sh -c "<cmd>"
   (cffi:with-foreign-objects ((argv :pointer 4)
-                              (envp :pointer 1))
+                              (envp :pointer 5))
     (let ((sh  (cffi:foreign-string-alloc "/bin/sh"))
           (c   (cffi:foreign-string-alloc "-c"))
-          (arg (cffi:foreign-string-alloc cmd)))
+          (arg (cffi:foreign-string-alloc cmd))
+          (e0  (cffi:foreign-string-alloc "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"))
+          (e1  (cffi:foreign-string-alloc "HOME=/root"))
+          (e2  (cffi:foreign-string-alloc "USER=root"))
+          (e3  (cffi:foreign-string-alloc "TERM=xterm")))
       (setf (cffi:mem-aref argv :pointer 0) sh
             (cffi:mem-aref argv :pointer 1) c
             (cffi:mem-aref argv :pointer 2) arg
             (cffi:mem-aref argv :pointer 3) (cffi:null-pointer))
-      (setf (cffi:mem-aref envp :pointer 0) (cffi:null-pointer))
+      (setf (cffi:mem-aref envp :pointer 0) e0
+            (cffi:mem-aref envp :pointer 1) e1
+            (cffi:mem-aref envp :pointer 2) e2
+            (cffi:mem-aref envp :pointer 3) e3
+            (cffi:mem-aref envp :pointer 4) (cffi:null-pointer))
       (%execve "/bin/sh" argv envp)))
 
   ;; If execve returns, it failed
@@ -307,7 +316,8 @@
   (declare (type simple-string cmd workdir)
            (type fixnum timeout))
 
-  (let ((started (get-unix-time)))
+  (let ((started (get-unix-time))
+        (start-ticks (get-internal-real-time)))
     ;; Open netns fd before fork (while we have access to /var/run/netns)
     (let ((netns-fd (when (sandbox-netns sandbox)
                       (let ((fd (%sys-open
@@ -357,13 +367,16 @@
                    (parent-read-output pid stdout-r stderr-r timeout)
 
                  (let* ((finished (get-unix-time))
+                        (end-ticks (get-internal-real-time))
+                        (duration-ms (round (* (- end-ticks start-ticks) 1000)
+                                            internal-time-units-per-second))
                         (seq (incf (sandbox-exec-count sandbox))))
 
                    ;; Write log entry to .meta/log
                    (ignore-errors
                      (write-exec-log sandbox seq cmd workdir
                                      exit-code started finished
-                                     stdout-str stderr-str
+                                     duration-ms stdout-str stderr-str
                                      :sandbox-dir sandbox-dir))
 
                    (make-exec-result
@@ -372,4 +385,5 @@
                     :stderr stderr-str
                     :started started
                     :finished finished
+                    :duration-ms duration-ms
                     :seq seq)))))))))))

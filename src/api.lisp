@@ -36,14 +36,25 @@
 
 ;;; ── Request body parsing ─────────────────────────────────────────────
 
+(defconstant +max-request-body-bytes+ (* 1024 1024)
+  "Maximum allowed request body size (1 MB).")
+
 (defun parse-json-body (request)
   "Parse JSON from the request body. Returns a plist (Jonathan default).
-   Returns NIL on parse failure or empty body."
+   Returns NIL on parse failure or empty body.
+   Signals a body-too-large condition (caught by callers) if content-length > 1MB."
   (handler-case
       (let ((content-type (lack.request:request-content-type request)))
         (when (and content-type
                    (search "application/json" content-type))
+          ;; Check content-length before reading body
+          (let ((content-length (lack.request:request-content-length request)))
+            (when (and content-length
+                       (> content-length +max-request-body-bytes+))
+              (return-from parse-json-body :body-too-large)))
           (let ((body-bytes (lack.request:request-content request)))
+            (when (and body-bytes (> (length body-bytes) +max-request-body-bytes+))
+              (return-from parse-json-body :body-too-large))
             (when (and body-bytes (plusp (length body-bytes)))
               (jojo:parse (babel:octets-to-string body-bytes :encoding :utf-8))))))
     (error () nil)))
@@ -135,23 +146,25 @@
       (lambda (params)
         (declare (ignore params))
         (let ((body (parse-json-body ningle:*request*)))
-          (handler-case
-              (let* ((id (getf body :|id|))
-                     (layers (parse-layers (getf body :|layers|)))
-                     (sandbox
-                       (manager-create-sandbox
-                        *manager* id
-                        :owner (getf body :|owner|)
-                        :layers layers
-                        :task (getf body :|task|)
-                        :cpu (getf body :|cpu|)
-                        :memory-mb (getf body :|memory_mb|)
-                        :max-lifetime-s (getf body :|max_lifetime_s|)
-                        :allow-net (getf body :|allow_net|))))
-                (json-response 201 (sandbox-to-info sandbox)))
-            (sandbox-error (e)
-              (json-response 400
-                (list :|error| (format nil "~A" e))))))))
+          (if (eq body :body-too-large)
+              (json-response 413 '(:|error| "request body too large"))
+              (handler-case
+                  (let* ((id (getf body :|id|))
+                         (layers (parse-layers (getf body :|layers|)))
+                         (sandbox
+                           (manager-create-sandbox
+                            *manager* id
+                            :owner (getf body :|owner|)
+                            :layers layers
+                            :task (getf body :|task|)
+                            :cpu (getf body :|cpu|)
+                            :memory-mb (getf body :|memory_mb|)
+                            :max-lifetime-s (getf body :|max_lifetime_s|)
+                            :allow-net (getf body :|allow_net|))))
+                    (json-response 201 (sandbox-to-info sandbox)))
+                (sandbox-error (e)
+                  (json-response 400
+                    (list :|error| (format nil "~A" e)))))))))
 
 ;;; ── Sandbox instance routes ─────────────────────────────────────────
 
@@ -186,71 +199,79 @@
 (setf (ningle:route *app* "/cgi-bin/api/sandboxes/:id/exec" :method :POST)
       (lambda (params)
         (let* ((id (cdr (assoc :id params)))
-               (body (parse-json-body ningle:*request*))
-               (cmd (getf body :|cmd|)))
-          (if (null cmd)
-              (json-response 400 (list :|error| "cmd required"))
-              (let ((workdir (or (getf body :|workdir|) "/"))
-                    (timeout (or (getf body :|timeout|) 300)))
-                (handler-case
-                    (let ((result (manager-exec *manager* id cmd
-                                                :workdir workdir
-                                                :timeout timeout)))
-                      (json-response 200 (exec-result-to-alist result)))
-                  (sandbox-error (e)
-                    (json-response 404
-                      (list :|error| (format nil "~A" e))))))))))
+               (body (parse-json-body ningle:*request*)))
+          (if (eq body :body-too-large)
+              (json-response 413 '(:|error| "request body too large"))
+              (let ((cmd (getf body :|cmd|)))
+                (if (null cmd)
+                    (json-response 400 (list :|error| "cmd required"))
+                    (let ((workdir (or (getf body :|workdir|) "/"))
+                          (timeout (or (getf body :|timeout|) 300)))
+                      (handler-case
+                          (let ((result (manager-exec *manager* id cmd
+                                                      :workdir workdir
+                                                      :timeout timeout)))
+                            (json-response 200 (exec-result-to-alist result)))
+                        (sandbox-error (e)
+                          (json-response 404
+                            (list :|error| (format nil "~A" e))))))))))))
 
 ;;; Activate module (add layer to running sandbox)
 
 (setf (ningle:route *app* "/cgi-bin/api/sandboxes/:id/activate" :method :POST)
       (lambda (params)
         (let* ((id (cdr (assoc :id params)))
-               (body (parse-json-body ningle:*request*))
-               (module-name (getf body :|module|)))
-          (if (null module-name)
-              (json-response 400 (list :|error| "module required"))
-              (handler-case
-                  (progn
-                    (manager-activate-module *manager* id module-name)
-                    (json-response 200 (manager-sandbox-info *manager* id)))
-                (sandbox-error (e)
-                  (json-response 400
-                    (list :|error| (format nil "~A" e)))))))))
+               (body (parse-json-body ningle:*request*)))
+          (if (eq body :body-too-large)
+              (json-response 413 '(:|error| "request body too large"))
+              (let ((module-name (getf body :|module|)))
+                (if (null module-name)
+                    (json-response 400 (list :|error| "module required"))
+                    (handler-case
+                        (progn
+                          (manager-activate-module *manager* id module-name)
+                          (json-response 200 (manager-sandbox-info *manager* id)))
+                      (sandbox-error (e)
+                        (json-response 400
+                          (list :|error| (format nil "~A" e)))))))))))
 
 ;;; Create snapshot
 
 (setf (ningle:route *app* "/cgi-bin/api/sandboxes/:id/snapshot" :method :POST)
       (lambda (params)
         (let* ((id (cdr (assoc :id params)))
-               (body (parse-json-body ningle:*request*))
-               (label (getf body :|label|)))
-          (handler-case
-              (multiple-value-bind (snap-label snap-size)
-                  (manager-snapshot *manager* id label)
-                (json-response 200
-                  (list :|snapshot| snap-label
-                        :|size| snap-size)))
-            (sandbox-error (e)
-              (json-response 400
-                (list :|error| (format nil "~A" e))))))))
+               (body (parse-json-body ningle:*request*)))
+          (if (eq body :body-too-large)
+              (json-response 413 '(:|error| "request body too large"))
+              (let ((label (getf body :|label|)))
+                (handler-case
+                    (multiple-value-bind (snap-label snap-size)
+                        (manager-snapshot *manager* id label)
+                      (json-response 200
+                        (list :|snapshot| snap-label
+                              :|size| snap-size)))
+                  (sandbox-error (e)
+                    (json-response 400
+                      (list :|error| (format nil "~A" e))))))))))
 
 ;;; Restore snapshot
 
 (setf (ningle:route *app* "/cgi-bin/api/sandboxes/:id/restore" :method :POST)
       (lambda (params)
         (let* ((id (cdr (assoc :id params)))
-               (body (parse-json-body ningle:*request*))
-               (label (getf body :|label|)))
-          (if (null label)
-              (json-response 400 (list :|error| "label required"))
-              (handler-case
-                  (progn
-                    (manager-restore *manager* id label)
-                    (json-response 200 (manager-sandbox-info *manager* id)))
-                (sandbox-error (e)
-                  (json-response 400
-                    (list :|error| (format nil "~A" e)))))))))
+               (body (parse-json-body ningle:*request*)))
+          (if (eq body :body-too-large)
+              (json-response 413 '(:|error| "request body too large"))
+              (let ((label (getf body :|label|)))
+                (if (null label)
+                    (json-response 400 (list :|error| "label required"))
+                    (handler-case
+                        (progn
+                          (manager-restore *manager* id label)
+                          (json-response 200 (manager-sandbox-info *manager* id)))
+                      (sandbox-error (e)
+                        (json-response 400
+                          (list :|error| (format nil "~A" e)))))))))))
 
 ;;; Get execution logs
 
@@ -285,8 +306,5 @@
         :|stderr| (exec-result-stderr result)
         :|started| (exec-result-started result)
         :|finished| (exec-result-finished result)
-        :|duration_ms| (the fixnum
-                         (* (- (exec-result-finished result)
-                               (exec-result-started result))
-                            1000))
+        :|duration_ms| (exec-result-duration-ms result)
         :|seq| (exec-result-seq result)))

@@ -1,0 +1,24 @@
+# Nix
+result
+result-*
+.direnv/
+
+# Rust
+target/
+
+# Zig
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Odin
+*.o
+*.bin
+
+# Build artifacts
+gastropod-v3.tar.gz
+repomix-output.xml
+
+# Editor/tool state
+.opencode/
+.scud/

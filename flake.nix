@@ -54,7 +54,9 @@
           };
         };
 
-        packages = pkgs.lib.optionalAttrs isLinux {
+        packages = (pkgs.lib.optionalAttrs isLinux
+          (import ./nix/modules.nix { inherit pkgs; })
+        ) // pkgs.lib.optionalAttrs isLinux {
           sq-secret-proxy = pkgs.stdenv.mkDerivation {
             pname = "sq-secret-proxy-https";
             version = "0.1.0";

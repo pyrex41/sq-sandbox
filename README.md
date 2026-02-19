@@ -61,7 +61,7 @@ A sandbox is a stack of read-only squashfs layers + a writable overlay:
 
 ```
 ┌─────────────────────────────┐
-│ upper/  (writable, tmpfs)   │ <- all changes land here
+│ upper/  (writable, plain dir)│ <- all changes land here
 ├─────────────────────────────┤
 │ 200-checkpoint.squashfs     │ <- optional: restored snapshot
 ├─────────────────────────────┤
@@ -78,6 +78,27 @@ A sandbox is a stack of read-only squashfs layers + a writable overlay:
 Operations: create (squashfuse + fuse-overlayfs), exec (bubblewrap sandbox),
 activate (add layer + remount), snapshot (mksquashfs upper/),
 restore (mount snapshot as layer + clear upper), destroy (unmount + rm).
+
+## Architecture
+
+All five implementations share a common architecture: they shell out to **shared
+helper scripts** in `shared/bin/` rather than making direct syscalls:
+
+| Helper | Purpose |
+|--------|---------|
+| `sq-mount-layer` | Mount/unmount squashfs via squashfuse |
+| `sq-mount-overlay` | Mount/unmount overlayfs via fuse-overlayfs |
+| `sq-exec` | Execute commands via bubblewrap (or unshare+chroot fallback) |
+
+This means:
+- **Consistent behavior** across all implementations
+- **Easy updates** — fix a mount issue once, all impls benefit
+- **Simpler code** — no FFI, no syscall bindings, just subprocess calls
+- **Testable in isolation** — each helper can be tested standalone
+
+Network namespaces and cgroups are **stubbed out** in unprivileged mode.
+Isolation is handled entirely by `sq-exec` (bubblewrap), which provides
+PID/IPC/UTS namespace isolation without requiring root or capabilities.
 
 ## Backends
 

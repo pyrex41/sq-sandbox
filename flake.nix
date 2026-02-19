@@ -116,6 +116,30 @@
           };
         };
 
+        # ── Deployment ───────────────────────────────────────────────
+        deployment = pkgs.lib.optionalAttrs isLinux {
+          sq-sandbox-service = pkgs.writeTextFile {
+            name = "sq-sandbox.service";
+            destination = "/lib/systemd/system/sq-sandbox.service";
+            text = ''
+              [Unit]
+              Description=sq-sandbox composable sandbox daemon
+              After=network.target
+
+              [Service]
+              Type=simple
+              ExecStart=/usr/local/bin/squashd
+              Environment=SQUASH_DATA=/var/lib/sq-sandbox
+              Environment=SQUASH_PORT=8080
+              Restart=on-failure
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            '';
+          };
+        };
+
         # ── OCI images ────────────────────────────────────────────────
         images = pkgs.lib.optionalAttrs isLinux
           (import ./nix/image.nix { inherit pkgs; self-packages = daemons; });
@@ -124,13 +148,14 @@
         devShells = {
           default = pkgs.mkShell {
             name = "sq-sandbox";
-            packages = with pkgs; [ jq curl git shellcheck ];
+            packages = with pkgs; [ jq curl git shellcheck ]
+              ++ pkgs.lib.optionals isLinux [ squashfuse fuse-overlayfs bubblewrap ];
           };
 
           shell = pkgs.mkShell {
             name = "sq-sandbox-shell";
             packages = with pkgs; [ shellcheck jq curl ]
-              ++ pkgs.lib.optionals isLinux [ pkgs.busybox ];
+              ++ pkgs.lib.optionals isLinux [ pkgs.busybox squashfuse fuse-overlayfs bubblewrap ];
           };
 
           rust = pkgs.mkShell {
@@ -160,7 +185,7 @@
           };
         };
 
-        packages = modules // daemons // images;
+        packages = modules // daemons // images // deployment;
       }
     );
 }

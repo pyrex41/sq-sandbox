@@ -1,0 +1,62 @@
+#!/bin/sh
+# squash/bin/sq-mount-overlay — create/remove overlay filesystems
+#
+# Usage:
+#   sq-mount-overlay <lowerdir:...> <upperdir> <workdir> <merged>
+#   sq-mount-overlay --unmount <merged>
+#
+# Mount mode tries fuse-overlayfs first (unprivileged), then falls back
+# to kernel overlayfs.  Unmount mode tries fusermount -u, then umount,
+# then umount -l.
+
+set -eu
+
+log() { echo "[sq-mount-overlay] $*"; }
+die() { echo "[sq-mount-overlay] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: $0 <lowerdir:...> <upperdir> <workdir> <merged>"
+    echo "       $0 --unmount <merged>"
+    exit 1
+}
+
+do_mount() {
+    local lower="$1" upper="$2" work="$3" merged="$4"
+    mkdir -p "$merged"
+
+    if command -v fuse-overlayfs >/dev/null 2>&1; then
+        log "mounting via fuse-overlayfs"
+        fuse-overlayfs -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
+    else
+        log "fuse-overlayfs not found, falling back to kernel overlayfs"
+        mount -t overlay overlay \
+            -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
+    fi
+}
+
+do_unmount() {
+    local mp="$1"
+    if command -v fusermount >/dev/null 2>&1 && fusermount -u "$mp" 2>/dev/null; then
+        log "unmounted $mp (fusermount)"
+    elif umount "$mp" 2>/dev/null; then
+        log "unmounted $mp (umount)"
+    elif umount -l "$mp" 2>/dev/null; then
+        log "lazy-unmounted $mp (umount -l)"
+    else
+        die "failed to unmount $mp"
+    fi
+}
+
+case "${1:---help}" in
+    --unmount)
+        [ $# -eq 2 ] || usage
+        do_unmount "$2"
+        ;;
+    --help|-h)
+        usage
+        ;;
+    *)
+        [ $# -eq 4 ] || usage
+        do_mount "$1" "$2" "$3" "$4"
+        ;;
+esac

@@ -9,10 +9,12 @@ distro-agnostic. Dual backend: chroot (default) or Firecracker microVM.
 ## Quick Start
 
 ```sh
-docker run -d --privileged \
-  -p 8080:8080 \
-  -v squash-data:/data \
-  ghcr.io/pyrex41/sq-sandbox:latest
+# Run directly via Nix (no Docker, no root)
+nix run github:pyrex41/sq-sandbox#squashd-shell
+
+# Or install and start
+nix profile install github:pyrex41/sq-sandbox#squashd-shell
+SQUASH_DATA=~/.sq-sandbox sq-start
 
 # Create a sandbox
 curl -X POST localhost:8080/cgi-bin/api/sandboxes \
@@ -25,13 +27,18 @@ curl -X POST localhost:8080/cgi-bin/api/sandboxes/dev/exec \
 
 ## What this is
 
-Squash Sandbox is a **single-container system** that is both the control plane
-and the sandbox runtime. One Docker container runs:
+Squash Sandbox is a **single daemon** that runs as a regular unprivileged user.
+No Docker, no root, no `--privileged`. It provides:
 
-- The HTTP API server (busybox httpd + CGI shell scripts)
+- The HTTP API server (busybox httpd + CGI, or a compiled daemon)
 - The sandbox lifecycle manager (create, exec, snapshot, restore, destroy)
-- The sandbox host (overlayfs mounts, cgroups, network namespaces, or Firecracker VMs)
+- The sandbox host (squashfuse + fuse-overlayfs + bubblewrap for isolation)
 - Optional background services (reaper, secret proxy, Tailscale)
+
+**Unprivileged by default** — sandboxes are isolated using squashfuse (FUSE-based
+squashfs mounts), fuse-overlayfs (userspace overlay filesystem), and bubblewrap
+(namespace isolation with `pivot_root`). No kernel modules, no capabilities, no
+setuid binaries required.
 
 **HTTPS secret injection** — Set `SQUASH_PROXY_HTTPS=1` to enable transparent
 HTTPS credential injection. The proxy generates per-host TLS certificates
@@ -40,15 +47,13 @@ headers. Sandboxes automatically trust the CA. Real API keys never enter the
 sandbox — only placeholders are visible. Works with curl, Python, Node.js, Go,
 and any TLS client that trusts the system CA bundle.
 
-There is no separate "sandbox agent" or remote execution node. The container
-that serves the API is the same container that mounts squashfs layers and runs
+There is no separate "sandbox agent" or remote execution node. The daemon
+that serves the API is the same process that mounts squashfs layers and runs
 sandboxed commands. This means:
 
-- **Deploy one container** — that's the whole system
-- **`--privileged` is required** — the container directly manipulates kernel
-  resources (loop mounts, overlayfs, cgroups, network namespaces)
-- **Sandbox escape = host compromise** in chroot mode — Firecracker mode
-  provides a stronger VM boundary
+- **Deploy one binary** — that's the whole system (via Nix, tarball, or systemd)
+- **No root required** — uses squashfuse + fuse-overlayfs + bubblewrap
+- **Firecracker mode** — optional VM-level isolation (requires `/dev/kvm`)
 
 ## How it works
 
@@ -70,16 +75,16 @@ A sandbox is a stack of read-only squashfs layers + a writable overlay:
 └─────────────────────────────┘
 ```
 
-Operations: create (mount layers as overlayfs), exec (unshare + chroot),
+Operations: create (squashfuse + fuse-overlayfs), exec (bubblewrap sandbox),
 activate (add layer + remount), snapshot (mksquashfs upper/),
 restore (mount snapshot as layer + clear upper), destroy (unmount + rm).
 
 ## Backends
 
-| Backend       | Isolation              | Requires             |
-|---------------|------------------------|----------------------|
-| `chroot`      | overlayfs + unshare    | Privileged container |
-| `firecracker` | microVM + vsock        | `/dev/kvm`           |
+| Backend       | Isolation                            | Requires                     |
+|---------------|--------------------------------------|------------------------------|
+| `chroot`      | squashfuse + fuse-overlayfs + bwrap  | FUSE access (unprivileged)   |
+| `firecracker` | microVM + vsock + tap networking     | `/dev/kvm` + root            |
 
 Set via `SQUASH_BACKEND` env var. The API is identical regardless of backend.
 
@@ -205,21 +210,14 @@ Available bases: `base-alpine` (~8MB, musl), `base-debian` (~30MB, glibc),
 
 ## Security
 
-**Resource limits** — `cpu` (cgroups v2 / VM config), `memory_mb` (OOM-killed
-on exceed), `max_lifetime_s` (auto-destroyed by `sq-reaper`),
-`SQUASH_UPPER_LIMIT_MB` (writable layer capped at 512MB tmpfs by default),
+**Resource limits** — `max_lifetime_s` (auto-destroyed by `sq-reaper`),
 `SQUASH_MAX_SANDBOXES` (default 100 concurrent sandboxes).
 
-**Namespace isolation** — Each sandbox exec runs in its own mount, PID, IPC,
-and UTS namespaces (`unshare --mount --pid --ipc --uts`). Every sandbox also
-gets a dedicated network namespace with veth pair, regardless of `allow_net`.
-
-**Network egress** — `allow_net` field on create. `[]` = allow all (default),
-`["api.anthropic.com"]` = whitelist, `["none"]` = block all. Every sandbox
-gets its own network namespace (chroot) or tap device (firecracker). DNS
-queries targeting the gateway IP are DNAT'd to the host's resolver. When
-`allow_net` is specified, iptables egress rules are applied with ICMP blocking
-and DNS rate limiting (10/s) to prevent tunneling.
+**Namespace isolation** — Each sandbox exec runs via bubblewrap with its own
+mount, PID, IPC, and UTS namespaces. The sandbox root is a `pivot_root`
+target, not a simple chroot. Processes inside cannot see host PIDs or mounts.
+Falls back to `unshare --mount --pid --ipc --uts --fork --map-root-user`
++ chroot when bubblewrap is unavailable.
 
 **Secret proxy** — `sq-secret-proxy` injects real credentials into outbound
 requests without exposing them inside the sandbox. Two modes:
@@ -266,28 +264,32 @@ persistent volume needed. Sandboxes auto-snapshot to S3 on destroy and
 auto-restore on create.
 
 ```sh
-# Stateless container — no -v flag needed
-docker run --rm --privileged \
-  -e SQUASH_EPHEMERAL=1 \
-  -e SQUASH_S3_BUCKET=my-squash \
-  -p 8080:8080 \
-  ghcr.io/pyrex41/sq-sandbox:latest
+# Stateless deployment — no persistent volume needed
+SQUASH_EPHEMERAL=1 SQUASH_S3_BUCKET=my-squash sq-start
 ```
 
 ## Deployment
 
-Runs as a privileged Docker container on any provider.
+Three deployment methods, all unprivileged:
 
 ```sh
-# Chroot backend (default)
-docker compose up -d
+# 1. Nix (recommended) — reproducible, all deps included
+nix profile install github:pyrex41/sq-sandbox#squashd-shell
+SQUASH_DATA=~/.sq-sandbox sq-start
 
-# Firecracker backend (requires /dev/kvm)
-docker compose -f docker-compose.firecracker.yml up -d
+# 2. NixOS module — declarative system service
+services.sq-sandbox = { enable = true; dataDir = "/var/lib/sq-sandbox"; };
+
+# 3. Static tarball — copy binaries + scripts, bring your own deps
+tar xf sq-sandbox-static.tar.gz -C /opt/sq-sandbox
+PATH=/opt/sq-sandbox/bin:$PATH sq-start
+
+# Firecracker backend (requires /dev/kvm + root for tap networking)
+SQUASH_BACKEND=firecracker sq-start
 ```
 
-Set env vars in `.env` or your shell. Works on any VPS, bare metal, ECS, Fly,
-etc. — anything that supports privileged containers.
+Requires: FUSE access (`/dev/fuse`), squashfuse, fuse-overlayfs, bubblewrap.
+All included automatically with Nix. Set env vars in `.env` or your shell.
 
 ## Environment Variables
 
@@ -302,33 +304,32 @@ etc. — anything that supports privileged containers.
 | `SQUASH_S3_REGION`    | `us-east-1`                   | AWS region                           |
 | `SQUASH_S3_PREFIX`    | `""`                          | Key prefix (e.g. `prod/`)           |
 | `SQUASH_EPHEMERAL`    | `""` (disabled)               | S3-backed ephemeral mode (set `1`)   |
-| `SQUASH_UPPER_LIMIT_MB` | `512`                      | Max size of writable upper layer (tmpfs) |
+| `SQUASH_UPPER_LIMIT_MB` | `512`                      | Max size of writable upper layer     |
 | `SQUASH_MAX_SANDBOXES`  | `100`                      | Max concurrent sandboxes             |
 | `SQUASH_PROXY_HTTPS`  | `""` (disabled)               | HTTPS MITM proxy (set `1`)           |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
 
 ## Known limitations
 
-- **Chroot: shared kernel** — a kernel exploit inside a sandbox could compromise
-  the host. Firecracker mode mitigates this with a separate guest kernel.
-- **Chroot: UID mapping in privileged containers** — `--map-root-user` helps but
-  effective isolation depends on the container runtime's user namespace config.
-  Use Firecracker mode for stronger isolation.
+- **Shared kernel** — a kernel exploit inside a sandbox could compromise the
+  host. Firecracker mode mitigates this with a separate guest kernel.
+- **FUSE required** — the unprivileged path needs `/dev/fuse` access. Most
+  Linux distributions enable this by default. If running inside a container,
+  the container needs `--device /dev/fuse`.
 - **Secret proxy modes** — Default HTTP mode doesn't handle HTTPS. Set
   `SQUASH_PROXY_HTTPS=1` for full HTTPS support (generates a MITM CA).
-- **Seccomp optional** — chroot relies on namespace isolation by default. Apply
-  Docker's seccomp infrastructure at deployment time for additional syscall
-  filtering: `docker run --privileged --security-opt seccomp=seccomp.json ...`
-  A reference `seccomp.json` is included in the repo.
-- **Single-container architecture** — API server and sandbox host share a process
+- **Single-process architecture** — API server and sandbox host share a process
   tree. Protect with `SQUASH_AUTH_TOKEN` and network-level access control.
+- **No network egress filtering** — sandboxes share the host network namespace.
+  Use the secret proxy for credential isolation. For network-level control,
+  deploy behind a firewall or use Firecracker mode.
 
 Not for untrusted multi-tenant. No GPU passthrough. No live migration between backends.
 
 ## Language Implementations
 
 The sandbox daemon is implemented in five languages on parallel branches. All
-share the same core model (squashfs + overlayfs, cgroups, netns, secrets
+share the same core model (squashfuse + fuse-overlayfs + bubblewrap, secrets
 injection) and expose the same HTTP API, but differ in runtime, dependencies,
 and how much is implemented in-language vs. delegated to external tools.
 
@@ -351,9 +352,6 @@ and how much is implemented in-language vs. delegated to external tools.
 | Native HTTPS proxy | ✓ | — | — | — | — |
 | HTTPS proxy (Go sidecar) | — | ✓ | ✓ | ✓ | ✓ |
 | Auth middleware | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Cgroup v2 limits | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Network namespace | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Egress filtering | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Init/recovery | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Reaper | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Graceful shutdown | ✓ | ✓ | — | ✓ | — |

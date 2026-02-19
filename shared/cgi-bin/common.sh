@@ -1,7 +1,8 @@
 #!/bin/sh
 # squash/cgi-bin/common.sh
 # Shared functions for all CGI handlers and CLI tools.
-# Depends: jq, mksquashfs, losetup, mount, unshare, chroot
+# Depends: jq, mksquashfs, sq-mount-layer, sq-mount-overlay, sq-exec
+# Optional: squashfuse, fuse-overlayfs, bubblewrap (for unprivileged mode)
 
 set -eu
 
@@ -213,40 +214,20 @@ _mount_overlay() {
     local id="$1" s=$(sdir "$1")
     local lower=$(_lowerdir "$id")
     [ -z "$lower" ] && return 1
-    mount -t overlay overlay \
-        -o "lowerdir=$lower,upperdir=$s/upper/data,workdir=$s/upper/work" \
-        "$s/merged"
+    sq-mount-overlay "$lower" "$s/upper/data" "$s/upper/work" "$s/merged"
 }
 
 _umount_overlay() {
     local s=$(sdir "$1")
-    umount "$s/merged" 2>/dev/null || umount -l "$s/merged" 2>/dev/null || true
+    sq-mount-overlay --unmount "$s/merged" 2>/dev/null || true
 }
 
-# ── cgroup helpers (Phase 2) ──────────────────────────────────────────
+# ── cgroup helpers (disabled — requires root) ─────────────────────────
+# Resource limits via cgroups v2 require CAP_SYS_ADMIN.
+# For unprivileged mode, use systemd-run --user --scope instead.
 
-_cgroup_setup() {
-    local id="$1" cpu="$2" mem_mb="$3"
-    local cg="/sys/fs/cgroup/squash-$id"
-    mkdir -p "$cg"
-
-    # CPU limit (cpu.max: quota period_us)
-    # cpu=1.0 means 100000us per 100000us period
-    local quota=$(echo "$cpu * 100000" | bc | cut -d. -f1)
-    echo "$quota 100000" > "$cg/cpu.max"
-
-    # Memory limit
-    local mem_bytes=$((mem_mb * 1024 * 1024))
-    echo "$mem_bytes" > "$cg/memory.max"
-
-    echo "$cg"
-}
-
-_cgroup_teardown() {
-    local id="$1"
-    local cg="/sys/fs/cgroup/squash-$id"
-    rmdir "$cg" 2>/dev/null || true
-}
+_cgroup_setup() { :; }
+_cgroup_teardown() { :; }
 
 # ── Secret proxy injection ────────────────────────────────────────────
 
@@ -258,13 +239,8 @@ _inject_secret_placeholders() {
     local env_dir="$s/upper/data/etc/profile.d"
     mkdir -p "$env_dir"
 
-    # Determine proxy address — use gateway IP if in a netns, otherwise localhost
+    # Proxy address — sandboxes inherit host networking, so localhost works
     local proxy_host="127.0.0.1"
-    local sandbox_index
-    sandbox_index=$(cat "$s/.meta/netns_index" 2>/dev/null || echo "")
-    if [ -n "$sandbox_index" ]; then
-        proxy_host="10.200.${sandbox_index}.1"
-    fi
 
     # Generate env script with placeholders + proxy config
     {
@@ -304,154 +280,9 @@ _inject_secret_placeholders() {
     fi
 }
 
-# ── Network namespace helpers (Phase 3) ───────────────────────────────
-
-_allocate_netns_index() {
-    (
-        flock -x 9
-        local index=1
-        while [ "$index" -le 254 ]; do
-            local in_use=0
-            for d in "$SANDBOXES"/*/; do
-                [ -f "$d/.meta/netns_index" ] || continue
-                [ "$(cat "$d/.meta/netns_index")" = "$index" ] && { in_use=1; break; }
-            done
-            [ "$in_use" = "0" ] && { echo "$index"; return 0; }
-            index=$((index + 1))
-        done
-        echo "no free netns index" >&2
-        return 1
-    ) 9>"$DATA/.netns-index.lock"
-}
-
-_chroot_setup_netns() {
-    local id="$1" allow_net="$2"
-    local veth_host="sq-${id}-h"
-    local veth_sandbox="sq-${id}-s"
-
-    # Allocate unique subnet index (sequential scan under flock)
-    local sandbox_index
-    sandbox_index=$(_allocate_netns_index) || { echo "subnet exhausted" >&2; return 1; }
-
-    # Create persistent network namespace
-    ip netns add "squash-$id"
-
-    # Create veth pair
-    ip link add "$veth_host" type veth peer name "$veth_sandbox"
-
-    # Move sandbox end INTO the namespace
-    ip link set "$veth_sandbox" netns "squash-$id"
-
-    # Configure host end
-    ip addr add "10.200.${sandbox_index}.1/30" dev "$veth_host"
-    ip link set "$veth_host" up
-
-    # Configure sandbox end (inside namespace)
-    ip netns exec "squash-$id" ip addr add "10.200.${sandbox_index}.2/30" dev "$veth_sandbox"
-    ip netns exec "squash-$id" ip link set "$veth_sandbox" up
-    ip netns exec "squash-$id" ip link set lo up
-    ip netns exec "squash-$id" ip route add default via "10.200.${sandbox_index}.1"
-
-    # Store metadata for cleanup and exec
-    echo "$sandbox_index" > "$(sdir "$id")/.meta/netns_index"
-    echo "$veth_host" > "$(sdir "$id")/.meta/veth_host"
-    echo "$veth_sandbox" > "$(sdir "$id")/.meta/veth_sandbox"
-    echo "squash-$id" > "$(sdir "$id")/.meta/netns_name"
-
-    # Enable IP forwarding
-    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-
-    # NAT on host for outbound
-    iptables -t nat -A POSTROUTING -s "10.200.${sandbox_index}.0/30" -j MASQUERADE
-
-    # DNS forwarding — redirect queries to gateway to host's real resolver
-    local host_dns
-    host_dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || echo "")
-    if [ -n "$host_dns" ]; then
-        iptables -t nat -A PREROUTING -s "10.200.${sandbox_index}.0/30" \
-            -d "10.200.${sandbox_index}.1" -p udp --dport 53 \
-            -j DNAT --to-destination "$host_dns"
-        iptables -t nat -A PREROUTING -s "10.200.${sandbox_index}.0/30" \
-            -d "10.200.${sandbox_index}.1" -p tcp --dport 53 \
-            -j DNAT --to-destination "$host_dns"
-    fi
-
-    # Egress filtering (applied to host-side veth — filters FORWARD traffic)
-    if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
-        _apply_egress_rules "$id" "$veth_host" "$allow_net"
-    fi
-}
-
-_apply_egress_rules() {
-    local id="$1" iface="$2" allow_net="$3"
-    local chain="squash-${id}"
-
-    iptables -N "$chain" 2>/dev/null || true
-    iptables -A FORWARD -i "$iface" -j "$chain"
-
-    # Block ICMP (prevents tunneling)
-    iptables -A "$chain" -p icmp -j DROP
-
-    # Rate-limited DNS (prevents DNS tunneling)
-    iptables -A "$chain" -p udp --dport 53 -m limit --limit 10/s --limit-burst 20 -j ACCEPT
-    iptables -A "$chain" -p tcp --dport 53 -m limit --limit 10/s --limit-burst 20 -j ACCEPT
-
-    # Allow established/related connections
-    iptables -A "$chain" -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    # Allow each host pattern
-    echo "$allow_net" | jq -r '.[]' 2>/dev/null | while read -r host; do
-        case "$host" in
-            none) ;; # block everything
-            *\**)
-                # Wildcard: resolve at connection time via ipset or DNS-based matching
-                # For MVP: log + warn that wildcards need sq-secret-proxy
-                echo "[net] WARN: wildcard $host requires proxy mode" >&2
-                ;;
-            *)
-                # Resolve and allow
-                for ip in $(getent hosts "$host" 2>/dev/null | awk '{print $1}'); do
-                    iptables -A "$chain" -d "$ip" -j ACCEPT
-                done
-                ;;
-        esac
-    done
-
-    # Default: drop
-    iptables -A "$chain" -j DROP
-}
-
-_chroot_teardown_netns() {
-    local id="$1"
-    local sandbox_index
-    sandbox_index=$(cat "$(sdir "$id")/.meta/netns_index" 2>/dev/null || echo "")
-
-    # Remove iptables rules
-    iptables -D FORWARD -i "sq-${id}-h" -j "squash-${id}" 2>/dev/null || true
-    iptables -F "squash-${id}" 2>/dev/null || true
-    iptables -X "squash-${id}" 2>/dev/null || true
-
-    if [ -n "$sandbox_index" ]; then
-        iptables -t nat -D POSTROUTING -s "10.200.${sandbox_index}.0/30" -j MASQUERADE 2>/dev/null || true
-
-        local host_dns
-        host_dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || echo "")
-        if [ -n "$host_dns" ]; then
-            iptables -t nat -D PREROUTING -s "10.200.${sandbox_index}.0/30" \
-                -d "10.200.${sandbox_index}.1" -p udp --dport 53 \
-                -j DNAT --to-destination "$host_dns" 2>/dev/null || true
-            iptables -t nat -D PREROUTING -s "10.200.${sandbox_index}.0/30" \
-                -d "10.200.${sandbox_index}.1" -p tcp --dport 53 \
-                -j DNAT --to-destination "$host_dns" 2>/dev/null || true
-        fi
-    fi
-
-    # Delete veth pair (host end — peer is auto-deleted)
-    ip link delete "sq-${id}-h" 2>/dev/null || true
-
-    # Delete network namespace
-    ip netns delete "squash-$id" 2>/dev/null || true
-}
+# ── Network (simplified — sandboxes inherit host networking) ──────────
+# Egress filtering via iptables has been removed. The secret proxy is the
+# credential security boundary. Sandboxes use host networking directly.
 
 # ── Chroot backend: Create ────────────────────────────────────────────
 
@@ -474,10 +305,8 @@ _chroot_create_sandbox() {
         mod_exists "$mod" || { echo "module not found: $mod" >&2; return 2; }
     done
 
-    # Build directory tree (upper is a size-limited tmpfs holding overlay data + workdir)
-    mkdir -p "$s/images" "$s/upper" "$s/merged" "$s/.meta/log"
-    local upper_limit="${SQUASH_UPPER_LIMIT_MB:-512}"
-    mount -t tmpfs -o "size=${upper_limit}M" tmpfs "$s/upper"
+    # Build directory tree (plain directory for upper — no tmpfs, no root needed)
+    mkdir -p "$s/images" "$s/merged" "$s/.meta/log"
     mkdir -p "$s/upper/data" "$s/upper/work"
 
     # Metadata as files
@@ -494,11 +323,10 @@ _chroot_create_sandbox() {
     # Set up cgroups for resource limits
     _cgroup_setup "$id" "$cpu" "$memory_mb" >/dev/null 2>&1 || true
 
-    # Loop-mount each module
+    # Mount each module (squashfuse for unprivileged, kernel mount as fallback)
     for mod in $(echo "$layer_csv" | tr ',' ' '); do
         local mp="$s/images/$mod.squashfs"
-        mkdir -p "$mp"
-        mount -o loop,ro -t squashfs "$(mod_path "$mod")" "$mp" || {
+        sq-mount-layer "$(mod_path "$mod")" "$mp" || {
             echo "mount failed: $mod" >&2
             destroy_sandbox "$id"
             return 3
@@ -512,19 +340,10 @@ _chroot_create_sandbox() {
         return 3
     }
 
-    # Always create network namespace for isolation
-    _chroot_setup_netns "$id" "$allow_net" 2>/dev/null || true
-
-    # Seed /etc/resolv.conf — DNS goes through the netns gateway
+    # Seed /etc/resolv.conf — sandboxes inherit host networking
     if [ -f /etc/resolv.conf ]; then
         mkdir -p "$s/upper/data/etc"
-        local sandbox_index
-        sandbox_index=$(cat "$s/.meta/netns_index" 2>/dev/null || echo "")
-        if [ -n "$sandbox_index" ]; then
-            echo "nameserver 10.200.${sandbox_index}.1" > "$s/upper/data/etc/resolv.conf"
-        else
-            cp /etc/resolv.conf "$s/upper/data/etc/resolv.conf"
-        fi
+        cp /etc/resolv.conf "$s/upper/data/etc/resolv.conf"
     fi
 
     # Inject secret placeholders + proxy config if secrets.json exists
@@ -559,32 +378,9 @@ _chroot_exec_in_sandbox() {
     local out=$(mktemp) err=$(mktemp)
     local rc=0
 
-    # Put process in cgroup before exec if cgroup exists
-    local cg="/sys/fs/cgroup/squash-$id"
-    if [ -d "$cg" ]; then
-        echo $$ > "$cg/cgroup.procs" 2>/dev/null || true
-    fi
-
-    # Determine if sandbox has a network namespace
-    local netns_name=""
-    [ -f "$s/.meta/netns_name" ] && netns_name=$(cat "$s/.meta/netns_name")
-
-    # Build the exec command
-    # If we have a netns, enter it; otherwise run without network isolation
-    if [ -n "$netns_name" ] && ip netns list 2>/dev/null | grep -q "^$netns_name"; then
-        timeout "$timeout_s" \
-            ip netns exec "$netns_name" \
-            unshare --mount --pid --ipc --uts --fork --map-root-user \
-            chroot "$s/merged" \
-            /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$workdir" "$cmd" \
-            >"$out" 2>"$err" || rc=$?
-    else
-        timeout "$timeout_s" \
-            unshare --mount --pid --ipc --uts --fork --map-root-user \
-            chroot "$s/merged" \
-            /bin/sh -c 'cd "$1" 2>/dev/null || true; eval "$2"' _ "$workdir" "$cmd" \
-            >"$out" 2>"$err" || rc=$?
-    fi
+    # Execute via bubblewrap (unprivileged) or unshare+chroot (fallback)
+    sq-exec "$s/merged" "$cmd" "$workdir" "$timeout_s" \
+        >"$out" 2>"$err" || rc=$?
 
     local t1=$(date -Iseconds)
 
@@ -620,8 +416,7 @@ _chroot_activate_module() {
     }
 
     # Mount new module
-    mkdir -p "$mp"
-    mount -o loop,ro -t squashfs "$(mod_path "$mod")" "$mp"
+    sq-mount-layer "$(mod_path "$mod")" "$mp"
 
     # Remount overlay (upper preserved)
     _umount_overlay "$id"
@@ -682,16 +477,15 @@ _chroot_restore_sandbox() {
 
     # Unmount previous snapshot layer if any
     if mountpoint -q "$s/images/_snapshot" 2>/dev/null; then
-        umount "$s/images/_snapshot" 2>/dev/null || umount -l "$s/images/_snapshot"
+        sq-mount-layer --unmount "$s/images/_snapshot" 2>/dev/null || true
     fi
 
-    # Clear upper contents (preserve tmpfs mount) + reset work
+    # Clear upper contents + reset work
     find "$s/upper/data" -mindepth 1 -delete 2>/dev/null || true
     find "$s/upper/work" -mindepth 1 -delete 2>/dev/null || true
 
     # Mount snapshot as top read-only layer
-    mkdir -p "$s/images/_snapshot"
-    mount -o loop,ro -t squashfs "$snapfile" "$s/images/_snapshot"
+    sq-mount-layer "$snapfile" "$s/images/_snapshot"
 
     # Record active snapshot
     echo "$label" > "$s/.meta/active_snapshot"
@@ -699,11 +493,14 @@ _chroot_restore_sandbox() {
     # Remount overlay
     _mount_overlay "$id"
 
-    # Re-seed DNS
+    # Re-seed DNS (host networking)
     if [ -f /etc/resolv.conf ]; then
         mkdir -p "$s/upper/data/etc"
         cp /etc/resolv.conf "$s/upper/data/etc/resolv.conf"
     fi
+
+    # Re-inject secret placeholders
+    _inject_secret_placeholders "$id"
 }
 
 # ── Chroot backend: Destroy ──────────────────────────────────────────
@@ -728,27 +525,20 @@ _chroot_destroy_sandbox() {
         _s3_push_manifest "$id" 2>/dev/null || true
     fi
 
-    # Tear down network namespace
-    _chroot_teardown_netns "$id" 2>/dev/null || true
-
-    # Tear down cgroup
-    _cgroup_teardown "$id"
-
     # Unmount overlay
     _umount_overlay "$id"
 
     # Unmount snapshot
-    [ -d "$s/images/_snapshot" ] && {
-        umount "$s/images/_snapshot" 2>/dev/null || umount -l "$s/images/_snapshot" 2>/dev/null || true
+    [ -d "$s/images/_snapshot" ] && mountpoint -q "$s/images/_snapshot" 2>/dev/null && {
+        sq-mount-layer --unmount "$s/images/_snapshot" 2>/dev/null || true
     }
 
     # Unmount all module images
     for d in "$s"/images/*.squashfs; do
-        [ -d "$d" ] && { umount "$d" 2>/dev/null || umount -l "$d" 2>/dev/null || true; }
+        [ -d "$d" ] && mountpoint -q "$d" 2>/dev/null && {
+            sq-mount-layer --unmount "$d" 2>/dev/null || true
+        }
     done
-
-    # Unmount tmpfs upper layer
-    umount "$s/upper" 2>/dev/null || true
 
     rm -rf "$s"
 }
@@ -756,10 +546,24 @@ _chroot_destroy_sandbox() {
 # ── Chroot backend: Mounted check ────────────────────────────────────
 
 _chroot_mounted() {
-    grep -q "$(sdir "$1")/merged" /proc/mounts 2>/dev/null
+    mountpoint -q "$(sdir "$1")/merged" 2>/dev/null
 }
 
 # ── Firecracker backend: Network ─────────────────────────────────────
+# NOTE: Firecracker networking requires root (tap devices, iptables).
+# This is separate from the unprivileged chroot path.
+
+_allocate_netns_index() {
+    # Find next free /30 subnet index (1-254)
+    local idx=1
+    while [ $idx -le 254 ]; do
+        if ! ip link show "sq-*-tap" 2>/dev/null | grep -q "10.0.${idx}."; then
+            echo "$idx"; return 0
+        fi
+        idx=$((idx + 1))
+    done
+    return 1
+}
 
 _firecracker_setup_network() {
     local id="$1"
@@ -780,12 +584,6 @@ _firecracker_setup_network() {
 
     # NAT for outbound
     iptables -t nat -A POSTROUTING -s "10.0.${sandbox_index}.0/30" -j MASQUERADE
-
-    # Egress rules if allow_net is set
-    local allow_net=$(cat "$s/.meta/allow_net" 2>/dev/null || echo "")
-    if [ -n "$allow_net" ] && [ "$allow_net" != "[]" ]; then
-        _apply_egress_rules "$id" "$tap" "$allow_net"
-    fi
 }
 
 _firecracker_teardown_network() {

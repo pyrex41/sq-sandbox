@@ -152,13 +152,54 @@ Only `id` and `layers` are required. Defaults: `cpu=2`, `memory_mb=1024`,
 | 11x   | Build tools       | gcc, make, cmake, git             |
 | 20x   | Services/daemons  | tailscale, nginx, postgres        |
 | 9xx   | Checkpoints       | (auto-generated from upper layer) |
-
-Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale`
+| 090   | Libs              | sqlite-libs (musl sqlite3.so)     |
+| 200   | Services          | nullclaw (Zig AI agent runtime)   |
+Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale|sqlite-libs|nullclaw`
 
 Build from directory: `sq-mkmod from-dir /path/to/tree 110-my-tools`
 
 Build from running sandbox: `sq-mkmod from-sandbox my-sandbox 110-my-customizations`
 
+## Nullclaw Integration
+
+Autonomous AI agent infrastructure (678KB Zig binary, [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw)).
+
+**Nix**: `nix build .#module-nullclaw` (optional `enableNullclaw=false`)
+
+**Preset**: `sq-mkmod preset nullclaw` (200-nullclaw.squashfs + sqlite-libs)
+
+**Runtime**:
+```
+curl -X POST localhost:8080/cgi-bin/api/sandboxes \\
+  -d '{\"id\":\"ai\",\"layers\":\"000-base-alpine,090-sqlite-libs,200-nullclaw\"}'
+
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/ai/exec \\
+  -d '{\"cmd\":\"/usr/local/bin/nullclaw --version\"}'
+```
+
+**Full agent**:
+```
+curl .../exec -d '{\"cmd\":\"/usr/local/bin/nullclaw onboard --api-key \\\"$SQUASH_ANTHROPIC_KEY\\\" --interactive\"}'
+curl .../exec -d '{\"cmd\":\"/usr/local/bin/nullclaw agent -m \\\"Solve this LeetCode problem\\\" --skill coding\"}'
+```
+
+Secrets proxy injects `$SQUASH_ANTHROPIC_KEY` etc. Firecracker compatible.
+
+**sq-sandbox as nullclaw backend**: Propose PR to nullclaw for `RuntimeAdapter \"squash\"`:
+```zig
+// src/runtime/squash.zig
+const SquashAdapter = struct {
+  api_base: []const u8 = \"http://host:8080/cgi-bin/api\";
+  vtable: RuntimeAdapter.VTable = .{
+    .name = \"squash\",
+    .has_shell_access = true,
+    .storage_path = \"/workspace/.nullclaw\",
+    // exec: POST /sandboxes/{id}/exec {\"cmd\":...}
+    // create: POST /sandboxes {\"layers\":\"090-sqlite-libs,000-base-alpine,200-nullclaw\"}
+  };
+};
+```
+Config: `\"runtime\": {\"kind\": \"squash\"}`
 Available bases: `base-alpine` (~8MB, musl), `base-debian` (~30MB, glibc),
 `base-ubuntu` (~45MB, glibc), `base-void` (~20MB, musl).
 

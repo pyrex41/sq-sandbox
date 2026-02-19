@@ -16,7 +16,7 @@
 
         # ── Squashfs modules ──────────────────────────────────────────
         modules = pkgs.lib.optionalAttrs isLinux
-          (import ./nix/modules.nix { inherit pkgs; });
+  (import ./nix/modules.nix { inherit pkgs; enableNullclaw = true; });
 
         # ── Daemon builds + proxy ─────────────────────────────────────
         daemons = pkgs.lib.optionalAttrs isLinux {

@@ -146,99 +146,73 @@
     (ensure-directories-exist (format nil "~A/images/" sandbox-dir))
     (ensure-directories-exist (format nil "~A/snapshots/" sandbox-dir))
 
-    ;; 1. Mount tmpfs for upper layer
-    (with-rollback-on-error (tmpfs
-                             (mount-tmpfs upper-path
-                                          (or (config-upper-limit-mb config) 512))
-                             (unmount-tmpfs tmpfs))
+    ;; Create upper/data and upper/work as regular directories (no tmpfs)
+    (ensure-directories-exist (format nil "~A/data/" upper-path))
+    (ensure-directories-exist (format nil "~A/work/" upper-path))
 
-      ;; 2. Mount squashfs layers
-      (let ((sqfs-mounts (make-array (length layers))))
-        (unwind-protect
-             (progn
-               (loop for layer in layers
-                     for i from 0
-                     for mod-path = (format nil "~A/~A.squashfs"
-                                            (modules-dir config) layer)
-                     for mp = (format nil "~A/images/~A.squashfs"
-                                      sandbox-dir layer)
-                     do (setf (aref sqfs-mounts i)
-                              (restart-case
-                                  (mount-squashfs mod-path mp)
-                                (pull-from-s3-and-retry ()
-                                  :report (lambda (s)
-                                            (format s "Pull ~A from S3" layer))
-                                  :test (lambda (c)
-                                          (declare (ignore c))
-                                          (not (null *s3-client*)))
-                                  (funcall 's3-pull-module *s3-client* layer)
-                                  (mount-squashfs mod-path mp)))))
+    ;; 1. Mount squashfs layers
+    (let ((sqfs-mounts (make-array (length layers))))
+      (unwind-protect
+           (progn
+             (loop for layer in layers
+                   for i from 0
+                   for mod-path = (format nil "~A/~A.squashfs"
+                                          (modules-dir config) layer)
+                   for mp = (format nil "~A/images/~A.squashfs"
+                                    sandbox-dir layer)
+                   do (setf (aref sqfs-mounts i)
+                            (restart-case
+                                (mount-squashfs mod-path mp)
+                              (pull-from-s3-and-retry ()
+                                :report (lambda (s)
+                                          (format s "Pull ~A from S3" layer))
+                                :test (lambda (c)
+                                        (declare (ignore c))
+                                        (not (null *s3-client*)))
+                                (funcall 's3-pull-module *s3-client* layer)
+                                (mount-squashfs mod-path mp)))))
 
-               ;; 3. Overlay
-               (let* ((lower-components
-                        (loop for m across sqfs-mounts
-                              collect (squashfs-mount-mount-point m)))
-                      (overlay (mount-overlay lower-components
-                                              (format nil "~A/data" upper-path)
-                                              (format nil "~A/work" upper-path)
-                                              merged-path)))
+             ;; 2. Overlay
+             (let* ((lower-components
+                      (loop for m across sqfs-mounts
+                            collect (squashfs-mount-mount-point m)))
+                    (overlay (mount-overlay lower-components
+                                            (format nil "~A/data" upper-path)
+                                            (format nil "~A/work" upper-path)
+                                            merged-path)))
 
-                 (with-rollback-on-error (overlay-guard overlay
-                                          (unmount-overlay overlay-guard))
+               (with-rollback-on-error (overlay-guard overlay
+                                        (unmount-overlay overlay-guard))
 
-                   ;; 4. Cgroup (may fail — optional)
-                   (let ((cgroup (handler-case
-                                     (create-cgroup id
-                                                    (or cpu 2.0)
-                                                    (or memory-mb 1024))
-                                   (error (e)
-                                     (declare (ignore e))
-                                     (warn 'cgroup-setup-failed :id id)
-                                     nil))))
+                 ;; 3. Write metadata
+                 (ignore-errors
+                   (write-sandbox-meta config id
+                                       :owner (or owner "anon")
+                                       :layers layers
+                                       :task (or task "")
+                                       :cpu (or cpu 2.0)
+                                       :memory-mb (or memory-mb 1024)
+                                       :max-lifetime-s (or max-lifetime-s 0)
+                                       :allow-net allow-net))
 
-                     ;; 5. Network namespace
-                     (with-rollback-on-error (netns
-                                              (setup-netns config id allow-net)
-                                              (teardown-netns netns))
+                 ;; Build and return the sandbox struct
+                 (let ((sandbox
+                         (%make-sandbox
+                          :id id
+                          :state :ready
+                          :mounts (make-sandbox-mounts
+                                   :squashfs-mounts sqfs-mounts
+                                   :overlay overlay)
+                          :netns nil
+                          :cgroup nil
+                          :created (get-unix-time)
+                          :last-active (get-unix-time)
+                          :max-lifetime-s (or max-lifetime-s 0))))
+                   sandbox))))
 
-                       ;; 6. Seed resolv.conf (DNS via netns gateway)
-                       (ignore-errors
-                         (seed-resolv-conf sandbox-dir netns))
-
-                      ;; 7. Inject secret placeholders + proxy env (best effort)
-                      (ignore-errors
-                        (funcall 'inject-secret-placeholders config sandbox-dir netns))
-
-                      ;; 8. Write metadata
-                       (ignore-errors
-                         (write-sandbox-meta config id
-                                             :owner (or owner "anon")
-                                             :layers layers
-                                             :task (or task "")
-                                             :cpu (or cpu 2.0)
-                                             :memory-mb (or memory-mb 1024)
-                                             :max-lifetime-s (or max-lifetime-s 0)
-                                             :allow-net allow-net))
-
-                       ;; Build and return the sandbox struct
-                       (let ((sandbox
-                               (%make-sandbox
-                                :id id
-                                :state :ready
-                                :mounts (make-sandbox-mounts
-                                         :squashfs-mounts sqfs-mounts
-                                         :tmpfs tmpfs
-                                         :overlay overlay)
-                                :netns netns
-                                :cgroup cgroup
-                                :created (get-unix-time)
-                                :last-active (get-unix-time)
-                                :max-lifetime-s (or max-lifetime-s 0))))
-                         sandbox))))))
-
-          ;; Cleanup squashfs on error
-          (loop for m across sqfs-mounts
-                when m do (ignore-errors (unmount-squashfs m))))))))
+        ;; Cleanup squashfs on error
+        (loop for m across sqfs-mounts
+              when m do (ignore-errors (unmount-squashfs m))))))
 
 ;;; ── Firecracker creation ─────────────────────────────────────────────
 

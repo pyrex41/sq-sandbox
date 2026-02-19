@@ -1,7 +1,7 @@
-# Exec — run command in sandbox via os/spawn with pipe capture.
+# Exec — run command in sandbox via sq-exec helper with pipe capture.
 #
 # Key improvements over temp-file approach:
-#   - os/spawn with array args — no shell injection in wrapper commands
+#   - sq-exec handles isolation (bubblewrap/unshare+chroot) and timeout
 #   - Pipe-based stdout/stderr capture — no temp files on disk
 #   - ev/deadline timeout — SIGTERM then SIGKILL, proper cleanup
 #   - Capped reads with drain — won't fill disk or block child
@@ -31,37 +31,20 @@
 
 (defn exec-in-sandbox
   "Run cmd in sandbox. Returns result table.
-   Uses os/spawn with pipes — no temp files, no shell injection in wrappers."
+   Uses sq-exec helper for isolation — no direct unshare/chroot calls."
   [sandbox cmd opts]
   (def workdir (get opts :workdir "/"))
   (def timeout-s (get opts :timeout 300))
   (def sdir (get opts :sandbox-dir))
   (def merged (string (get sandbox :dir) "/merged"))
-  (def netns (get sandbox :netns))
-  (def cgroup (get sandbox :cgroup))
 
   (def started (os/time))
   (def seq (+ 1 (get sandbox :exec-count 0)))
   (put sandbox :exec-count seq)
   (put sandbox :last-active started)
 
-  # Cgroup assignment: prefix the shell command with echo $$ > cgroup.procs.
-  # This runs inside the child's sh, so $$ is the PID that enters the cgroup.
-  (def cg-prefix
-    (if cgroup
-      (string "echo $$ > " (get cgroup :path) "/cgroup.procs 2>/dev/null; ")
-      ""))
-  (def shell-cmd (string cg-prefix "cd " workdir " 2>/dev/null || true; " cmd))
-
-  # Build command array — each element is a separate argv entry.
-  # os/spawn uses execvp, so wrapper commands (ip, unshare, chroot)
-  # cannot be tricked by special characters in the sandbox id or path.
-  (def args @[])
-  (when netns
-    (array/concat args ["ip" "netns" "exec" (get netns :name)]))
-  (array/concat args
-    ["unshare" "--mount" "--pid" "--ipc" "--uts" "--fork"
-     "chroot" merged "/bin/sh" "-l" "-c" shell-cmd])
+  # Build command array for sq-exec
+  (def args ["sq-exec" merged cmd workdir (string timeout-s)])
 
   (var proc nil)
   (var timed-out false)
@@ -79,10 +62,11 @@
       (ev/spawn (ev/give out-ch (read-capped (in proc :out) max-output)))
       (ev/spawn (ev/give err-ch (read-capped (in proc :err) max-output)))
 
-      # Timeout killer fiber: SIGTERM then SIGKILL
+      # Safety-net timeout killer fiber (sq-exec has its own timeout, but this catches hangs)
+      (def safety-timeout (+ timeout-s 5))
       (def killer
         (ev/go (fn []
-          (ev/sleep timeout-s)
+          (ev/sleep safety-timeout)
           (set timed-out true)
           (try (os/proc-kill proc false :term) ([e] nil))
           (ev/sleep 1)

@@ -23,16 +23,6 @@ when ODIN_OS == .Darwin {
 foreign libc {
 	@(link_name = "fork")
 	c_fork :: proc() -> c.int ---
-	@(link_name = "execve")
-	c_execve :: proc(path: cstring, argv: [^]cstring, envp: [^]cstring) -> c.int ---
-	@(link_name = "chroot")
-	c_chroot :: proc(path: cstring) -> c.int ---
-	@(link_name = "chdir")
-	c_chdir :: proc(path: cstring) -> c.int ---
-	@(link_name = "unshare")
-	c_unshare :: proc(flags: c.int) -> c.int ---
-	@(link_name = "setns")
-	c_setns :: proc(fd: c.int, nstype: c.int) -> c.int ---
 	@(link_name = "dup2")
 	c_dup2 :: proc(oldfd: c.int, newfd: c.int) -> c.int ---
 	@(link_name = "pipe")
@@ -45,8 +35,6 @@ foreign libc {
 	c_waitpid :: proc(pid: c.int, status: ^c.int, options: c.int) -> c.int ---
 	@(link_name = "kill")
 	c_kill :: proc(pid: c.int, sig: c.int) -> c.int ---
-	@(link_name = "getpid")
-	c_getpid :: proc() -> c.int ---
 	@(link_name = "_exit")
 	c_exit :: proc(status: c.int) ---
 	@(link_name = "execvp")
@@ -62,13 +50,6 @@ foreign libc {
 SIGKILL       :: 9
 STDOUT_FILENO :: 1
 STDERR_FILENO :: 2
-
-CLONE_NEWNS  :: 0x00020000
-CLONE_NEWPID :: 0x20000000
-CLONE_NEWIPC :: 0x08000000
-CLONE_NEWUTS :: 0x04000000
-CLONE_NEWNET :: 0x40000000
-
 
 MAX_OUTPUT :: 65536 // Max bytes captured per stream (matches shell impl)
 
@@ -105,15 +86,13 @@ Exec_Error :: enum {
 	Not_Ready,
 	Pipe_Failed,
 	Fork_Failed,
-	Netns_Open_Failed,
 }
 
 // ---------------------------------------------------------------------------
-// exec_in_sandbox — fork/unshare/chroot/execve with I/O capture
+// exec_in_sandbox — fork + exec sq-exec with I/O capture
 //
-// Replaces common.sh:546-607.
-// Child: enters cgroup, network namespace, creates new mount/PID/IPC/UTS
-//        namespaces, chroots into merged overlay, execves /bin/sh -c "cmd".
+// Child: redirects stdout/stderr to pipes, execs sq-exec which handles
+//        PID/IPC/UTS namespace isolation via bubblewrap.
 // Parent: captures stdout/stderr via pipes with poll-based timeout, SIGKILL
 //         on timeout, waitpid for exit status.
 // ---------------------------------------------------------------------------
@@ -143,24 +122,8 @@ exec_in_sandbox :: proc(
 		return {}, .Pipe_Failed
 	}
 
-	// Open netns fd before fork (if sandbox has a network namespace)
-	netns_fd: c.int = -1
-	if netns, ok := ready.netns.?; ok {
-		ns_path := fmt.tprintf("/var/run/netns/%s", netns.name)
-		ns_handle, ns_err := os.open(ns_path, os.O_RDONLY)
-		if ns_err != nil {
-			c_close(stdout_fds[0])
-			c_close(stdout_fds[1])
-			c_close(stderr_fds[0])
-			c_close(stderr_fds[1])
-			return {}, .Netns_Open_Failed
-		}
-		netns_fd = c.int(ns_handle)
-	}
-
 	pid := c_fork()
 	if pid < 0 {
-		if netns_fd >= 0 { c_close(netns_fd) }
 		c_close(stdout_fds[0])
 		c_close(stdout_fds[1])
 		c_close(stderr_fds[0])
@@ -170,8 +133,31 @@ exec_in_sandbox :: proc(
 
 	if pid == 0 {
 		// ═══ CHILD PROCESS ═══
-		_child_exec(ready, req, stdout_fds, stderr_fds, netns_fd)
-		// _child_exec never returns — it calls c_exit(127) on execve failure
+		// Close read ends of pipes (parent owns them)
+		c_close(stdout_fds[0])
+		c_close(stderr_fds[0])
+
+		// Redirect stdout/stderr to pipe write ends
+		c_dup2(stdout_fds[1], STDOUT_FILENO)
+		c_dup2(stderr_fds[1], STDERR_FILENO)
+		c_close(stdout_fds[1])
+		c_close(stderr_fds[1])
+
+		// Build argv for sq-exec <merged-root> <cmd> [workdir] [timeout]
+		merged := ready.mounts.overlay.merged_path
+		workdir := req.workdir if len(req.workdir) > 0 else "/"
+		timeout_str := fmt.tprintf("%d", req.timeout)
+
+		argv := [6]cstring{
+			"sq-exec",
+			_to_cstr(merged),
+			_to_cstr(req.cmd),
+			_to_cstr(workdir),
+			_to_cstr(timeout_str),
+			nil,
+		}
+		c_execvp("sq-exec", &argv[0])
+		c_exit(127) // execvp failed
 	}
 
 	// ═══ PARENT PROCESS ═══
@@ -179,7 +165,6 @@ exec_in_sandbox :: proc(
 	// Close write ends of pipes (child owns them now)
 	c_close(stdout_fds[1])
 	c_close(stderr_fds[1])
-	if netns_fd >= 0 { c_close(netns_fd) }
 
 	// Transition to Executing state — save Ready data and restore after waitpid
 	saved_ready := ready^
@@ -301,88 +286,6 @@ exec_in_sandbox :: proc(
 }
 
 // ---------------------------------------------------------------------------
-// _child_exec — child-side logic after fork. Never returns.
-//
-// Sequence: redirect I/O -> enter cgroup -> enter netns -> unshare
-//           mount/PID/IPC/UTS -> chroot -> chdir -> execve /bin/sh
-// ---------------------------------------------------------------------------
-
-_child_exec :: proc(
-	ready: ^Ready,
-	req: Exec_Request,
-	stdout_fds: [2]c.int,
-	stderr_fds: [2]c.int,
-	netns_fd: c.int,
-) {
-	// Close read ends of pipes (parent owns them)
-	c_close(stdout_fds[0])
-	c_close(stderr_fds[0])
-
-	// Redirect stdout/stderr to pipe write ends
-	c_dup2(stdout_fds[1], STDOUT_FILENO)
-	c_dup2(stderr_fds[1], STDERR_FILENO)
-	c_close(stdout_fds[1])
-	c_close(stderr_fds[1])
-
-	// Enter cgroup (optional — write our PID to cgroup.procs)
-	if cg, ok := &ready.cgroup.?; ok {
-		cgroup_add_process(cg, i32(c_getpid()))
-	}
-
-	// Enter network namespace (if present)
-	if netns_fd >= 0 {
-		c_setns(netns_fd, CLONE_NEWNET)
-		c_close(netns_fd)
-	}
-
-	// Create new mount/PID/IPC/UTS namespaces
-	if c_unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS) != 0 {
-		c_exit(126)
-	}
-
-	// After unshare(CLONE_NEWPID), this process remains in the old PID namespace.
-	// Fork again so the inner child runs as PID 1 in the new namespace.
-	inner_pid := c_fork()
-	if inner_pid < 0 {
-		c_exit(126)
-	}
-	if inner_pid > 0 {
-		status: c.int
-		c_waitpid(inner_pid, &status, 0)
-		if status & 0x7f == 0 {
-			c_exit((status >> 8) & 0xff)
-		} else {
-			c_exit(128 + (status & 0x7f))
-		}
-	}
-
-	// chroot into the merged overlay filesystem
-	merged_c := _to_cstr(ready.mounts.overlay.merged_path)
-	c_chroot(merged_c)
-
-	// Change to requested working directory
-	workdir := req.workdir if len(req.workdir) > 0 else "/"
-	workdir_c := _to_cstr(workdir)
-	c_chdir(workdir_c)
-
-	// execve /bin/sh -c "{cmd}" with minimal environment
-	cmd_c := _to_cstr(req.cmd)
-	argv := [4]cstring{"/bin/sh", "-c", cmd_c, nil}
-	envp := [6]cstring{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME=/root",
-		"USER=root",
-		"TERM=xterm",
-		"LANG=C.UTF-8",
-		nil,
-	}
-	c_execve("/bin/sh", &argv[0], &envp[0])
-
-	// If execve returns, it failed
-	c_exit(127)
-}
-
-// ---------------------------------------------------------------------------
 // Execution logging
 // ---------------------------------------------------------------------------
 
@@ -493,10 +396,6 @@ _write_json_string :: proc(b: ^strings.Builder, s: string) {
 	}
 	strings.write_byte(b, '"')
 }
-
-// ---------------------------------------------------------------------------
-// ISO 8601 timestamp formatting
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // exec_in_sandbox_firecracker — exec via vsock for Firecracker backend

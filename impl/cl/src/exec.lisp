@@ -4,17 +4,7 @@
 
 ;;; ── Constants ──────────────────────────────────────────────────────
 
-(defconstant +stdout-fileno+ 1)
-(defconstant +stderr-fileno+ 2)
 (defconstant +max-output+ 65536)
-(defconstant +poll-interval-ms+ 100)
-
-;;; ── pollfd struct ──────────────────────────────────────────────────
-
-(cffi:defcstruct pollfd
-  (fd :int)
-  (events :short)
-  (revents :short))
 
 ;;; ── Helpers ────────────────────────────────────────────────────────
 
@@ -83,307 +73,80 @@
        s))))
 
 ;;; ── Sandbox accessors (forward references) ─────────────────────────
-;;; These are defined in sandbox.lisp (task 5.1). We declare their
-;;; types here to suppress SBCL style-warnings and enable optimization.
-;;; At compile time these are forward references; at runtime the actual
-;;; struct accessors exist.
+;;; These are defined in sandbox.lisp. We declare their types here to
+;;; suppress SBCL style-warnings and enable optimization.
 
-(declaim (ftype (function (t) (or null t)) sandbox-netns))
-(declaim (ftype (function (t) (or null t)) sandbox-cgroup))
-(declaim (ftype (function (t) t) sandbox-mounts))
+(declaim (ftype (function (t) (or null t)) sandbox-mounts))
 (declaim (ftype (function (t) fixnum) sandbox-exec-count))
 
 ;;; Helper to extract the merged path from a sandbox's mounts.
-;;; This isolates exec.lisp from the internal structure of sandbox/mounts.
 
 (defun sandbox-merged-path (sandbox)
   "Get the overlay merged path for a sandbox."
   (overlay-mount-merged-path
    (sandbox-mounts-overlay (sandbox-mounts sandbox))))
 
-;;; ── Pipe helpers ───────────────────────────────────────────────────
+;;; ── Stream reading helper ──────────────────────────────────────────
 
-(defun make-pipe ()
-  "Create a pipe. Returns (values read-fd write-fd)."
-  (cffi:with-foreign-object (fds :int 2)
-    (let ((rc (%pipe fds)))
-      (unless (zerop rc)
-        (error "pipe() failed: errno ~D" (get-errno)))
-      (values (cffi:mem-aref fds :int 0)
-              (cffi:mem-aref fds :int 1)))))
-
-(defun close-fd-safe (fd)
-  "Close a file descriptor, ignoring errors."
-  (declare (type fixnum fd))
-  (when (>= fd 0)
-    (%close fd)))
-
-;;; ── Child process setup ────────────────────────────────────────────
-
-(defun child-setup-and-exec (sandbox cmd workdir netns-fd stdout-w stderr-w)
-  "Called in the child process after fork.
-   Sets up namespaces, chroot, redirects stdio, then execve's /bin/sh -c cmd.
-   This function never returns on success — it calls %exit on failure."
-  (declare (type simple-string cmd workdir))
-  ;; Redirect stdout/stderr to pipes
-  (%dup2 stdout-w +stdout-fileno+)
-  (%dup2 stderr-w +stderr-fileno+)
-  (%close stdout-w)
-  (%close stderr-w)
-
-  ;; Enter cgroup (write our PID to cgroup.procs)
-  (when (sandbox-cgroup sandbox)
-    (let ((cgroup-path (cgroup-handle-path (sandbox-cgroup sandbox))))
-      (write-string-to-file
-       (concatenate 'string cgroup-path "/cgroup.procs")
-       (format nil "~D" (%getpid)))))
-
-  ;; Enter network namespace via setns
-  (when netns-fd
-    (when (minusp (%setns netns-fd +clone-newnet+))
-      (%exit 125))
-    (%close netns-fd))
-
-  ;; New mount, PID, IPC, UTS namespaces
-  (when (minusp (%unshare (logior +clone-newns+ +clone-newpid+
-                                   +clone-newipc+ +clone-newuts+)))
-    (%exit 125))
-
-  ;; After unshare(CLONE_NEWPID), this process is still in the old PID ns.
-  ;; Fork once more so the inner child executes in the new PID namespace.
-  (let ((inner-pid (%fork)))
-    (cond
-      ((minusp inner-pid) (%exit 126))
-      ((plusp inner-pid)
-       (cffi:with-foreign-object (status :int)
-         (%waitpid inner-pid status 0)
-         (let ((raw-status (cffi:mem-aref status :int 0)))
-           (cond
-             ((zerop (logand raw-status #x7f))
-              (%exit (ash (logand raw-status #xff00) -8)))
-             (t
-              (%exit (+ 128 (logand raw-status #x7f))))))))
-      (t nil)))
-
-  ;; chroot into the overlay merged directory, then chdir to workdir
-  (let ((merged (sandbox-merged-path sandbox)))
-    (when (minusp (%chroot merged))
-      (%exit 125)))
-  (when (minusp (%chdir workdir))
-    (%exit 125))
-
-  ;; execve /bin/sh -c "<cmd>"
-  (cffi:with-foreign-objects ((argv :pointer 4)
-                              (envp :pointer 5))
-    (let ((sh  (cffi:foreign-string-alloc "/bin/sh"))
-          (c   (cffi:foreign-string-alloc "-c"))
-          (arg (cffi:foreign-string-alloc cmd))
-          (e0  (cffi:foreign-string-alloc "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"))
-          (e1  (cffi:foreign-string-alloc "HOME=/root"))
-          (e2  (cffi:foreign-string-alloc "USER=root"))
-          (e3  (cffi:foreign-string-alloc "TERM=xterm")))
-      (setf (cffi:mem-aref argv :pointer 0) sh
-            (cffi:mem-aref argv :pointer 1) c
-            (cffi:mem-aref argv :pointer 2) arg
-            (cffi:mem-aref argv :pointer 3) (cffi:null-pointer))
-      (setf (cffi:mem-aref envp :pointer 0) e0
-            (cffi:mem-aref envp :pointer 1) e1
-            (cffi:mem-aref envp :pointer 2) e2
-            (cffi:mem-aref envp :pointer 3) e3
-            (cffi:mem-aref envp :pointer 4) (cffi:null-pointer))
-      (%execve "/bin/sh" argv envp)))
-
-  ;; If execve returns, it failed
-  (%exit 127))
-
-;;; ── Parent: poll-based output reader ───────────────────────────────
-
-(defun parent-read-output (pid stdout-r stderr-r timeout-s)
-  "Read stdout/stderr from child via poll() with timeout.
-   Returns (values exit-code stdout-str stderr-str timed-out-p)."
-  (declare (type fixnum pid stdout-r stderr-r timeout-s)
-           (optimize (speed 3) (safety 1)))
-
-  (cffi:with-foreign-objects ((stdout-buf :unsigned-char +max-output+)
-                              (stderr-buf :unsigned-char +max-output+)
-                              (poll-fds '(:struct pollfd) 2)
-                              (status :int 1))
-    (let ((stdout-len 0)
-          (stderr-len 0)
-          (deadline (+ (get-monotonic-ms) (* timeout-s 1000)))
-          (timed-out nil)
-          (stdout-open t)
-          (stderr-open t))
-      (declare (type fixnum stdout-len stderr-len))
-
-      ;; Poll loop — read from both pipes until both close or timeout
-      (loop while (or stdout-open stderr-open)
-            do
-            (let ((remaining (- deadline (get-monotonic-ms))))
-              (when (<= remaining 0)
-                (setf timed-out t)
-                (%kill pid +sigkill+)
-                (return))
-
-              ;; Set up pollfd array
-              (cffi:with-foreign-slots ((fd events revents)
-                                        (cffi:mem-aptr poll-fds '(:struct pollfd) 0)
-                                        (:struct pollfd))
-                (setf fd (if stdout-open stdout-r -1)
-                      events +pollin+
-                      revents 0))
-              (cffi:with-foreign-slots ((fd events revents)
-                                        (cffi:mem-aptr poll-fds '(:struct pollfd) 1)
-                                        (:struct pollfd))
-                (setf fd (if stderr-open stderr-r -1)
-                      events +pollin+
-                      revents 0))
-
-              (%poll poll-fds 2 (min (the fixnum remaining) +poll-interval-ms+))
-
-              ;; Read stdout
-              (let ((revents (cffi:foreign-slot-value
-                              (cffi:mem-aptr poll-fds '(:struct pollfd) 0)
-                              '(:struct pollfd) 'revents)))
-                (when (plusp (logand revents +pollin+))
-                  (when (< stdout-len +max-output+)
-                    (let ((n (%read stdout-r
-                                    (cffi:inc-pointer stdout-buf stdout-len)
-                                    (- +max-output+ stdout-len))))
-                      (when (plusp n) (incf stdout-len (the fixnum n))))))
-                (when (plusp (logand revents +pollhup+))
-                  ;; Drain remaining data after HUP
-                  (loop for n = (%read stdout-r
-                                       (cffi:inc-pointer stdout-buf stdout-len)
-                                       (- +max-output+ stdout-len))
-                        while (and (plusp n) (< stdout-len +max-output+))
-                        do (incf stdout-len (the fixnum n)))
-                  (setf stdout-open nil)))
-
-              ;; Read stderr
-              (let ((revents (cffi:foreign-slot-value
-                              (cffi:mem-aptr poll-fds '(:struct pollfd) 1)
-                              '(:struct pollfd) 'revents)))
-                (when (plusp (logand revents +pollin+))
-                  (when (< stderr-len +max-output+)
-                    (let ((n (%read stderr-r
-                                    (cffi:inc-pointer stderr-buf stderr-len)
-                                    (- +max-output+ stderr-len))))
-                      (when (plusp n) (incf stderr-len (the fixnum n))))))
-                (when (plusp (logand revents +pollhup+))
-                  (loop for n = (%read stderr-r
-                                       (cffi:inc-pointer stderr-buf stderr-len)
-                                       (- +max-output+ stderr-len))
-                        while (and (plusp n) (< stderr-len +max-output+))
-                        do (incf stderr-len (the fixnum n)))
-                  (setf stderr-open nil)))))
-
-      ;; Reap child process
-      (%waitpid pid status 0)
-      (%close stdout-r)
-      (%close stderr-r)
-
-      (let* ((raw-status (cffi:mem-aref status :int 0))
-             (exit-code (cond
-                          (timed-out 124)
-                          ;; WIFEXITED: low 7 bits zero means normal exit
-                          ((zerop (logand raw-status #x7f))
-                           (ash (logand raw-status #xff00) -8))
-                          ;; Killed by signal: 128 + signal number
-                          (t (+ 128 (logand raw-status #x7f))))))
-
-        (values exit-code
-                (if (plusp stdout-len)
-                    (cffi:foreign-string-to-lisp stdout-buf
-                      :count stdout-len :encoding :utf-8)
-                    "")
-                (if (plusp stderr-len)
-                    (cffi:foreign-string-to-lisp stderr-buf
-                      :count stderr-len :encoding :utf-8)
-                    "")
-                timed-out)))))
+(defun read-capped-from-stream (stream max-bytes)
+  "Read up to MAX-BYTES characters from STREAM, return as string."
+  (declare (type fixnum max-bytes))
+  (let ((buf (make-string max-bytes))
+        (pos 0))
+    (declare (type fixnum pos))
+    (handler-case
+        (loop while (< pos max-bytes)
+              for ch = (read-char stream nil nil)
+              while ch
+              do (setf (schar buf pos) ch)
+                 (incf pos))
+      (error () nil))
+    (if (zerop pos)
+        ""
+        (subseq buf 0 pos))))
 
 ;;; ── Main entry point ───────────────────────────────────────────────
 
 (defun exec-in-sandbox (sandbox cmd &key (workdir "/") (timeout 300)
                                         sandbox-dir)
-  "Execute CMD in SANDBOX via fork/execve.
-   Child enters cgroup, network namespace, unshares mount/PID/IPC/UTS,
-   chroots into the overlay merged dir, then runs /bin/sh -c CMD.
-   Parent captures stdout/stderr via poll() with TIMEOUT seconds.
+  "Execute CMD in SANDBOX via sq-exec helper.
+   Spawns sq-exec with the overlay merged dir, captures stdout/stderr.
    Returns an exec-result struct.
    Increments exec-count for sequence tracking."
   (declare (type simple-string cmd workdir)
            (type fixnum timeout))
 
-  (let ((started (get-unix-time))
-        (start-ticks (get-internal-real-time)))
-    ;; Open netns fd before fork (while we have access to /var/run/netns)
-    (let ((netns-fd (when (sandbox-netns sandbox)
-                      (let ((fd (%sys-open
-                                 (format nil "/var/run/netns/~A"
-                                         (netns-handle-name
-                                          (sandbox-netns sandbox)))
-                                 +o-rdonly+ 0)))
-                        (when (minusp fd)
-                          (error 'sandbox-error
-                                 :id "exec"
-                                 :message (format nil "open netns fd failed: errno ~D"
-                                                  (get-errno))))
-                        fd))))
-      ;; Create pipes for stdout and stderr
-      (multiple-value-bind (stdout-r stdout-w) (make-pipe)
-        (multiple-value-bind (stderr-r stderr-w) (make-pipe)
-          (let ((pid (%fork)))
-            (cond
-              ;; Fork failed
-              ((minusp pid)
-               (close-fd-safe stdout-r)
-               (close-fd-safe stdout-w)
-               (close-fd-safe stderr-r)
-               (close-fd-safe stderr-w)
-               (when netns-fd (close-fd-safe netns-fd))
-               (error 'sandbox-error
-                      :id "exec"
-                      :message (format nil "fork failed: errno ~D" (get-errno))))
+  (let* ((started (get-unix-time))
+         (start-ticks (get-internal-real-time))
+         (merged (sandbox-merged-path sandbox))
+         (proc (uiop:launch-program
+                (list "sq-exec" merged cmd workdir
+                      (princ-to-string timeout))
+                :output :stream :error-output :stream))
+         (stdout-stream (uiop:process-info-output proc))
+         (stderr-stream (uiop:process-info-error-output proc)))
 
-              ;; ═══ CHILD ═══
-              ((zerop pid)
-               ;; Close read ends of pipes (parent owns those)
-               (%close stdout-r)
-               (%close stderr-r)
-               ;; Never returns
-               (child-setup-and-exec sandbox cmd workdir
-                                     netns-fd stdout-w stderr-w))
+    (let* ((stdout-str (read-capped-from-stream stdout-stream +max-output+))
+           (stderr-str (read-capped-from-stream stderr-stream +max-output+))
+           (exit-code (uiop:wait-process proc))
+           (finished (get-unix-time))
+           (end-ticks (get-internal-real-time))
+           (duration-ms (round (* (- end-ticks start-ticks) 1000)
+                               internal-time-units-per-second))
+           (seq (incf (sandbox-exec-count sandbox))))
 
-              ;; ═══ PARENT ═══
-              (t
-               ;; Close write ends of pipes (child owns those)
-               (%close stdout-w)
-               (%close stderr-w)
-               (when netns-fd (%close netns-fd))
+      ;; Write log entry to .meta/log
+      (ignore-errors
+        (write-exec-log sandbox seq cmd workdir
+                        exit-code started finished
+                        duration-ms stdout-str stderr-str
+                        :sandbox-dir sandbox-dir))
 
-               (multiple-value-bind (exit-code stdout-str stderr-str)
-                   (parent-read-output pid stdout-r stderr-r timeout)
-
-                 (let* ((finished (get-unix-time))
-                        (end-ticks (get-internal-real-time))
-                        (duration-ms (round (* (- end-ticks start-ticks) 1000)
-                                            internal-time-units-per-second))
-                        (seq (incf (sandbox-exec-count sandbox))))
-
-                   ;; Write log entry to .meta/log
-                   (ignore-errors
-                     (write-exec-log sandbox seq cmd workdir
-                                     exit-code started finished
-                                     duration-ms stdout-str stderr-str
-                                     :sandbox-dir sandbox-dir))
-
-                   (make-exec-result
-                    :exit-code exit-code
-                    :stdout stdout-str
-                    :stderr stderr-str
-                    :started started
-                    :finished finished
-                    :duration-ms duration-ms
-                    :seq seq)))))))))))
+      (make-exec-result
+       :exit-code exit-code
+       :stdout stdout-str
+       :stderr stderr-str
+       :started started
+       :finished finished
+       :duration-ms duration-ms
+       :seq seq))))

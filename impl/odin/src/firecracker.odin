@@ -108,24 +108,6 @@ firecracker_setup_network :: proc(id: string, index: int, allow_net: Maybe([]str
 	// NAT for outbound traffic
 	run_cmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE")
 
-	// DNS DNAT — redirect DNS queries from guest to host resolver
-	gateway := fmt.tprintf("10.0.%d.1", index)
-	host_dns := _parse_first_nameserver()
-	if dns, ok := host_dns.?; ok {
-		run_cmd("iptables", "-t", "nat", "-A", "PREROUTING",
-			"-s", subnet, "-d", gateway, "-p", "udp", "--dport", "53",
-			"-j", "DNAT", "--to-destination", dns)
-		run_cmd("iptables", "-t", "nat", "-A", "PREROUTING",
-			"-s", subnet, "-d", gateway, "-p", "tcp", "--dport", "53",
-			"-j", "DNAT", "--to-destination", dns)
-	}
-
-	// Egress filtering (if allow_net is specified)
-	if nets, ok := allow_net.?; ok && len(nets) > 0 {
-		chain := fmt.tprintf("squash-fc-%s", id)
-		_apply_egress_rules(chain, tap_name, nets)
-	}
-
 	return .None
 }
 
@@ -133,7 +115,6 @@ firecracker_setup_network :: proc(id: string, index: int, allow_net: Maybe([]str
 firecracker_teardown_network :: proc(id: string, index: int) -> Firecracker_Error {
 	tap_name := fmt.tprintf("sq-%s-tap", id)
 	subnet := fmt.tprintf("10.0.%d.0/30", index)
-	gateway := fmt.tprintf("10.0.%d.1", index)
 
 	// Remove egress chain if present
 	chain := fmt.tprintf("squash-fc-%s", id)
@@ -143,17 +124,6 @@ firecracker_teardown_network :: proc(id: string, index: int) -> Firecracker_Erro
 
 	// Remove NAT rules
 	run_cmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE")
-
-	// Remove DNS DNAT rules
-	host_dns := _parse_first_nameserver()
-	if dns, ok := host_dns.?; ok {
-		run_cmd("iptables", "-t", "nat", "-D", "PREROUTING",
-			"-s", subnet, "-d", gateway, "-p", "udp", "--dport", "53",
-			"-j", "DNAT", "--to-destination", dns)
-		run_cmd("iptables", "-t", "nat", "-D", "PREROUTING",
-			"-s", subnet, "-d", gateway, "-p", "tcp", "--dport", "53",
-			"-j", "DNAT", "--to-destination", dns)
-	}
 
 	// Delete tap device
 	run_cmd("ip", "tuntap", "del", "dev", tap_name, "mode", "tap")

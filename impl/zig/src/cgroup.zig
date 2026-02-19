@@ -1,7 +1,7 @@
 // Cgroup v2 — REMOVED in unprivileged mode.
 // Sandboxes run under bubblewrap without cgroup isolation.
 
-const CgroupHandle = void;
+pub const CgroupHandle = void;
 
 pub fn create_cgroup(_: []const u8, _: f64, _: u64) ?CgroupHandle {
     return null;

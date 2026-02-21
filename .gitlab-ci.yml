@@ -25,60 +25,56 @@ stages:
   before_script:
     - nix --version
 
+# MR pipelines: just verify builds succeed (no artifacts needed)
 build-zig:
   extends: .nix-base
   stage: build
   script:
     - nix build .#image-zig -L
-    - cp result image-zig.tar.gz
-  artifacts:
-    paths:
-      - image-zig.tar.gz
-    expire_in: 1 hour
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 build-modules:
   extends: .nix-base
   stage: build
   script:
-    - nix build .#module-base-alpine -o result-base -L
-    - nix build .#module-nodejs22 -o result-node -L
-    - nix build .#sq-secret-proxy -o result-proxy -L
-    - mkdir -p modules
-    - cp result-base modules/000-base-alpine.squashfs
-    - cp result-node modules/100-nodejs22.squashfs
-    - cp result-proxy modules/sq-secret-proxy
-  artifacts:
-    paths:
-      - modules/
-    expire_in: 1 hour
+    - nix build .#module-base-alpine -L
+    - nix build .#module-nodejs22 -L
+    - nix build .#sq-secret-proxy -L
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
+# Main branch: build and push in one step (avoids artifact size limits)
 publish-image:
   extends: .nix-base
   stage: publish
-  needs: [build-zig]
   script:
-    # Install docker CLI + AWS CLI for ECR push
-    - nix profile install nixpkgs#docker-client nixpkgs#awscli2
-    # ECR login
-    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-    # Load and tag
-    - docker load < image-zig.tar.gz
-    - SOURCE_TAG=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep sq-sandbox-zig | head -1)
-    - docker tag "$SOURCE_TAG" "$ECR_REGISTRY/$ECR_IMAGE:zig-latest"
-    - docker tag "$SOURCE_TAG" "$ECR_REGISTRY/$ECR_IMAGE:zig-sha-$CI_COMMIT_SHORT_SHA"
-    # Push
-    - docker push "$ECR_REGISTRY/$ECR_IMAGE:zig-latest"
-    - docker push "$ECR_REGISTRY/$ECR_IMAGE:zig-sha-$CI_COMMIT_SHORT_SHA"
+    - nix build .#image-zig -L
+    - nix profile install nixpkgs#skopeo
+    - >
+      nix run nixpkgs#awscli2 --
+      ecr get-login-password --region $AWS_DEFAULT_REGION |
+      skopeo login --username AWS --password-stdin $ECR_REGISTRY
+    - skopeo copy --insecure-policy
+      docker-archive:result
+      docker://$ECR_REGISTRY/$ECR_IMAGE:zig-latest
+    - skopeo copy --insecure-policy
+      docker-archive:result
+      docker://$ECR_REGISTRY/$ECR_IMAGE:zig-sha-$CI_COMMIT_SHORT_SHA
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 publish-modules:
   extends: .nix-base
   stage: publish
-  needs: [build-modules]
   script:
-    - nix profile install nixpkgs#awscli2
-    - aws s3 cp modules/000-base-alpine.squashfs s3://fg-squash-sandbox/modules/000-base-alpine.squashfs
-    - aws s3 cp modules/100-nodejs22.squashfs s3://fg-squash-sandbox/modules/100-nodejs22.squashfs
+    - nix build .#module-base-alpine -o result-base -L
+    - nix build .#module-nodejs22 -o result-node -L
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-base s3://fg-squash-sandbox/modules/000-base-alpine.squashfs
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-node s3://fg-squash-sandbox/modules/100-nodejs22.squashfs
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

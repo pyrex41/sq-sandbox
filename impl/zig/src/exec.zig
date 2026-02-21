@@ -63,6 +63,10 @@ pub const SandboxContext = struct {
     log_dir: ?[]const u8 = null,
     /// Atomic sequence counter shared across execs for this sandbox.
     seq_counter: ?*SeqCounter = null,
+    /// Network namespace name for sandbox isolation. Null if no netns.
+    netns_name: ?[]const u8 = null,
+    /// Cgroup path for resource limits. Null if no cgroup.
+    cgroup_path: ?[]const u8 = null,
 };
 
 pub const ExecError = error{

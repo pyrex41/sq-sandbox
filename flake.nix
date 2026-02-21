@@ -3,15 +3,17 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils }:
     flake-utils.lib.eachSystem [
       "x86_64-linux" "aarch64-linux" "aarch64-darwin"
     ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        pkgs-unstable = import nixpkgs-unstable { inherit system; };
         isLinux = pkgs.stdenv.isLinux;
 
         # ── Squashfs modules ──────────────────────────────────────────
@@ -65,7 +67,7 @@
             pname = "squashd-zig";
             version = "0.1.0";
             src = ./impl/zig;
-            nativeBuildInputs = [ pkgs.zig ];
+            nativeBuildInputs = [ pkgs-unstable.zig ];
             dontConfigure = true;
             dontInstall = true;
             buildPhase = ''

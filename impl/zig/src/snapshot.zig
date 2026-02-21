@@ -230,9 +230,9 @@ pub fn restoreSnapshot(
         // Attempt to remount overlay without snapshot (degraded recovery)
         overlay_mount.* = mounts.OverlayMount.mount(
             params.lower_layers,
-            params.upper_data,
-            params.upper_work,
-            params.merged_path,
+            std.mem.span(params.upper_data),
+            std.mem.span(params.upper_work),
+            std.mem.span(params.merged_path),
         ) catch {
             log.err("CRITICAL: failed to remount overlay after clear failure", .{});
             return SnapshotError.RestoreFailed;
@@ -253,9 +253,9 @@ pub fn restoreSnapshot(
         // Recovery: remount without snapshot
         overlay_mount.* = mounts.OverlayMount.mount(
             params.lower_layers,
-            params.upper_data,
-            params.upper_work,
-            params.merged_path,
+            std.mem.span(params.upper_data),
+            std.mem.span(params.upper_work),
+            std.mem.span(params.merged_path),
         ) catch {
             log.err("CRITICAL: failed to remount overlay during recovery", .{});
             return SnapshotError.RestoreFailed;
@@ -265,15 +265,15 @@ pub fn restoreSnapshot(
 
     var snap_mount = mounts.SquashfsMount.mount(
         snap_path_z,
-        params.snapshot_mount_point,
+        std.mem.span(params.snapshot_mount_point),
     ) catch {
         log.err("failed to mount snapshot squashfs", .{});
         // Recovery: remount without snapshot
         overlay_mount.* = mounts.OverlayMount.mount(
             params.lower_layers,
-            params.upper_data,
-            params.upper_work,
-            params.merged_path,
+            std.mem.span(params.upper_data),
+            std.mem.span(params.upper_work),
+            std.mem.span(params.merged_path),
         ) catch {
             log.err("CRITICAL: failed to remount overlay during recovery", .{});
             return SnapshotError.RestoreFailed;
@@ -289,9 +289,9 @@ pub fn restoreSnapshot(
         // Recovery: remount without snapshot
         overlay_mount.* = mounts.OverlayMount.mount(
             params.lower_layers,
-            params.upper_data,
-            params.upper_work,
-            params.merged_path,
+            std.mem.span(params.upper_data),
+            std.mem.span(params.upper_work),
+            std.mem.span(params.merged_path),
         ) catch {
             log.err("CRITICAL: failed to remount overlay during recovery", .{});
             return SnapshotError.RestoreFailed;
@@ -305,19 +305,19 @@ pub fn restoreSnapshot(
 
     // 6. Remount overlay with snapshot layer
     overlay_mount.* = mounts.OverlayMount.mount(
-        new_lower,
-        params.upper_data,
-        params.upper_work,
-        params.merged_path,
+        params.lower_layers,
+        std.mem.span(params.upper_data),
+        std.mem.span(params.upper_work),
+        std.mem.span(params.merged_path),
     ) catch {
         log.err("failed to remount overlay with snapshot layer", .{});
         snap_mount.deinit();
         // Last-resort recovery: remount without snapshot
         overlay_mount.* = mounts.OverlayMount.mount(
             params.lower_layers,
-            params.upper_data,
-            params.upper_work,
-            params.merged_path,
+            std.mem.span(params.upper_data),
+            std.mem.span(params.upper_work),
+            std.mem.span(params.merged_path),
         ) catch {
             log.err("CRITICAL: failed to remount overlay during recovery", .{});
             return SnapshotError.RestoreFailed;

@@ -7,9 +7,12 @@ let
   # Common runtime dependencies for all images
   runtimeDeps = with pkgs; [
     squashfsTools    # mksquashfs, unsquashfs
+    squashfuse       # FUSE-based squashfs mount (unprivileged)
+    fuse-overlayfs   # FUSE-based overlay mount (unprivileged)
+    bubblewrap       # unprivileged sandboxing (replaces chroot)
     util-linux       # mount, losetup
-    iproute2         # ip (veth, netns)
-    iptables         # NAT, egress filtering
+    iproute2         # ip (veth, netns) -- only needed for legacy privileged mode or Firecracker backend
+    iptables         # NAT, egress filtering -- only needed for legacy privileged mode or Firecracker backend
     curl
     wget
     jq
@@ -27,7 +30,7 @@ let
 
   shared = ../shared;
 
-  mkImage = { name, daemonPkg, entrypoint ? "entrypoint-v3.sh", extraDeps ? [] }:
+  mkImage = { name, daemonPkg, extraDeps ? [] }:
     pkgs.dockerTools.buildLayeredImage {
       inherit name;
       tag = "latest";
@@ -45,12 +48,10 @@ let
         cp -r ${shared}/static/* app/static/
         cp -r ${shared}/vm/* app/vm/
         cp ${shared}/seccomp.json app/
-        cp ${shared}/${entrypoint} app/entrypoint.sh
-        chmod +x app/entrypoint.sh
       '';
 
       config = {
-        Cmd = [ "/app/entrypoint.sh" ];
+        Cmd = [ "/app/bin/sq-start" ];
         WorkingDir = "/app";
         Env = [
           "PATH=/app/bin:/bin:/usr/bin:/sbin:/usr/sbin"
@@ -94,7 +95,6 @@ in {
   image-cl = mkImage {
     name = "sq-sandbox-cl";
     daemonPkg = self-packages.squashd-cl;
-    entrypoint = "entrypoint-v4.sh";
     extraDeps = clExtraDeps;
   };
 }

@@ -1,0 +1,62 @@
+#!/bin/sh
+# squash/bin/sq-mount-layer — mount/unmount squashfs layers (unprivileged)
+#
+# Usage:
+#   sq-mount-layer <squashfs-file> <mount-point>   Mount read-only
+#   sq-mount-layer --unmount <mount-point>          Unmount
+#
+# Prefers squashfuse (no root needed). Falls back to kernel loop mount.
+
+set -eu
+
+log() { echo "[sq-mount-layer] $*"; }
+die() { echo "[sq-mount-layer] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: $0 <squashfs-file> <mount-point>"
+    echo "       $0 --unmount <mount-point>"
+    exit 1
+}
+
+do_mount() {
+    local sqfs="$1" mp="$2"
+
+    [ -f "$sqfs" ] || die "squashfs file not found: $sqfs"
+    mkdir -p "$mp"
+
+    if command -v squashfuse >/dev/null 2>&1; then
+        squashfuse -o ro "$sqfs" "$mp" || die "squashfuse failed: $sqfs -> $mp"
+    else
+        mount -o loop,ro -t squashfs "$sqfs" "$mp" || die "mount failed: $sqfs -> $mp"
+    fi
+}
+
+do_unmount() {
+    local mp="$1"
+
+    mountpoint -q "$mp" 2>/dev/null || die "not a mountpoint: $mp"
+
+    if command -v fusermount >/dev/null 2>&1 && fusermount -u "$mp" 2>/dev/null; then
+        return 0
+    fi
+
+    umount "$mp" 2>/dev/null && return 0
+    umount -l "$mp" 2>/dev/null && return 0
+
+    die "unmount failed: $mp"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+case "${1:-}" in
+    --unmount|-u)
+        [ $# -lt 2 ] && usage
+        do_unmount "$2"
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        [ $# -lt 2 ] && usage
+        do_mount "$1" "$2"
+        ;;
+esac

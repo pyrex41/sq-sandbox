@@ -2,6 +2,9 @@ package squashd
 
 // Syscall wrappers not available in core:sys/linux.
 // Centralized here so a single `foreign import libc` is shared across the package.
+//
+// c_mount / c_umount2 REMOVED — unprivileged mode uses shared helper scripts
+// (sq-mount-layer, sq-mount-overlay) via run_cmd().
 
 import "core:c"
 
@@ -12,10 +15,6 @@ when ODIN_OS == .Linux {
 }
 
 foreign libc {
-	@(link_name = "mount")
-	c_mount :: proc(source: cstring, target: cstring, fstype: cstring, flags: c.ulong, data: rawptr) -> c.int ---
-	@(link_name = "umount2")
-	c_umount2 :: proc(target: cstring, flags: c.int) -> c.int ---
 	@(link_name = "close")
 	c_close :: proc(fd: c.int) -> c.int ---
 	@(link_name = "flock")

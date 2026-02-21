@@ -1,14 +1,15 @@
 # Sandbox — lifecycle, create, destroy.
 #
 # Creation uses unwind-protect for rollback: if overlay mount fails,
-# squashfs and tmpfs are cleaned up. Each resource is tracked so
+# squashfs mounts are cleaned up. Each resource is tracked so
 # destroy-sandbox can tear down in reverse order.
+#
+# Unprivileged mode: no tmpfs, no cgroups, no netns.
+# Isolation is handled by sq-exec (bubblewrap/unshare).
 
 (import config :prefix "config/")
 (import validate :prefix "validate/")
 (import mounts :prefix "mounts/")
-(import cgroup)
-(import netns)
 (import meta)
 (import secrets :prefix "secrets/")
 (import s3)
@@ -24,7 +25,8 @@
 
   # Create directory tree
   (mounts/ensure-dir (string sdir "/images"))
-  (mounts/ensure-dir (string sdir "/upper"))
+  (mounts/ensure-dir (string sdir "/upper/data"))
+  (mounts/ensure-dir (string sdir "/upper/work"))
   (mounts/ensure-dir (string sdir "/merged"))
   (mounts/ensure-dir (string sdir "/.meta/log"))
 
@@ -35,19 +37,13 @@
   # Track all resources for rollback
   (def sqfs-mounts @[])
   (def lower-components @[])
-  (var tmpfs nil)
   (var overlay nil)
-  (var cg nil)
-  (var ns nil)
 
   (defn rollback []
     "Tear down all resources created so far."
     (when overlay (try (mounts/unmount-overlay overlay) ([e] nil)))
-    (when tmpfs (try (mounts/unmount-tmpfs tmpfs) ([e] nil)))
     (each m (reverse sqfs-mounts)
-      (try (mounts/unmount-squashfs m) ([e] nil)))
-    (when ns (try (netns/teardown-netns ns) ([e] nil)))
-    (when cg (try (cgroup/destroy-cgroup cg) ([e] nil))))
+      (try (mounts/unmount-squashfs m) ([e] nil))))
 
   (try
     (do
@@ -71,38 +67,15 @@
       (sort lower-components
         (fn [a b] (> (numeric-prefix a) (numeric-prefix b))))
 
-      # Mount tmpfs for upper layer
-      (set tmpfs (mounts/mount-tmpfs (string sdir "/upper")
-                   (or (get opts :upper-limit-mb) (get config :upper-limit-mb) 512)))
-
-      # Mount overlay
+      # Mount overlay (upper/data and upper/work are regular directories)
       (set overlay (mounts/mount-overlay
                      lower-components
                      (string sdir "/upper/data")
                      (string sdir "/upper/work")
                      (string sdir "/merged")))
 
-      # Cgroup (optional — may fail on non-Linux or without privileges)
-      (set cg
-        (try (cgroup/create-cgroup id
-               (or (get opts :cpu) 2)
-               (or (get opts :memory-mb) 1024))
-          ([e] nil)))
-
-      # Network namespace (optional)
-      (set ns
-        (try (netns/setup-netns id (get opts :allow-net))
-          ([e] nil)))
-
-      # Seed resolv.conf (DNS via netns gateway)
-      (when ns
-        (def etc-dir (string sdir "/upper/data/etc"))
-        (mounts/ensure-dir etc-dir)
-        (spit (string etc-dir "/resolv.conf")
-              (string "nameserver " (string/format "10.200.%d.1" (get ns :index)) "\n")))
-
-      # Secret injection (placeholders + proxy env)
-      (secrets/inject-secrets config @{:dir sdir :netns ns})
+      # Secret injection
+      (secrets/inject-secrets config @{:dir sdir})
 
       # Write metadata
       (meta/write-sandbox-meta sdir @{
@@ -125,11 +98,8 @@
         :mounts @{
           :squashfs-mounts sqfs-mounts
           :snapshot-mount nil
-          :tmpfs tmpfs
           :overlay overlay
         }
-        :cgroup cg
-        :netns ns
         :created (os/time)
         :last-active (os/time)
         :exec-count 0
@@ -149,9 +119,5 @@
   (put sandbox :state :destroying)
   (when (get sandbox :mounts)
     (try (mounts/destroy-sandbox-mounts (get sandbox :mounts)) ([e] nil)))
-  (when (get sandbox :netns)
-    (try (netns/teardown-netns (get sandbox :netns)) ([e] nil)))
-  (when (get sandbox :cgroup)
-    (try (cgroup/destroy-cgroup (get sandbox :cgroup)) ([e] nil)))
   (put sandbox :state :destroyed)
   sandbox)

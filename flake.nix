@@ -3,20 +3,22 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils }:
     flake-utils.lib.eachSystem [
       "x86_64-linux" "aarch64-linux" "aarch64-darwin"
     ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        pkgs-unstable = import nixpkgs-unstable { inherit system; };
         isLinux = pkgs.stdenv.isLinux;
 
         # ── Squashfs modules ──────────────────────────────────────────
         modules = pkgs.lib.optionalAttrs isLinux
-          (import ./nix/modules.nix { inherit pkgs; });
+  (import ./nix/modules.nix { inherit pkgs; enableNullclaw = true; });
 
         # ── Daemon builds + proxy ─────────────────────────────────────
         daemons = pkgs.lib.optionalAttrs isLinux {
@@ -65,7 +67,7 @@
             pname = "squashd-zig";
             version = "0.1.0";
             src = ./impl/zig;
-            nativeBuildInputs = [ pkgs.zig ];
+            nativeBuildInputs = [ pkgs-unstable.zig ];
             dontConfigure = true;
             dontInstall = true;
             buildPhase = ''
@@ -116,6 +118,30 @@
           };
         };
 
+        # ── Deployment ───────────────────────────────────────────────
+        deployment = pkgs.lib.optionalAttrs isLinux {
+          sq-sandbox-service = pkgs.writeTextFile {
+            name = "sq-sandbox.service";
+            destination = "/lib/systemd/system/sq-sandbox.service";
+            text = ''
+              [Unit]
+              Description=sq-sandbox composable sandbox daemon
+              After=network.target
+
+              [Service]
+              Type=simple
+              ExecStart=/usr/local/bin/squashd
+              Environment=SQUASH_DATA=/var/lib/sq-sandbox
+              Environment=SQUASH_PORT=8080
+              Restart=on-failure
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            '';
+          };
+        };
+
         # ── OCI images ────────────────────────────────────────────────
         images = pkgs.lib.optionalAttrs isLinux
           (import ./nix/image.nix { inherit pkgs; self-packages = daemons; });
@@ -124,13 +150,14 @@
         devShells = {
           default = pkgs.mkShell {
             name = "sq-sandbox";
-            packages = with pkgs; [ jq curl git shellcheck ];
+            packages = with pkgs; [ jq curl git shellcheck ]
+              ++ pkgs.lib.optionals isLinux [ squashfuse fuse-overlayfs bubblewrap ];
           };
 
           shell = pkgs.mkShell {
             name = "sq-sandbox-shell";
             packages = with pkgs; [ shellcheck jq curl ]
-              ++ pkgs.lib.optionals isLinux [ pkgs.busybox ];
+              ++ pkgs.lib.optionals isLinux [ pkgs.busybox squashfuse fuse-overlayfs bubblewrap ];
           };
 
           rust = pkgs.mkShell {
@@ -160,7 +187,7 @@
           };
         };
 
-        packages = modules // daemons // images;
+        packages = modules // daemons // images // deployment;
       }
     );
 }

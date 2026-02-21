@@ -1,40 +1,12 @@
-// exec.zig — Sandbox execution via fork, pipe, namespace isolation, chroot, execve.
+// exec.zig — Sandbox execution via sq-exec helper script.
 //
-// Security-sensitive: the ordering of setns, unshare, chroot, and chdir
-// matters. The child enters the network namespace FIRST (setns requires
-// the host mount namespace to resolve /var/run/netns/), then unshares
-// mount/PID/IPC/UTS, then chroots into the merged overlayfs, then chdir
-// to the workdir, and finally execve.
+// Shells out to `sq-exec <merged-root> <cmd> [workdir] [timeout]` which
+// handles PID/IPC/UTS isolation via bubblewrap or unshare+chroot.
 
 const std = @import("std");
 const posix = std.posix;
-const builtin = @import("builtin");
-const is_linux = builtin.os.tag == .linux;
 const log = std.log.scoped(.exec);
 const json_mod = @import("json.zig");
-
-const c = if (is_linux) @cImport({
-    @cInclude("sys/mount.h");
-    @cInclude("sched.h");
-    @cInclude("unistd.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-    @cInclude("poll.h");
-    @cInclude("fcntl.h");
-    @cInclude("errno.h");
-}) else struct {
-    // macOS stubs for compilation — actual exec is Linux-only
-    pub const CLONE_NEWNET: c_int = 0x40000000;
-    pub const CLONE_NEWNS: c_int = 0x00020000;
-    pub const CLONE_NEWPID: c_int = 0x20000000;
-    pub const CLONE_NEWIPC: c_int = 0x08000000;
-    pub const CLONE_NEWUTS: c_int = 0x04000000;
-    pub fn setns(_: c_int, _: c_int) c_int { return -1; }
-    pub fn unshare(_: c_int) c_int { return -1; }
-    pub fn getpid() c_int { return 0; }
-    pub fn chroot(_: anytype) c_int { return -1; }
-    pub fn _exit(code: u8) noreturn { std.posix.exit(code); }
-};
 
 /// Maximum bytes captured from stdout/stderr (64KB each).
 pub const max_output_bytes: usize = 65536;
@@ -85,39 +57,29 @@ pub const SeqCounter = struct {
 /// Parameters describing the sandbox environment for exec.
 /// Other modules (sandbox.zig, manager.zig) populate this from their state.
 pub const SandboxContext = struct {
-    /// Absolute path to the merged overlayfs directory (chroot target).
-    merged_path: [*:0]const u8,
-    /// Network namespace name (e.g. "squash-myid"). Null if no netns.
-    netns_name: ?[]const u8 = null,
-    /// Cgroup path (e.g. "/sys/fs/cgroup/squash-myid"). Null if no cgroup.
-    cgroup_path: ?[]const u8 = null,
+    /// Absolute path to the merged overlayfs directory (sandbox root).
+    merged_path: []const u8,
     /// Absolute path to the exec log directory for this sandbox. Null to skip logging.
     log_dir: ?[]const u8 = null,
     /// Atomic sequence counter shared across execs for this sandbox.
     seq_counter: ?*SeqCounter = null,
+    /// Network namespace name for sandbox isolation. Null if no netns.
+    netns_name: ?[]const u8 = null,
+    /// Cgroup path for resource limits. Null if no cgroup.
+    cgroup_path: ?[]const u8 = null,
 };
 
 pub const ExecError = error{
     ForkFailed,
     PipeCreationFailed,
-    NetnsOpenFailed,
     PollFailed,
     WaitFailed,
     OutputAlloc,
 };
 
-/// Execute a command inside a sandboxed environment.
+/// Execute a command inside a sandboxed environment by shelling out to sq-exec.
 ///
-/// Flow:
-///   1. Create pipes for stdout/stderr capture
-///   2. Open netns fd (if applicable) — must happen BEFORE fork while we
-///      still have access to the host filesystem
-///   3. Fork
-///   4. Child: close pipe read ends, dup2 write ends to stdout/stderr,
-///      enter cgroup, setns into netns, unshare mount/PID/IPC/UTS,
-///      chroot, chdir, execve /bin/sh -c <cmd>
-///   5. Parent: close pipe write ends, poll-read stdout/stderr with
-///      timeout, waitpid, build result
+/// sq-exec <merged-root> <cmd> [workdir] [timeout]
 pub fn execInSandbox(
     allocator: std.mem.Allocator,
     ctx: SandboxContext,
@@ -125,159 +87,58 @@ pub fn execInSandbox(
 ) ExecError!ExecResult {
     const started = std.time.timestamp();
 
-    // 1. Create pipes
-    const stdout_pipe = createPipe() orelse return ExecError.PipeCreationFailed;
-    defer posix.close(stdout_pipe.read);
-    const stderr_pipe = createPipe() orelse return ExecError.PipeCreationFailed;
-    defer posix.close(stderr_pipe.read);
+    // Format timeout as string
+    var timeout_buf: [16]u8 = undefined;
+    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{req.timeout_s}) catch
+        return ExecError.ForkFailed;
 
-    // 2. Open netns fd before fork (requires host mount namespace)
-    const netns_fd = openNetns(ctx.netns_name);
-    defer if (netns_fd) |fd| posix.close(fd);
+    var child = std.process.Child.init(
+        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str },
+        allocator,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Close;
 
-    // 3. Fork
-    const fork_result = posix.fork() catch return ExecError.ForkFailed;
+    child.spawn() catch return ExecError.ForkFailed;
 
-    if (fork_result == 0) {
-        // ═══ CHILD PROCESS ═══
-        // This code path never returns on success (execve replaces the process).
-        // On failure, _exit(126) or _exit(127).
-        childExec(
-            stdout_pipe,
-            stderr_pipe,
-            netns_fd,
-            ctx,
-            req,
-        );
-        // childExec calls _exit and never returns
-        unreachable;
-    }
-
-    // ═══ PARENT PROCESS ═══
-    const child_pid = fork_result;
-
-    // Close write ends — only the child writes to these
-    posix.close(stdout_pipe.write);
-    posix.close(stderr_pipe.write);
-
-    // Read stdout/stderr with timeout via poll()
+    // Read stdout/stderr from pipes
     var stdout_buf: [max_output_bytes]u8 = undefined;
     var stderr_buf: [max_output_bytes]u8 = undefined;
     var stdout_len: usize = 0;
     var stderr_len: usize = 0;
-    var timed_out = false;
 
-    const deadline_ms: i64 = if (req.timeout_s > 0)
-        std.time.milliTimestamp() + @as(i64, @intCast(req.timeout_s)) * 1000
-    else
-        std.math.maxInt(i64); // effectively no timeout
-
-    var stdout_eof = false;
-    var stderr_eof = false;
-
-    while (!stdout_eof or !stderr_eof) {
-        const now_ms = std.time.milliTimestamp();
-        if (now_ms >= deadline_ms) {
-            // Timeout — kill child process group
-            killChild(child_pid);
-            timed_out = true;
-            break;
+    // Read stdout
+    if (child.stdout) |*stdout_stream| {
+        while (stdout_len < max_output_bytes) {
+            const n = stdout_stream.read(stdout_buf[stdout_len..]) catch break;
+            if (n == 0) break;
+            stdout_len += n;
         }
+    }
 
-        const remaining_ms = deadline_ms - now_ms;
-        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
-
-        var fds = [2]posix.pollfd{
-            .{
-                .fd = if (stdout_eof) -1 else stdout_pipe.read,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = if (stderr_eof) -1 else stderr_pipe.read,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-
-        const poll_rc = posix.poll(&fds, poll_timeout) catch {
-            // poll error — kill child and break
-            killChild(child_pid);
-            break;
-        };
-
-        if (poll_rc == 0) {
-            // poll timeout — check deadline again at top of loop
-            continue;
-        }
-
-        // Read stdout
-        if (!stdout_eof) {
-            if (fds[0].revents & posix.POLL.IN != 0) {
-                if (stdout_len < max_output_bytes) {
-                    const n = posix.read(stdout_pipe.read, stdout_buf[stdout_len..]) catch 0;
-                    if (n == 0) {
-                        stdout_eof = true;
-                    } else {
-                        stdout_len += n;
-                    }
-                } else {
-                    // Buffer full — drain and discard
-                    var discard: [4096]u8 = undefined;
-                    const n = posix.read(stdout_pipe.read, &discard) catch 0;
-                    if (n == 0) stdout_eof = true;
-                }
-            }
-            if (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
-                // Drain remaining data after HUP
-                if (stdout_len < max_output_bytes) {
-                    while (true) {
-                        const n = posix.read(stdout_pipe.read, stdout_buf[stdout_len..]) catch break;
-                        if (n == 0) break;
-                        stdout_len += n;
-                        if (stdout_len >= max_output_bytes) break;
-                    }
-                }
-                stdout_eof = true;
-            }
-        }
-
-        // Read stderr
-        if (!stderr_eof) {
-            if (fds[1].revents & posix.POLL.IN != 0) {
-                if (stderr_len < max_output_bytes) {
-                    const n = posix.read(stderr_pipe.read, stderr_buf[stderr_len..]) catch 0;
-                    if (n == 0) {
-                        stderr_eof = true;
-                    } else {
-                        stderr_len += n;
-                    }
-                } else {
-                    var discard: [4096]u8 = undefined;
-                    const n = posix.read(stderr_pipe.read, &discard) catch 0;
-                    if (n == 0) stderr_eof = true;
-                }
-            }
-            if (fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
-                if (stderr_len < max_output_bytes) {
-                    while (true) {
-                        const n = posix.read(stderr_pipe.read, stderr_buf[stderr_len..]) catch break;
-                        if (n == 0) break;
-                        stderr_len += n;
-                        if (stderr_len >= max_output_bytes) break;
-                    }
-                }
-                stderr_eof = true;
-            }
+    // Read stderr
+    if (child.stderr) |*stderr_stream| {
+        while (stderr_len < max_output_bytes) {
+            const n = stderr_stream.read(stderr_buf[stderr_len..]) catch break;
+            if (n == 0) break;
+            stderr_len += n;
         }
     }
 
     // Wait for child to exit
-    const exit_code = waitForChild(child_pid, timed_out);
+    const term = child.wait() catch return ExecError.WaitFailed;
     const finished = std.time.timestamp();
 
-    // Determine final exit code
-    const final_exit_code: i32 = if (timed_out) 124 else exit_code;
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @intCast(code),
+        .Signal => |sig| 128 + @as(i32, @intCast(sig)),
+        else => -1,
+    };
+
+    // sq-exec uses timeout(1) which returns 124 on timeout
+    const timed_out = exit_code == 124;
+    const final_exit_code = exit_code;
 
     // Get sequence number and write exec log
     const seq: u32 = if (ctx.seq_counter) |counter| counter.next() else 0;
@@ -321,169 +182,6 @@ pub fn execInSandbox(
     };
 }
 
-// ── Internal helpers ────────────────────────────────────────────────────
-
-const Pipe = struct {
-    read: posix.fd_t,
-    write: posix.fd_t,
-};
-
-fn createPipe() ?Pipe {
-    const fds = posix.pipe2(.{ .CLOEXEC = true }) catch return null;
-    return .{ .read = fds[0], .write = fds[1] };
-}
-
-/// Open the network namespace file descriptor.
-/// Returns null if no netns is configured.
-fn openNetns(netns_name: ?[]const u8) ?posix.fd_t {
-    const name = netns_name orelse return null;
-    if (name.len == 0) return null;
-
-    var path_buf: [280]u8 = undefined;
-    const ns_path = std.fmt.bufPrintZ(&path_buf, "/var/run/netns/{s}", .{name}) catch return null;
-
-    return posix.openZ(ns_path, .{}, 0) catch |err| {
-        log.warn("failed to open netns {s}: {}", .{ name, err });
-        return null;
-    };
-}
-
-/// Child process: set up namespaces, chroot, and exec.
-/// This function NEVER returns — it calls _exit or execve.
-fn childExec(
-    stdout_pipe: Pipe,
-    stderr_pipe: Pipe,
-    netns_fd: ?posix.fd_t,
-    ctx: SandboxContext,
-    req: ExecRequest,
-) noreturn {
-    // Close read ends of pipes (parent reads these)
-    posix.close(stdout_pipe.read);
-    posix.close(stderr_pipe.read);
-
-    // Redirect stdout and stderr to pipe write ends
-    posix.dup2(stdout_pipe.write, posix.STDOUT_FILENO) catch exitChild(126);
-    posix.dup2(stderr_pipe.write, posix.STDERR_FILENO) catch exitChild(126);
-    // Close the original write fds now that they're dup'd
-    posix.close(stdout_pipe.write);
-    posix.close(stderr_pipe.write);
-
-    // Enter cgroup (best-effort — if cgroup doesn't exist, continue)
-    if (ctx.cgroup_path) |cg_path| {
-        addSelfToCgroup(cg_path);
-    }
-
-    // Enter network namespace via setns(fd, CLONE_NEWNET)
-    // This MUST happen before unshare(CLONE_NEWNS) because setns needs
-    // access to /var/run/netns/ which is on the host mount namespace.
-    if (netns_fd) |fd| {
-        const rc = c.setns(fd, c.CLONE_NEWNET);
-        if (rc != 0) exitChild(126);
-    }
-
-    // Create new mount, PID, IPC, UTS namespaces
-    const ns_flags = c.CLONE_NEWNS | c.CLONE_NEWPID | c.CLONE_NEWIPC | c.CLONE_NEWUTS;
-    if (c.unshare(ns_flags) != 0) exitChild(126);
-
-    // After unshare(CLONE_NEWPID), the current process is still in the old
-    // PID namespace. We need to fork once more so the child gets PID 1 in
-    // the new namespace. This matches the shell behavior of
-    // `unshare --pid --fork`.
-    const inner_pid = posix.fork() catch exitChild(126);
-    if (inner_pid != 0) {
-        // Intermediate parent: wait for inner child and exit with its status
-        const wait_result = posix.waitpid(inner_pid, 0);
-        if (posix.W.IFEXITED(wait_result.status)) {
-            exitChild(@intCast(posix.W.EXITSTATUS(wait_result.status)));
-        } else if (posix.W.IFSIGNALED(wait_result.status)) {
-            exitChild(128 + @as(u8, @intCast(posix.W.TERMSIG(wait_result.status))));
-        } else {
-            exitChild(126);
-        }
-    }
-
-    // Inner child: PID 1 in the new PID namespace
-
-    // Chroot into the merged overlayfs
-    if (c.chroot(ctx.merged_path) != 0) exitChild(126);
-
-    // Change to requested working directory (best-effort)
-    var workdir_buf: [4096]u8 = undefined;
-    const workdir_z = std.fmt.bufPrintZ(&workdir_buf, "{s}", .{req.workdir}) catch exitChild(126);
-    posix.chdirZ(workdir_z) catch {};
-
-    // Build null-terminated command string for /bin/sh -c
-    var cmd_buf: [65536]u8 = undefined;
-    if (req.cmd.len >= cmd_buf.len) exitChild(126);
-    @memcpy(cmd_buf[0..req.cmd.len], req.cmd);
-    cmd_buf[req.cmd.len] = 0;
-    const cmd_z: [*:0]const u8 = @ptrCast(&cmd_buf);
-
-    // Set up minimal environment.
-    // Use /bin/sh -l -c so that /etc/profile.d/*.sh are sourced,
-    // which is where squash-secrets.sh exports placeholder env vars.
-    const env_home: [*:0]const u8 = "HOME=/root";
-    const env_path: [*:0]const u8 = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    const env_term: [*:0]const u8 = "TERM=xterm";
-
-    const argv = [_:null]?[*:0]const u8{
-        "/bin/sh",
-        "-l",
-        "-c",
-        cmd_z,
-    };
-    const envp = [_:null]?[*:0]const u8{
-        env_home,
-        env_path,
-        env_term,
-    };
-
-    posix.execveZ("/bin/sh", &argv, &envp) catch {};
-    // execve failed
-    exitChild(127);
-}
-
-/// Write our PID to the cgroup's cgroup.procs file.
-fn addSelfToCgroup(cg_path: []const u8) void {
-    var procs_buf: [280]u8 = undefined;
-    const procs_path = std.fmt.bufPrint(&procs_buf, "{s}/cgroup.procs", .{cg_path}) catch return;
-
-    const file = std.fs.openFileAbsolute(procs_path, .{ .mode = .write_only }) catch return;
-    defer file.close();
-
-    var pid_buf: [16]u8 = undefined;
-    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{c.getpid()}) catch return;
-    _ = file.write(pid_str) catch {};
-}
-
-/// Exit the child process without running any Zig cleanup (atexit, defer, etc).
-fn exitChild(code: u8) noreturn {
-    // Use the C _exit to avoid any buffered I/O issues
-    c._exit(code);
-}
-
-/// Kill a child process. Sends SIGKILL.
-fn killChild(pid: posix.pid_t) void {
-    // First try SIGTERM for graceful shutdown
-    posix.kill(pid, posix.SIG.TERM) catch {};
-    // Brief grace period then SIGKILL
-    std.Thread.sleep(100 * std.time.ns_per_ms);
-    posix.kill(pid, posix.SIG.KILL) catch {};
-}
-
-/// Wait for child process and return its exit code.
-fn waitForChild(pid: posix.pid_t, was_killed: bool) i32 {
-    _ = was_killed;
-    const wait_result = posix.waitpid(pid, 0);
-
-    if (posix.W.IFEXITED(wait_result.status)) {
-        return @as(i32, @intCast(posix.W.EXITSTATUS(wait_result.status)));
-    } else if (posix.W.IFSIGNALED(wait_result.status)) {
-        return @as(i32, 128) + @as(i32, @intCast(posix.W.TERMSIG(wait_result.status)));
-    }
-    return -1;
-}
-
 // ── Exec Logging ────────────────────────────────────────────────────────
 
 /// Write an exec log entry as a JSON file to the sandbox's log directory.
@@ -514,7 +212,6 @@ fn writeExecLog(
     };
 
     // Build JSON content — use a fixed buffer to avoid allocation.
-    // Worst case: each byte in stdout/stderr could expand to 6 chars (\uXXXX) + overhead.
     var buf: [max_output_bytes * 6 * 2 + 4096]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
     const writer = stream.writer();
@@ -684,7 +381,6 @@ test "ExecResult deinit frees allocations" {
         .seq = 1,
     };
     result.deinit(allocator);
-    // If deinit didn't free, the testing allocator would detect a leak
 }
 
 test "ExecResult deinit handles empty output" {
@@ -701,39 +397,8 @@ test "ExecResult deinit handles empty output" {
     result.deinit(allocator);
 }
 
-test "createPipe returns valid fds" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const pipe = createPipe() orelse return error.SkipZigTest;
-    defer posix.close(pipe.read);
-    defer posix.close(pipe.write);
-
-    // Write to write end, read from read end
-    const msg = "test pipe";
-    _ = posix.write(pipe.write, msg) catch return error.SkipZigTest;
-    var buf: [64]u8 = undefined;
-    const n = posix.read(pipe.read, &buf) catch return error.SkipZigTest;
-    try std.testing.expectEqualStrings(msg, buf[0..n]);
-}
-
-test "openNetns returns null for null name" {
-    try std.testing.expectEqual(@as(?posix.fd_t, null), openNetns(null));
-}
-
-test "openNetns returns null for empty name" {
-    try std.testing.expectEqual(@as(?posix.fd_t, null), openNetns(""));
-}
-
-test "openNetns returns null for nonexistent namespace" {
-    // This should fail gracefully (log warning, return null)
-    const result = openNetns("nonexistent-netns-12345");
-    try std.testing.expectEqual(@as(?posix.fd_t, null), result);
-}
-
 test "SandboxContext defaults" {
     const ctx = SandboxContext{ .merged_path = "/tmp/merged" };
-    try std.testing.expectEqual(@as(?[]const u8, null), ctx.netns_name);
-    try std.testing.expectEqual(@as(?[]const u8, null), ctx.cgroup_path);
     try std.testing.expectEqual(@as(?[]const u8, null), ctx.log_dir);
     try std.testing.expectEqual(@as(?*SeqCounter, null), ctx.seq_counter);
 }
@@ -762,7 +427,6 @@ test "writeLogJson produces valid JSON" {
 
     const json_str = stream.getWritten();
 
-    // Parse it back to verify it's valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
@@ -787,12 +451,10 @@ test "writeLogJson escapes special characters" {
 
     const json_str = stream.getWritten();
 
-    // Parse it back — if escaping is wrong, parsing will fail
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
-    // The parsed values should have the unescaped versions
     try std.testing.expectEqualStrings("echo \"hello\\nworld\"", obj.get("cmd").?.string);
     try std.testing.expectEqualStrings("line1\nline2\ttab", obj.get("stdout").?.string);
     try std.testing.expectEqualStrings("err\"msg", obj.get("stderr").?.string);
@@ -819,10 +481,8 @@ test "writeLogJson with timed_out true" {
 }
 
 test "writeExecLog creates log file" {
-    // Use /tmp for test log directory
     const test_dir = "/tmp/squash-test-exec-log";
 
-    // Clean up from previous test runs
     std.fs.deleteTreeAbsolute(test_dir) catch {};
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
@@ -830,14 +490,12 @@ test "writeExecLog creates log file" {
 
     writeExecLog(test_dir, 1, req, 0, 1736899200, 1736899205, "test output\n", "", false);
 
-    // Verify the file was created
     const content = std.fs.cwd().readFileAlloc(std.testing.allocator, test_dir ++ "/0001.json", 8192) catch |err| {
         std.debug.print("Failed to read log file: {}\n", .{err});
         return err;
     };
     defer std.testing.allocator.free(content);
 
-    // Parse and verify
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, content, .{});
     defer parsed.deinit();
 
@@ -856,12 +514,10 @@ test "writeExecLog sequence numbering in filenames" {
 
     const req = ExecRequest{ .cmd = "echo test" };
 
-    // Write three log entries
     writeExecLog(test_dir, 1, req, 0, 100, 101, "out1", "", false);
     writeExecLog(test_dir, 2, req, 1, 102, 103, "out2", "err2", false);
     writeExecLog(test_dir, 10, req, 0, 104, 105, "out3", "", false);
 
-    // Verify files exist with correct names
     const f1 = std.fs.cwd().readFileAlloc(std.testing.allocator, test_dir ++ "/0001.json", 8192) catch return error.SkipZigTest;
     defer std.testing.allocator.free(f1);
     const f2 = std.fs.cwd().readFileAlloc(std.testing.allocator, test_dir ++ "/0002.json", 8192) catch return error.SkipZigTest;
@@ -869,7 +525,6 @@ test "writeExecLog sequence numbering in filenames" {
     const f3 = std.fs.cwd().readFileAlloc(std.testing.allocator, test_dir ++ "/0010.json", 8192) catch return error.SkipZigTest;
     defer std.testing.allocator.free(f3);
 
-    // Verify seq 2 has exit_code 1
     const parsed2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, f2, .{});
     defer parsed2.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed2.value.object.get("exit_code").?.integer);
@@ -885,18 +540,15 @@ test "readExecLogs returns sorted entries" {
     const req2 = ExecRequest{ .cmd = "second" };
     const req3 = ExecRequest{ .cmd = "third" };
 
-    // Write out of order to test sorting
     writeExecLog(test_dir, 3, req3, 0, 300, 301, "three", "", false);
     writeExecLog(test_dir, 1, req1, 0, 100, 101, "one", "", false);
     writeExecLog(test_dir, 2, req2, 1, 200, 201, "two", "err", false);
 
-    // Read them back
     const logs = try readExecLogs(std.testing.allocator, test_dir);
     defer freeExecLogs(std.testing.allocator, logs);
 
     try std.testing.expectEqual(@as(usize, 3), logs.len);
 
-    // Should be sorted by seq
     try std.testing.expectEqual(@as(u32, 1), logs[0].seq);
     try std.testing.expectEqualStrings("first", logs[0].cmd);
     try std.testing.expectEqualStrings("one", logs[0].stdout);
@@ -922,7 +574,6 @@ test "writeJsonString handles control characters" {
     try writeJsonString(writer, "val", "a\x00b\x01c");
 
     const output = stream.getWritten();
-    // Verify the output contains escaped control chars
     try std.testing.expect(std.mem.indexOf(u8, output, "\\u0000") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\\u0001") != null);
 }

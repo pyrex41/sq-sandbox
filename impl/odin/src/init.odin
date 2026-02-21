@@ -206,10 +206,7 @@ remount_surviving_sandboxes :: proc(config: ^Config) {
 
 			_ensure_dir_recursive(local_mp)
 			if !_is_mounted(local_mp) {
-				src := _to_cstr(sqfs)
-				tgt := _to_cstr(local_mp)
-				rc := c_mount(src, tgt, "squashfs", MS_RDONLY, nil)
-				if rc != 0 {
+				if !run_cmd("mount", "-t", "squashfs", "-o", "ro", sqfs, local_mp) {
 					fmt.printfln("[init]   WARN: mount failed: %s", mod_trimmed)
 					continue
 				}
@@ -227,9 +224,7 @@ remount_surviving_sandboxes :: proc(config: ^Config) {
 				if os.exists(snap_file) {
 					_ensure_dir_recursive(snap_mp)
 					if !_is_mounted(snap_mp) {
-						src := _to_cstr(snap_file)
-						tgt := _to_cstr(snap_mp)
-						c_mount(src, tgt, "squashfs", MS_RDONLY, nil)
+						run_cmd("mount", "-t", "squashfs", "-o", "ro", snap_file, snap_mp)
 					}
 				}
 			}

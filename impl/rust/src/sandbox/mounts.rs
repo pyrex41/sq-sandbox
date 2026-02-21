@@ -1,11 +1,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use tracing::{debug, warn};
 
-/// A squashfs filesystem mounted read-only from a module.
+/// A squashfs filesystem mounted read-only from a module via sq-mount-layer.
 #[derive(Debug)]
 pub struct SquashfsMount {
     source: PathBuf,
@@ -21,14 +21,18 @@ impl SquashfsMount {
 
         fs::create_dir_all(&target)?;
 
-        mount(
-            Some(&source),
-            &target,
-            Some("squashfs"),
-            MsFlags::MS_RDONLY,
-            None::<&str>,
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("squashfs mount failed: {}", e)))?;
+        let status = Command::new("sq-mount-layer")
+            .arg(&source)
+            .arg(&target)
+            .status()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sq-mount-layer: {}", e)))?;
+
+        if !status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("sq-mount-layer failed for {} -> {}", source.display(), target.display()),
+            ));
+        }
 
         debug!("squashfs mounted: {} -> {}", source.display(), target.display());
 
@@ -55,8 +59,18 @@ impl SquashfsMount {
             return Ok(());
         }
 
-        umount2(&self.target, MntFlags::MNT_DETACH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("umount failed: {}", e)))?;
+        let status = Command::new("sq-mount-layer")
+            .arg("--unmount")
+            .arg(&self.target)
+            .status()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sq-mount-layer --unmount: {}", e)))?;
+
+        if !status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("sq-mount-layer --unmount failed for {}", self.target.display()),
+            ));
+        }
 
         self.mounted = false;
         debug!("squashfs unmounted: {}", self.target.display());
@@ -67,82 +81,27 @@ impl SquashfsMount {
 impl Drop for SquashfsMount {
     fn drop(&mut self) {
         if self.mounted {
-            if let Err(e) = umount2(&self.target, MntFlags::MNT_DETACH) {
-                warn!("failed to unmount squashfs {}: {}", self.target.display(), e);
-            } else {
-                debug!("squashfs unmounted (Drop): {}", self.target.display());
+            let result = Command::new("sq-mount-layer")
+                .arg("--unmount")
+                .arg(&self.target)
+                .status();
+            match result {
+                Ok(s) if s.success() => {
+                    debug!("squashfs unmounted (Drop): {}", self.target.display());
+                }
+                Ok(_) => {
+                    warn!("failed to unmount squashfs {}: non-zero exit", self.target.display());
+                }
+                Err(e) => {
+                    warn!("failed to unmount squashfs {}: {}", self.target.display(), e);
+                }
             }
         }
     }
 }
 
-/// A tmpfs filesystem for overlay upper and work dirs.
-#[derive(Debug)]
-pub struct TmpfsMount {
-    target: PathBuf,
-    size_mb: u64,
-    mounted: bool,
-}
-
-impl TmpfsMount {
-    /// Mount a tmpfs at the target with the specified size limit in MB.
-    pub fn mount(target: impl AsRef<Path>, size_mb: u64) -> io::Result<Self> {
-        let target = target.as_ref().to_path_buf();
-
-        fs::create_dir_all(&target)?;
-
-        let opts = format!("size={}M", size_mb);
-        mount(
-            Some("tmpfs"),
-            &target,
-            Some("tmpfs"),
-            MsFlags::empty(),
-            Some(opts.as_str()),
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tmpfs mount failed: {}", e)))?;
-
-        debug!("tmpfs mounted: {} (size={}MB)", target.display(), size_mb);
-
-        Ok(Self {
-            target,
-            size_mb,
-            mounted: true,
-        })
-    }
-
-    /// Returns the mount target path.
-    pub fn target(&self) -> &Path {
-        &self.target
-    }
-
-    /// Unmount explicitly (called by Drop, but can be called early for testing).
-    pub fn unmount(&mut self) -> io::Result<()> {
-        if !self.mounted {
-            return Ok(());
-        }
-
-        umount2(&self.target, MntFlags::MNT_DETACH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("umount failed: {}", e)))?;
-
-        self.mounted = false;
-        debug!("tmpfs unmounted: {}", self.target.display());
-        Ok(())
-    }
-}
-
-impl Drop for TmpfsMount {
-    fn drop(&mut self) {
-        if self.mounted {
-            if let Err(e) = umount2(&self.target, MntFlags::MNT_DETACH) {
-                warn!("failed to unmount tmpfs {}: {}", self.target.display(), e);
-            } else {
-                debug!("tmpfs unmounted (Drop): {}", self.target.display());
-            }
-        }
-    }
-}
-
-/// An overlayfs combining multiple lower layers with an upper writable layer.
+/// An overlayfs combining multiple lower layers with an upper writable layer,
+/// mounted via sq-mount-overlay.
 #[derive(Debug)]
 pub struct OverlayMount {
     target: PathBuf,
@@ -157,7 +116,7 @@ impl OverlayMount {
     ///
     /// # Arguments
     /// * `target` - Where to mount the merged view (e.g., `sandbox/merged`)
-    /// * `lower_dirs` - Ordered list of read-only lower layers (bottom-to-top)
+    /// * `lower_dirs` - Ordered list of read-only lower layers (top-to-bottom for lowerdir)
     /// * `upper_dir` - Writable upper layer for changes
     /// * `work_dir` - Work directory for overlay (must be on same fs as upper)
     pub fn mount(
@@ -181,30 +140,27 @@ impl OverlayMount {
         fs::create_dir_all(&upper_dir)?;
         fs::create_dir_all(&work_dir)?;
 
-        // Build lowerdir option: colon-separated paths
+        // Build colon-separated lowerdir string (sq-mount-overlay takes this as first arg)
         let lower_str = lower_dirs
             .iter()
             .map(|p| p.to_str().unwrap())
             .collect::<Vec<_>>()
             .join(":");
 
-        let opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lower_str,
-            upper_dir.display(),
-            work_dir.display()
-        );
+        let status = Command::new("sq-mount-overlay")
+            .arg(&lower_str)
+            .arg(&upper_dir)
+            .arg(&work_dir)
+            .arg(&target)
+            .status()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sq-mount-overlay: {}", e)))?;
 
-        mount(
-            Some("overlay"),
-            &target,
-            Some("overlay"),
-            MsFlags::empty(),
-            Some(opts.as_str()),
-        )
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("overlay mount failed: {}", e))
-        })?;
+        if !status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("sq-mount-overlay failed for {}", target.display()),
+            ));
+        }
 
         debug!(
             "overlay mounted: {} (lower={}, upper={}, work={})",
@@ -239,8 +195,18 @@ impl OverlayMount {
             return Ok(());
         }
 
-        umount2(&self.target, MntFlags::MNT_DETACH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("umount failed: {}", e)))?;
+        let status = Command::new("sq-mount-overlay")
+            .arg("--unmount")
+            .arg(&self.target)
+            .status()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sq-mount-overlay --unmount: {}", e)))?;
+
+        if !status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("sq-mount-overlay --unmount failed for {}", self.target.display()),
+            ));
+        }
 
         self.mounted = false;
         debug!("overlay unmounted: {}", self.target.display());
@@ -251,24 +217,32 @@ impl OverlayMount {
 impl Drop for OverlayMount {
     fn drop(&mut self) {
         if self.mounted {
-            if let Err(e) = umount2(&self.target, MntFlags::MNT_DETACH) {
-                warn!("failed to unmount overlay {}: {}", self.target.display(), e);
-            } else {
-                debug!("overlay unmounted (Drop): {}", self.target.display());
+            let result = Command::new("sq-mount-overlay")
+                .arg("--unmount")
+                .arg(&self.target)
+                .status();
+            match result {
+                Ok(s) if s.success() => {
+                    debug!("overlay unmounted (Drop): {}", self.target.display());
+                }
+                Ok(_) => {
+                    warn!("failed to unmount overlay {}: non-zero exit", self.target.display());
+                }
+                Err(e) => {
+                    warn!("failed to unmount overlay {}: {}", self.target.display(), e);
+                }
             }
         }
     }
 }
 
-/// Owns all mounts for a sandbox: squashfs layers, tmpfs, and overlay.
+/// Owns all mounts for a sandbox: squashfs layers and overlay.
 ///
-/// Drop unmounts in reverse order: overlay first, then tmpfs, then squashfs layers.
+/// Drop unmounts in reverse order: overlay first, then snapshot, then squashfs layers.
 #[derive(Debug)]
 pub struct SandboxMounts {
     /// The overlayfs merging all layers with the upper writable layer.
     pub overlay: OverlayMount,
-    /// The tmpfs holding upper/data and upper/work.
-    pub tmpfs: TmpfsMount,
     /// Active snapshot mount (if a snapshot is currently active).
     pub snapshot: Option<SquashfsMount>,
     /// Squashfs module layers (ordered bottom-to-top).
@@ -281,16 +255,16 @@ impl SandboxMounts {
     /// # Arguments
     /// * `layer_sources` - Paths to squashfs modules to mount (ordered bottom-to-top)
     /// * `layer_targets` - Mountpoints for each layer
-    /// * `tmpfs_target` - Where to mount the tmpfs for upper/work
-    /// * `tmpfs_size_mb` - Size limit for tmpfs in MB
+    /// * `upper_base` - Base directory for upper/work (upper/data and upper/work created inside)
+    /// * `_upper_limit_mb` - Unused in unprivileged mode (no tmpfs)
     /// * `overlay_target` - Where to mount the merged overlay view
     /// * `snapshot_source` - Optional snapshot squashfs to mount
     /// * `snapshot_target` - Optional snapshot mountpoint
     pub fn mount(
         layer_sources: Vec<PathBuf>,
         layer_targets: Vec<PathBuf>,
-        tmpfs_target: impl AsRef<Path>,
-        tmpfs_size_mb: u64,
+        upper_base: impl AsRef<Path>,
+        _upper_limit_mb: u64,
         overlay_target: impl AsRef<Path>,
         snapshot_source: Option<PathBuf>,
         snapshot_target: Option<PathBuf>,
@@ -309,7 +283,7 @@ impl SandboxMounts {
             ));
         }
 
-        let tmpfs_target = tmpfs_target.as_ref();
+        let upper_base = upper_base.as_ref();
         let overlay_target = overlay_target.as_ref();
 
         // Mount squashfs layers
@@ -337,19 +311,9 @@ impl SandboxMounts {
             _ => None,
         };
 
-        // Mount tmpfs
-        let tmpfs = match TmpfsMount::mount(tmpfs_target, tmpfs_size_mb) {
-            Ok(t) => t,
-            Err(e) => {
-                drop(snapshot);
-                drop(layers);
-                return Err(e);
-            }
-        };
-
-        // Create upper/data and upper/work directories
-        let upper_data = tmpfs_target.join("data");
-        let upper_work = tmpfs_target.join("work");
+        // Create upper/data and upper/work directories (no tmpfs in unprivileged mode)
+        let upper_data = upper_base.join("data");
+        let upper_work = upper_base.join("work");
         fs::create_dir_all(&upper_data)?;
         fs::create_dir_all(&upper_work)?;
 
@@ -368,7 +332,6 @@ impl SandboxMounts {
         {
             Ok(o) => o,
             Err(e) => {
-                drop(tmpfs);
                 drop(snapshot);
                 drop(layers);
                 return Err(e);
@@ -376,15 +339,13 @@ impl SandboxMounts {
         };
 
         debug!(
-            "sandbox mounts created: {} layers, tmpfs={}, overlay={}",
+            "sandbox mounts created: {} layers, overlay={}",
             layers.len(),
-            tmpfs_target.display(),
             overlay_target.display()
         );
 
         Ok(Self {
             overlay,
-            tmpfs,
             snapshot,
             layers,
         })
@@ -393,7 +354,7 @@ impl SandboxMounts {
 
 impl Drop for SandboxMounts {
     fn drop(&mut self) {
-        // Explicit reverse-order unmount: overlay, tmpfs, snapshot, layers (top to bottom)
+        // Explicit reverse-order unmount: overlay, snapshot, layers (top to bottom)
         debug!("dropping SandboxMounts: unmounting in reverse order");
 
         // 1. Overlay
@@ -401,19 +362,14 @@ impl Drop for SandboxMounts {
             warn!("failed to unmount overlay during SandboxMounts drop: {}", e);
         }
 
-        // 2. Tmpfs
-        if let Err(e) = self.tmpfs.unmount() {
-            warn!("failed to unmount tmpfs during SandboxMounts drop: {}", e);
-        }
-
-        // 3. Snapshot (if present)
+        // 2. Snapshot (if present)
         if let Some(ref mut snap) = self.snapshot {
             if let Err(e) = snap.unmount() {
                 warn!("failed to unmount snapshot during SandboxMounts drop: {}", e);
             }
         }
 
-        // 4. Layers (reverse order: top to bottom)
+        // 3. Layers (reverse order: top to bottom)
         for layer in self.layers.iter_mut().rev() {
             if let Err(e) = layer.unmount() {
                 warn!(

@@ -1,0 +1,64 @@
+#!/bin/sh
+# sq-start — start the sq-sandbox daemon stack
+#
+# Works on bare metal, NixOS, or any Linux host. No Docker required.
+# Starts: secret proxy (optional), tailscale (optional), init, reaper, daemon.
+#
+# Usage: sq-start [squashd-binary]
+#   If no argument given, falls back to: squashd → start-api (busybox httpd)
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="$SCRIPT_DIR:$PATH"
+
+DATA="${SQUASH_DATA:-/data}"
+echo "[sq-start] data=$DATA"
+
+# ── Secret proxy ──────────────────────────────────────────────────────
+if [ -f "$DATA/secrets.json" ]; then
+    if [ "${SQUASH_PROXY_HTTPS:-}" = "1" ]; then
+        _proxy_ca_dir="$DATA/proxy-ca"
+        if [ ! -f "$_proxy_ca_dir/ca.crt" ]; then
+            mkdir -p "$_proxy_ca_dir"
+            openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+                -days 3650 -nodes -x509 \
+                -subj "/CN=sq-secret-proxy CA" \
+                -keyout "$_proxy_ca_dir/ca.key" \
+                -out "$_proxy_ca_dir/ca.crt" 2>/dev/null
+            chmod 600 "$_proxy_ca_dir/ca.key"
+            echo "[sq-start] generated proxy CA certificate"
+        fi
+        sq-secret-proxy-https &
+        echo "[sq-start] HTTPS secret proxy started (pid $!)"
+    else
+        sq-secret-proxy &
+        echo "[sq-start] HTTP secret proxy started (pid $!)"
+    fi
+fi
+
+# ── Tailscale ─────────────────────────────────────────────────────────
+if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+    setup-tailscale &
+    echo "[sq-start] tailscale setup started (pid $!)"
+fi
+
+# ── Init + Reaper ─────────────────────────────────────────────────────
+# Determine which daemon to run
+daemon="${1:-}"
+if [ -z "$daemon" ]; then
+    if command -v squashd >/dev/null 2>&1; then
+        daemon="squashd"
+    else
+        daemon="start-api"
+    fi
+fi
+
+# If using start-api (shell/CGI mode), run init and reaper externally
+if [ "$daemon" = "start-api" ]; then
+    sq-init
+    sq-reaper &
+    echo "[sq-start] reaper started (pid $!)"
+fi
+
+echo "[sq-start] starting $daemon"
+exec "$daemon"

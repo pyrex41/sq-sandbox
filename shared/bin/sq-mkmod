@@ -202,7 +202,11 @@ case "${1:-help}" in
             go|golang)   preset_golang ;;
             rust)        preset_rust ;;
             build*|dev*) preset_build_tools ;;
-            tailscale)   preset_tailscale ;;
+    tailscale)   preset_tailscale ;;
+  sqlite-libs) preset_sqlite_libs ;;
+  nullclaw)    preset_nullclaw ;; 
+  nullclaw)    preset_nullclaw ;;
+
             *)           die "unknown preset: ${2:-}. Run '$0 list'" ;;
         esac
         ;;

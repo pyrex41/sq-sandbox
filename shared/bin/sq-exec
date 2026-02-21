@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "Usage: sq-exec <merged-root> <cmd> [workdir] [timeout]" >&2
+    echo "  merged-root  overlayfs merged directory (chroot/bwrap target)" >&2
+    echo "  cmd          shell command to execute" >&2
+    echo "  workdir      working directory inside sandbox (default: /)" >&2
+    echo "  timeout      seconds before kill (default: 300)" >&2
+    exit 1
+}
+
+[ $# -lt 2 ] && usage
+
+root="$1"
+cmd="$2"
+workdir="${3:-/}"
+timeout_s="${4:-300}"
+
+# Try bubblewrap first (unprivileged, pivot_root-based)
+if command -v bwrap >/dev/null 2>&1; then
+    timeout "$timeout_s" bwrap \
+        --bind "$root" / \
+        --dev /dev \
+        --proc /proc \
+        --tmpfs /tmp \
+        --tmpfs /run \
+        --ro-bind /etc/resolv.conf /etc/resolv.conf \
+        --unshare-pid \
+        --unshare-ipc \
+        --unshare-uts \
+        --die-with-parent \
+        --chdir "$workdir" \
+        /bin/sh -c "$cmd" && exit 0 || rc=$?
+
+    # If bwrap failed due to pivot_root (common inside containers), fall through
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+        # 124 = timeout, which is a legitimate result, not a bwrap failure
+        echo "[sq-exec] bwrap failed (rc=$rc), falling back to unshare+chroot" >&2
+    else
+        exit "$rc"
+    fi
+fi
+
+# Fallback: unshare + chroot (works as root, or with user namespaces)
+exec timeout "$timeout_s" \
+    unshare --mount --pid --ipc --uts --fork --map-root-user \
+    chroot "$root" \
+    /bin/sh -c "cd \"$workdir\" 2>/dev/null || true; $cmd"

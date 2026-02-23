@@ -263,7 +263,7 @@ _handle_exec :: proc(req: ^Http_Request, resp: ^Http_Response) {
 			// unreachable
 		case .Not_Ready:
 			_json_error(resp, 400, "sandbox not ready")
-		case .Pipe_Failed, .Fork_Failed, .Netns_Open_Failed:
+		case .Pipe_Failed, .Fork_Failed:
 			_json_error(resp, 500, "exec failed")
 		}
 		return
@@ -617,7 +617,6 @@ _rebuild_mounts_for_metadata :: proc(ms: ^Managed_Sandbox) -> bool {
 		modules_dir   = modules_dir(_api_config),
 		layers        = layers,
 		snapshot_path = snap_path,
-		upper_size_mb = _api_config.upper_limit_mb,
 	}
 	new_mounts, m_err := sandbox_mounts_setup(&params, managed_sandbox_allocator(ms))
 	if m_err != .None {

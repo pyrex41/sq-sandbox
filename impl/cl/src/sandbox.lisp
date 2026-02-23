@@ -61,22 +61,13 @@
 
 (defun destroy-sandbox (sandbox)
   "Destroy all resources associated with SANDBOX.
-   Unmounts filesystems, tears down netns, removes cgroup.
-   Each step is individually error-isolated.
+   Unmounts filesystems. Each step is individually error-isolated.
    Sets state to :destroyed when complete."
   (setf (sandbox-state sandbox) :destroying)
 
-  ;; 1. Tear down mounts (overlay → snapshot → tmpfs → squashfs in reverse)
+  ;; Tear down mounts (overlay → snapshot → squashfs in reverse)
   (when (sandbox-mounts sandbox)
     (ignore-errors (destroy-sandbox-mounts (sandbox-mounts sandbox))))
-
-  ;; 2. Tear down network namespace
-  (when (sandbox-netns sandbox)
-    (ignore-errors (teardown-netns (sandbox-netns sandbox))))
-
-  ;; 3. Remove cgroup
-  (when (sandbox-cgroup sandbox)
-    (ignore-errors (destroy-cgroup (sandbox-cgroup sandbox))))
 
   (setf (sandbox-state sandbox) :destroyed)
   sandbox)

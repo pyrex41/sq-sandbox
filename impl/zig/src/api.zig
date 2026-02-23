@@ -270,7 +270,6 @@ fn handleHealth(request: *http.Server.Request, cfg: *const Config, allocator: st
 }
 
 fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
-
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -310,7 +309,6 @@ fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config, alloca
 }
 
 fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
-
     if (!requireJsonContentType(request, allocator)) return;
 
     const parsed = readJsonBody(json_mod.CreateRequest, request, allocator) catch {
@@ -459,7 +457,6 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config, alloca
 }
 
 fn handleGetSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -513,7 +510,6 @@ fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []
 }
 
 fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-
     if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
@@ -698,7 +694,6 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
 }
 
 fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -740,7 +735,6 @@ fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const
 }
 
 fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-
     if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
@@ -794,7 +788,6 @@ fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const
 }
 
 fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-
     if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
@@ -1032,7 +1025,6 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
 }
 
 fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-
     if (!requireJsonContentType(request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
@@ -1158,7 +1150,6 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
 }
 
 fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
-
     var mod_dir_buf: [256]u8 = undefined;
     const mod_dir_path = cfg.modulesDir(&mod_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -1213,23 +1204,23 @@ fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocato
             if (s3_client.list(allocator, "modules/")) |remote_keys| {
                 defer s3_mod.S3Client.freeList(allocator, remote_keys);
                 for (remote_keys) |key| {
-                const name = if (std.mem.startsWith(u8, key, "modules/"))
-                    key["modules/".len..]
-                else
-                    key;
-                if (!std.mem.endsWith(u8, name, ".squashfs")) continue;
-                const stem = name[0 .. name.len - ".squashfs".len];
-                if (stem.len == 0 or local_set.contains(stem)) continue;
-                const duped_name = allocator.dupe(u8, stem) catch continue;
-                list.append(allocator, json_mod.ModuleInfo{
-                    .name = duped_name,
-                    .size = 0,
-                    .location = "s3",
-                }) catch {
-                    allocator.free(duped_name);
-                    continue;
-                };
-            }
+                    const name = if (std.mem.startsWith(u8, key, "modules/"))
+                        key["modules/".len..]
+                    else
+                        key;
+                    if (!std.mem.endsWith(u8, name, ".squashfs")) continue;
+                    const stem = name[0 .. name.len - ".squashfs".len];
+                    if (stem.len == 0 or local_set.contains(stem)) continue;
+                    const duped_name = allocator.dupe(u8, stem) catch continue;
+                    list.append(allocator, json_mod.ModuleInfo{
+                        .name = duped_name,
+                        .size = 0,
+                        .location = "s3",
+                    }) catch {
+                        allocator.free(duped_name);
+                        continue;
+                    };
+                }
             } else |_| {}
         }
     }
@@ -1307,8 +1298,13 @@ fn doFirecrackerSnapshot(
     // Get file size (the guest should have created the snapshot file)
     const stat = std.fs.cwd().statFile(snap_path) catch blk: {
         break :blk std.fs.File.Stat{
-            .inode = 0, .size = 0, .mode = 0, .kind = .file,
-            .atime = 0, .mtime = 0, .ctime = 0,
+            .inode = 0,
+            .size = 0,
+            .mode = 0,
+            .kind = .file,
+            .atime = 0,
+            .mtime = 0,
+            .ctime = 0,
         };
     };
 
@@ -1749,25 +1745,15 @@ fn provisionSandboxResources(
     }
 
     var upper_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const upper_z = try std.fmt.bufPrintZ(&upper_buf, "{s}/upper", .{sandbox_path});
-    _ = try mounts_mod.TmpfsMount.mount(upper_z, cfg.upper_limit_mb);
+    const upper_path = try std.fmt.bufPrint(&upper_buf, "{s}/upper", .{sandbox_path});
+    std.fs.makeDirAbsolute(upper_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(try std.fmt.bufPrint(&upper_buf, "{s}/upper/data", .{sandbox_path})) catch {};
+    std.fs.makeDirAbsolute(try std.fmt.bufPrint(&upper_buf, "{s}/upper/work", .{sandbox_path})) catch {};
 
     try remountOverlayForSandbox(allocator, sandbox_path);
-
-    if (cgroup_mod.CgroupHandle.create(sandbox_id, cpu, memory_mb)) |cg| {
-        writeMetaFile(sandbox_path, "cgroup_path", cg.path());
-    } else |_| {}
-
-    if (netns_mod.NetnsHandle.setup(allocator, cfg.data_dir, sandbox_id, allow_net)) |ns| {
-        writeMetaFile(sandbox_path, "netns_name", ns.name);
-        writeMetaFile(sandbox_path, "veth_host", ns.veth_host);
-
-        var idx_buf: [8]u8 = undefined;
-        const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{ns.index}) catch "0";
-        writeMetaFile(sandbox_path, "netns_index", idx_str);
-
-        netns_mod.seedResolvConf(cfg.data_dir, sandbox_id, ns.index) catch {};
-    } else |_| {}
 
     writeMetaFile(sandbox_path, "mounted", "1");
 }
@@ -1832,17 +1818,6 @@ fn runCommandSilent(allocator: std.mem.Allocator, argv: []const []const u8) void
     }) catch return;
     allocator.free(result.stdout);
     allocator.free(result.stderr);
-}
-
-fn cgroupHandleFromPath(path: []const u8) ?cgroup_mod.CgroupHandle {
-    var handle = cgroup_mod.CgroupHandle{
-        .path_buf = undefined,
-        .path_len = 0,
-    };
-    if (path.len > handle.path_buf.len) return null;
-    @memcpy(handle.path_buf[0..path.len], path);
-    handle.path_len = path.len;
-    return handle;
 }
 
 fn mountModuleLayer(sandbox_path: []const u8, module_path: []const u8, module_name: []const u8) !void {
@@ -1970,43 +1945,6 @@ pub fn teardownSandboxResources(allocator: std.mem.Allocator, sandbox_path: []co
             };
             layer_mount.deinit();
         } else |_| {}
-    }
-
-    var upper_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.fmt.bufPrintZ(&upper_buf, "{s}/upper", .{sandbox_path})) |upper_z| {
-        var tmpfs = mounts_mod.TmpfsMount{
-            .mount_point = upper_z,
-            .active = true,
-        };
-        tmpfs.deinit();
-    } else |_| {}
-
-    const cgroup_path = readMetaFile(allocator, sandbox_path, "cgroup_path") catch null;
-    defer if (cgroup_path) |p| allocator.free(p);
-    if (cgroup_path) |path| {
-        if (cgroupHandleFromPath(path)) |cg_value| {
-            var cg = cg_value;
-            cg.deinit();
-        }
-    } else {
-        var default_cg_buf: [256]u8 = undefined;
-        if (std.fmt.bufPrint(&default_cg_buf, "/sys/fs/cgroup/squash-{s}", .{id})) |p| {
-            if (cgroupHandleFromPath(p)) |cg_value| {
-                var cg = cg_value;
-                cg.deinit();
-            }
-        } else |_| {}
-    }
-
-    const netns_name = readMetaFile(allocator, sandbox_path, "netns_name") catch null;
-    defer if (netns_name) |n| allocator.free(n);
-    if (netns_name) |name| {
-        const veth_host = std.fmt.allocPrint(allocator, "sq-{s}-h", .{id}) catch "";
-        defer if (veth_host.len > 0) allocator.free(veth_host);
-        if (veth_host.len > 0) {
-            runCommandSilent(allocator, &.{ "ip", "link", "delete", veth_host });
-        }
-        runCommandSilent(allocator, &.{ "ip", "netns", "delete", name });
     }
 }
 

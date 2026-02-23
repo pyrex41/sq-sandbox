@@ -48,7 +48,7 @@ for sdir in "$SANDBOXES"/*/; do
     [ ! -f "$sdir/.meta/layers" ] && continue
     id=$(basename "$sdir")
 
-    if grep -q "$sdir/merged" /proc/mounts 2>/dev/null; then
+    if mountpoint -q "$sdir/merged" 2>/dev/null; then
         log "$id: already mounted"
         continue
     fi
@@ -71,7 +71,7 @@ for sdir in "$SANDBOXES"/*/; do
         fi
         mkdir -p "$local_mp"
         mountpoint -q "$local_mp" 2>/dev/null || \
-            mount -o loop,ro -t squashfs "$sqfs" "$local_mp" 2>/dev/null || \
+            sq-mount-layer "$sqfs" "$local_mp" 2>/dev/null || \
             { log "  WARN: mount failed: $mod"; continue; }
     done
 
@@ -82,7 +82,7 @@ for sdir in "$SANDBOXES"/*/; do
         if [ -f "$snapfile" ]; then
             mkdir -p "$sdir/images/_snapshot"
             mountpoint -q "$sdir/images/_snapshot" 2>/dev/null || \
-                mount -o loop,ro -t squashfs "$snapfile" "$sdir/images/_snapshot" 2>/dev/null || true
+                sq-mount-layer "$snapfile" "$sdir/images/_snapshot" 2>/dev/null || true
         fi
     fi
 
@@ -101,9 +101,8 @@ for sdir in "$SANDBOXES"/*/; do
     done
 
     if [ -n "$lower" ]; then
-        mount -t overlay overlay \
-            -o "lowerdir=$lower,upperdir=$sdir/upper,workdir=$sdir/work" \
-            "$sdir/merged" 2>/dev/null && log "$id: ok" || log "$id: FAILED"
+        sq-mount-overlay "$lower" "$sdir/upper" "$sdir/work" "$sdir/merged" \
+            2>/dev/null && log "$id: ok" || log "$id: FAILED"
     fi
 done
 fi

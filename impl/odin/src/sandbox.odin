@@ -16,8 +16,6 @@ Creating :: struct {}
 
 Ready :: struct {
 	mounts: Sandbox_Mounts,
-	netns:  Maybe(Netns_Handle),
-	cgroup: Maybe(Cgroup_Handle),
 }
 
 Executing :: struct {
@@ -69,16 +67,17 @@ Sandbox :: struct {
 
 // ---------------------------------------------------------------------------
 // Create_Error — errors during sandbox creation
+//
+// Note: Tmpfs_Failed, Cgroup_Failed, Netns_Failed removed — unprivileged mode
+// uses plain directories for upper layer and delegates resource limits/network
+// isolation to sq-exec/bwrap.
 // ---------------------------------------------------------------------------
 
 Create_Error :: enum {
 	None,
 	Dir_Failed,
-	Tmpfs_Failed,
 	Squashfs_Failed,
 	Overlay_Failed,
-	Cgroup_Failed,
-	Netns_Failed,
 	Resolv_Failed,
 	Secrets_Failed,
 	Meta_Failed,
@@ -88,13 +87,9 @@ Create_Error :: enum {
 sandbox_set_ready :: proc(
 	s: ^Sandbox,
 	mounts: Sandbox_Mounts,
-	netns: Maybe(Netns_Handle),
-	cgroup: Maybe(Cgroup_Handle),
 ) {
 	s.state = Ready{
 		mounts = mounts,
-		netns  = netns,
-		cgroup = cgroup,
 	}
 }
 
@@ -133,16 +128,11 @@ sandbox_create :: proc(
 		_remove_dir_recursive(sdir)
 	}
 
-	// 2. Mount tmpfs for upper layer (size-limited writable layer)
-	upper_path := fmt.tprintf("%s/upper", sdir)
-	tmpfs, tmpfs_err := tmpfs_mount(upper_path, config.upper_limit_mb, allocator)
-	if tmpfs_err != .None {
-		fmt.printfln("[sandbox] %s: tmpfs mount failed", sandbox.id)
-		return .Tmpfs_Failed
-	}
-	defer if err != .None {
-		tmpfs_unmount(&tmpfs)
-	}
+	// 2. Create upper layer directories (plain directories in unprivileged mode)
+	upper_data := fmt.tprintf("%s/upper/data", sdir)
+	work := fmt.tprintf("%s/upper/work", sdir)
+	_ensure_dir_recursive(upper_data)
+	_ensure_dir_recursive(work)
 
 	// 3. Loop-mount each squashfs module layer
 	sqfs_mounts := make([dynamic]Squashfs_Mount, allocator = allocator)
@@ -180,8 +170,6 @@ sandbox_create :: proc(
 	_sort_strings_descending(lower_components[:])
 
 	// 4. Mount overlay filesystem
-	upper_data := fmt.tprintf("%s/upper/data", sdir)
-	work := fmt.tprintf("%s/upper/work", sdir)
 	merged := fmt.tprintf("%s/merged", sdir)
 	overlay, ov_err := overlay_mount(lower_components[:], upper_data, work, merged, allocator)
 	if ov_err != .None {
@@ -192,72 +180,35 @@ sandbox_create :: proc(
 		overlay_unmount(&overlay)
 	}
 
-	// 5. Create cgroup (best effort — failure is non-fatal)
-	cgroup: Maybe(Cgroup_Handle)
-	cg, cg_err := cgroup_create(sandbox.id, opts.cpu, opts.memory_mb, allocator)
-	if cg_err == .None {
-		cgroup = cg
-	} else {
-		fmt.printfln("[sandbox] %s: cgroup creation failed (non-fatal)", sandbox.id)
-	}
-	defer if err != .None {
-		if cg_handle, ok := &cgroup.?; ok {
-			cgroup_destroy(cg_handle)
-		}
-	}
-
-	// 6. Set up network namespace (always created for isolation)
-	netns: Maybe(Netns_Handle)
-	ns, ns_err := netns_setup(config, sandbox.id, opts.allow_net, allocator)
-	if ns_err == .None {
-		netns = ns
-	} else {
-		// Netns failure is non-fatal in matching shell behavior (|| true)
-		fmt.printfln("[sandbox] %s: netns setup failed (non-fatal)", sandbox.id)
-	}
-	defer if err != .None {
-		if ns_handle, ok := &netns.?; ok {
-			netns_teardown(ns_handle)
-		}
-	}
-
-	// Get netns index for resolv.conf and secret injection
-	netns_index: u8 = 0
-	if ns_handle, ok := netns.?; ok {
-		netns_index = ns_handle.index
-	}
-
-	// 7. Seed /etc/resolv.conf
-	resolv_err := seed_resolv_conf(sdir, netns_index)
+	// 5. Seed /etc/resolv.conf
+	resolv_err := seed_resolv_conf(sdir, 0)
 	if resolv_err != .None {
 		fmt.printfln("[sandbox] %s: resolv.conf seeding failed", sandbox.id)
 		return .Resolv_Failed
 	}
 
-	// 8. Inject secret placeholders
-	secrets_err := inject_secret_placeholders(config, sdir, netns_index)
+	// 6. Inject secret placeholders
+	secrets_err := inject_secret_placeholders(config, sdir, 0)
 	if secrets_err != .None && secrets_err != .File_Not_Found {
 		fmt.printfln("[sandbox] %s: secret injection failed", sandbox.id)
 		return .Secrets_Failed
 	}
 
-	// 9. Write metadata files
-	meta_err := write_meta(sdir, sandbox.id, opts, netns_index)
+	// 7. Write metadata files
+	meta_err := write_meta(sdir, sandbox.id, opts, 0)
 	if meta_err != .None {
 		fmt.printfln("[sandbox] %s: metadata write failed", sandbox.id)
 		return .Meta_Failed
 	}
 
 	// All succeeded — transition sandbox to Ready state
-	// Build Sandbox_Mounts from the acquired resources
 	mounts := Sandbox_Mounts{
 		sqfs_mounts    = sqfs_mounts,
 		snapshot_mount = nil,
-		tmpfs          = tmpfs,
 		overlay        = overlay,
 	}
 
-	sandbox_set_ready(sandbox, mounts, netns, cgroup)
+	sandbox_set_ready(sandbox, mounts)
 	fmt.printfln("[sandbox] %s: created", sandbox.id)
 
 	return .None
@@ -307,7 +258,7 @@ sandbox_create_firecracker :: proc(
 	net_err := firecracker_setup_network(sandbox.id, tap_index, opts.allow_net)
 	if net_err != .None {
 		fmt.printfln("[sandbox-fc] %s: network setup failed", sandbox.id)
-		return .Netns_Failed
+		return .Meta_Failed
 	}
 	defer if err != .None {
 		firecracker_teardown_network(sandbox.id, tap_index)
@@ -357,7 +308,7 @@ sandbox_create_firecracker :: proc(
 	mounts := Sandbox_Mounts{
 		sqfs_mounts = make([dynamic]Squashfs_Mount, allocator),
 	}
-	sandbox_set_ready(sandbox, mounts, nil, nil)
+	sandbox_set_ready(sandbox, mounts)
 	fmt.printfln("[sandbox-fc] %s: created (cid=%d)", sandbox.id, cid)
 
 	return .None
@@ -397,18 +348,8 @@ sandbox_destroy_firecracker :: proc(s: ^Sandbox) {
 sandbox_destroy :: proc(s: ^Sandbox) {
 	// Only tear down resources if in Ready state
 	if ready, ok := &s.state.(Ready); ok {
-		// 1. Mounts (reverse order handled by sandbox_mounts_destroy)
+		// Mounts (reverse order handled by sandbox_mounts_destroy)
 		sandbox_mounts_destroy(&ready.mounts)
-
-		// 2. Cgroup
-		if cg, cg_ok := &ready.cgroup.?; cg_ok {
-			cgroup_destroy(cg)
-		}
-
-		// 3. Network namespace
-		if ns, ns_ok := &ready.netns.?; ns_ok {
-			netns_teardown(ns)
-		}
 	}
 	s.state = Destroying{}
 }

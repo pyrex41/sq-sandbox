@@ -1,0 +1,80 @@
+# sq-sandbox/.gitlab-ci.yml
+# Builds squashd (zig) + squashfs modules via Nix, pushes OCI image to ECR
+
+variables:
+  ECR_REGISTRY: "620666897359.dkr.ecr.us-east-2.amazonaws.com"
+  ECR_IMAGE: "fg-claude-bot-sandbox"
+  AWS_DEFAULT_REGION: "us-east-2"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - build
+  - publish
+
+.nix-base:
+  image: nixos/nix:latest
+  tags:
+    - kubernetes
+    - small
+  variables:
+    NIX_CONFIG: "experimental-features = nix-command flakes"
+  before_script:
+    - nix --version
+
+# MR pipelines: just verify builds succeed (no artifacts needed)
+build-zig:
+  extends: .nix-base
+  stage: build
+  script:
+    - nix build .#image-zig -L
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+build-modules:
+  extends: .nix-base
+  stage: build
+  script:
+    - nix build .#module-base-alpine -L
+    - nix build .#module-nodejs22 -L
+    - nix build .#sq-secret-proxy -L
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Main branch: build and push in one step (avoids artifact size limits)
+publish-image:
+  extends: .nix-base
+  stage: publish
+  script:
+    - nix build .#image-zig -L
+    - nix profile install nixpkgs#skopeo
+    - >
+      nix run nixpkgs#awscli2 --
+      ecr get-login-password --region $AWS_DEFAULT_REGION |
+      skopeo login --username AWS --password-stdin $ECR_REGISTRY
+    - skopeo copy --insecure-policy
+      docker-archive:result
+      docker://$ECR_REGISTRY/$ECR_IMAGE:zig-latest
+    - skopeo copy --insecure-policy
+      docker-archive:result
+      docker://$ECR_REGISTRY/$ECR_IMAGE:zig-sha-$CI_COMMIT_SHORT_SHA
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+publish-modules:
+  extends: .nix-base
+  stage: publish
+  script:
+    - nix build .#module-base-alpine -o result-base -L
+    - nix build .#module-nodejs22 -o result-node -L
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-base s3://fg-squash-sandbox/modules/000-base-alpine.squashfs
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-node s3://fg-squash-sandbox/modules/100-nodejs22.squashfs
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

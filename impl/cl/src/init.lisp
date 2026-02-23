@@ -125,55 +125,56 @@ Returns NIL if no valid index is present."
         nil))))
 
 (defun remount-sandbox-filesystems (manager sandbox-dir id layers)
-  "Remount squashfs layers, tmpfs, and overlay for a recovered sandbox.
+  "Remount squashfs layers and overlay for a recovered sandbox.
    Returns a sandbox-mounts struct on success, NIL on failure."
   (let ((config (manager-config manager)))
     (handler-case
         (let* ((upper-path (format nil "~A/upper" sandbox-dir))
                (merged-path (format nil "~A/merged" sandbox-dir))
-               ;; 1. Mount tmpfs for upper layer
-               (tmpfs (mount-tmpfs upper-path
-                                   (or (config-upper-limit-mb config) 512)))
-               ;; 2. Mount squashfs layers
                (sqfs-mounts (make-array (length layers))))
-          (with-rollback-on-error (tmpfs-guard tmpfs (unmount-tmpfs tmpfs-guard))
-            (loop for layer in layers
-                  for i from 0
-                  for mod-path = (format nil "~A/~A.squashfs"
-                                         (modules-dir config) layer)
-                  for mp = (format nil "~A/images/~A.squashfs"
-                                   sandbox-dir layer)
-                  do (setf (aref sqfs-mounts i)
-                           (mount-squashfs mod-path mp)))
-            ;; 3. Overlay
-            (let* ((lower-components
-                     (loop for m across sqfs-mounts
-                           collect (squashfs-mount-mount-point m)))
-                   (overlay (mount-overlay lower-components
-                                           (format nil "~A/data" upper-path)
-                                           (format nil "~A/work" upper-path)
-                                           merged-path)))
-              (make-sandbox-mounts
-               :squashfs-mounts sqfs-mounts
-               :tmpfs tmpfs
-               :overlay overlay))))
+          ;; Ensure upper/data and upper/work dirs exist
+          (ensure-directories-exist (format nil "~A/data/" upper-path))
+          (ensure-directories-exist (format nil "~A/work/" upper-path))
+          ;; 1. Mount squashfs layers
+          (loop for layer in layers
+                for i from 0
+                for mod-path = (format nil "~A/~A.squashfs"
+                                       (modules-dir config) layer)
+                for mp = (format nil "~A/images/~A.squashfs"
+                                 sandbox-dir layer)
+                do (setf (aref sqfs-mounts i)
+                         (mount-squashfs mod-path mp)))
+          ;; 2. Overlay
+          (let* ((lower-components
+                   (loop for m across sqfs-mounts
+                         collect (squashfs-mount-mount-point m)))
+                 (overlay (mount-overlay lower-components
+                                         (format nil "~A/data" upper-path)
+                                         (format nil "~A/work" upper-path)
+                                         merged-path)))
+            (make-sandbox-mounts
+             :squashfs-mounts sqfs-mounts
+             :overlay overlay)))
       (error (e)
         (log:warn "init: remount error for ~A: ~A" id e)
         nil))))
 
 (defun cleanup-sandbox-dir (sandbox-dir)
   "Best-effort cleanup of a sandbox directory's mounts and files."
-  (let ((merged (format nil "~A/merged" sandbox-dir))
-        (upper (format nil "~A/upper" sandbox-dir)))
-    ;; Try unmounting in reverse order
-    (ignore-errors (%umount2 merged +mnt-detach+))
-    (ignore-errors (%umount2 upper +mnt-detach+))
+  (let ((merged (format nil "~A/merged" sandbox-dir)))
+    ;; Try unmounting overlay
+    (ignore-errors
+      (uiop:run-program (list "sq-mount-overlay" "--unmount" merged)
+                         :output nil :error-output nil :ignore-error-status t))
     ;; Unmount any squashfs layers under images/
     (let ((images-dir (format nil "~A/images" sandbox-dir)))
       (when (probe-file images-dir)
         (dolist (entry (uiop:subdirectories images-dir))
           (ignore-errors
-            (%umount2 (namestring entry) +mnt-detach+)))))))
+            (uiop:run-program (list "sq-mount-layer" "--unmount"
+                                     (namestring entry))
+                               :output nil :error-output nil
+                               :ignore-error-status t)))))))
 
 (defun read-sandbox-meta (sandbox-dir)
   "Read .meta/sandbox.json from SANDBOX-DIR. Returns a plist or NIL."

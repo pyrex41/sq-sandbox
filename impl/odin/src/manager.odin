@@ -372,7 +372,7 @@ _recover_managed_sandbox :: proc(
 		mounts := Sandbox_Mounts{
 			sqfs_mounts = empty_sqfs,
 		}
-		sandbox_set_ready(&ms.sandbox, mounts, nil, nil)
+		sandbox_set_ready(&ms.sandbox, mounts)
 		ms.sandbox.max_lifetime_s = max_lifetime_s
 		ms.sandbox.last_active = time.now()
 		return ms
@@ -411,36 +411,13 @@ _recover_managed_sandbox :: proc(
 	mounts := Sandbox_Mounts{
 		sqfs_mounts    = sqfs_mounts,
 		snapshot_mount = snapshot_mount,
-		tmpfs          = Tmpfs_Mount{
-			mount_point = strings_clone(upper_mp, sa),
-			active      = true,
-		},
 		overlay        = Overlay_Mount{
 			merged_path = strings_clone(merged_mp, sa),
 			active      = true,
 		},
 	}
 
-	// Recreate cgroup/netns handles best-effort from metadata.
-	cgroup: Maybe(Cgroup_Handle)
-	cg_path := fmt.tprintf("/sys/fs/cgroup/squash-%s", id)
-	if os.exists(cg_path) {
-		cgroup = Cgroup_Handle{path = strings_clone(cg_path, sa)}
-	}
-
-	netns: Maybe(Netns_Handle)
-	netns_index := _read_meta_u64(sdir, "netns_index", 0)
-	if netns_index > 0 && netns_index <= 254 {
-		netns = Netns_Handle{
-			name       = strings_clone(fmt.tprintf("squash-%s", id), sa),
-			index      = u8(netns_index),
-			veth_host  = strings_clone(fmt.tprintf("sq-%s-h", id), sa),
-			chain_name = nil,
-			host_dns   = nil,
-		}
-	}
-
-	sandbox_set_ready(&ms.sandbox, mounts, netns, cgroup)
+	sandbox_set_ready(&ms.sandbox, mounts)
 	ms.sandbox.max_lifetime_s = max_lifetime_s
 	ms.sandbox.last_active = time.now()
 	return ms

@@ -1,10 +1,12 @@
 # sq-sandbox/.gitlab-ci.yml
-# Builds squashd (zig) + squashfs modules via Nix, pushes OCI image to ECR
+# Builds squashd (zig) daemon, base modules (000/100), and agent modules (200)
+# Pushes OCI image to ECR and squashfs modules to S3
 
 variables:
   ECR_REGISTRY: "620666897359.dkr.ecr.us-east-2.amazonaws.com"
   ECR_IMAGE: "fg-claude-bot-sandbox"
   AWS_DEFAULT_REGION: "us-east-2"
+  S3_BUCKET: "fg-squash-sandbox"
 
 workflow:
   rules:
@@ -25,7 +27,8 @@ stages:
   before_script:
     - nix --version
 
-# MR pipelines: just verify builds succeed (no artifacts needed)
+# ── MR pipelines: verify builds succeed ─────────────────────────
+
 build-zig:
   extends: .nix-base
   stage: build
@@ -34,17 +37,29 @@ build-zig:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
-build-modules:
+build-base-modules:
   extends: .nix-base
   stage: build
   script:
     - nix build .#module-base-alpine -L
     - nix build .#module-nodejs22 -L
+    - nix build .#module-python312 -L
     - nix build .#sq-secret-proxy -L
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
-# Main branch: build and push in one step (avoids artifact size limits)
+build-agent-modules:
+  extends: .nix-base
+  stage: build
+  script:
+    - nix build .#module-nullclaw -L
+    - nix build .#module-claude-code -L
+    - nix build .#module-odin-claw -L
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ── Main branch: build and push ─────────────────────────────────
+
 publish-image:
   extends: .nix-base
   stage: publish
@@ -68,13 +83,32 @@ publish-modules:
   extends: .nix-base
   stage: publish
   script:
+    # Base layers
     - nix build .#module-base-alpine -o result-base -L
     - nix build .#module-nodejs22 -o result-node -L
+    - nix build .#module-python312 -o result-python -L
+    # Agent layers
+    - nix build .#module-nullclaw -o result-nullclaw -L
+    - nix build .#module-claude-code -o result-claude -L
+    - nix build .#module-odin-claw -o result-odin -L
+    # Push all to S3
     - >
       nix run nixpkgs#awscli2 --
-      s3 cp result-base s3://fg-squash-sandbox/modules/000-base-alpine.squashfs
+      s3 cp result-base s3://$S3_BUCKET/modules/000-base-alpine.squashfs
     - >
       nix run nixpkgs#awscli2 --
-      s3 cp result-node s3://fg-squash-sandbox/modules/100-nodejs22.squashfs
+      s3 cp result-node s3://$S3_BUCKET/modules/100-nodejs22.squashfs
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-python s3://$S3_BUCKET/modules/100-python312.squashfs
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-nullclaw s3://$S3_BUCKET/modules/200-nullclaw.squashfs
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-claude s3://$S3_BUCKET/modules/200-claude-code.squashfs
+    - >
+      nix run nixpkgs#awscli2 --
+      s3 cp result-odin s3://$S3_BUCKET/modules/200-odin-claw.squashfs
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

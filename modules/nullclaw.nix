@@ -1,27 +1,62 @@
-{ pkgs, lib }:
+# Build nullclaw from source and package as squashfs module.
+# Uses pkgs-unstable for Zig 0.15.2+.
+{ pkgs, pkgs-unstable, lib, nullclaw-src, mkSquashfsModule }:
 let
-  pkgsMusl = import nixpkgs {
-    inherit (pkgs) system;
-    crossSystem = { libc = &quot;musl&quot;; };
+  # Determine target triple for cross-compilation
+  target = if pkgs.stdenv.hostPlatform.isAarch64
+    then "aarch64-linux-musl"
+    else "x86_64-linux-musl";
+
+  nullclaw = pkgs.stdenv.mkDerivation {
+    pname = "nullclaw";
+    version = "0-unstable";
+    src = nullclaw-src;
+
+    nativeBuildInputs = [ pkgs-unstable.zig ];
+
+    # Zig manages its own cache; point it at a writable directory
+    ZIG_GLOBAL_CACHE_DIR = "$TMPDIR/zig-cache";
+
+    buildPhase = ''
+      runHook preBuild
+      mkdir -p $TMPDIR/zig-cache
+      zig build -Doptimize=ReleaseSmall -Dtarget=${target} \
+        --global-cache-dir $TMPDIR/zig-cache
+      runHook postBuild
+    '';
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/bin
+      cp zig-out/bin/nullclaw $out/bin/
+      runHook postInstall
+    '';
+
+    # Zig handles its own parallelism
+    enableParallelBuilding = false;
   };
-  src = pkgs.fetchgit {
-    url = &quot;https://github.com/nullclaw/nullclaw&quot;;
-    rev = &quot;main&quot;;
-    hash = &quot;sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=&quot;; # TODO: nix-prefetch
-  };
-in lib.mkSquashfsModule {
-  name = &quot;200-nullclaw&quot;;
+in
+mkSquashfsModule {
+  name = "200-nullclaw";
   buildScript = ''
-    export HOME=$TMPDIR
-    export XDG_CACHE_HOME=$TMPDIR/.cache
-    mkdir -p $rootfs/usr/local/bin
-    cd ${src}
-    zig=${pkgs.zig}/bin/zig build \\
-      -Doptimize=ReleaseSmall \\
-      -Dtarget=aarch64-linux-musl \\
-      -Dsqlite-include=${pkgsMusl.sqlite.dev}/include \\
-      -Dsqlite-lib=${pkgsMusl.sqlite.out}/lib
-    cp zig-out/bin/nullclaw $rootfs/usr/local/bin/
-    $rootfs/usr/local/bin/nullclaw --version || true
+    mkdir -p "$rootfs/usr/local/bin"
+    cp ${nullclaw}/bin/nullclaw "$rootfs/usr/local/bin/"
+
+    # Default config template
+    mkdir -p "$rootfs/etc/nullclaw"
+    cat > "$rootfs/etc/nullclaw/config.json.template" <<'TMPL'
+{
+  "models": {
+    "default_provider": "anthropic",
+    "default_model": "anthropic/claude-sonnet-4",
+    "providers": [
+      {
+        "name": "anthropic",
+        "api_key": "sq-secret-NULLCLAW_API_KEY"
+      }
+    ]
+  }
+}
+TMPL
   '';
 }

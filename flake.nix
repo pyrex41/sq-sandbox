@@ -5,9 +5,14 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+
+    # Agent sources — flake = false so we get source trees without pulling
+    # in their flake dependencies (zig2nix, etc.)
+    nullclaw-src = { url = "github:nullclaw/nullclaw"; flake = false; };
+    odin-claw-src = { url = "github:pyrex41/odin-claw"; flake = false; };
   };
 
-  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils, nullclaw-src, odin-claw-src }:
     flake-utils.lib.eachSystem [
       "x86_64-linux" "aarch64-linux" "aarch64-darwin"
     ] (system:
@@ -16,9 +21,11 @@
         pkgs-unstable = import nixpkgs-unstable { inherit system; };
         isLinux = pkgs.stdenv.isLinux;
 
-        # ── Squashfs modules ──────────────────────────────────────────
+        # ── Squashfs modules (base + agent layers) ──────────────────
         modules = pkgs.lib.optionalAttrs isLinux
-  (import ./nix/modules.nix { inherit pkgs; enableNullclaw = true; });
+          (import ./nix/modules.nix {
+            inherit pkgs pkgs-unstable nullclaw-src odin-claw-src;
+          });
 
         # ── Daemon builds + proxy ─────────────────────────────────────
         daemons = pkgs.lib.optionalAttrs isLinux {

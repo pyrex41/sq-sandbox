@@ -34,7 +34,8 @@ _s3_enabled() { [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>
 _ephemeral_enabled() { [ "${SQUASH_EPHEMERAL:-}" = "1" ] && _s3_enabled; }
 
 _s3_push_manifest() {
-    local id="$1" s=$(sdir "$id")
+    local id="$1"
+    local s=$(sdir "$id")
     [ ! -d "$s/.meta" ] && return 1
     local tmp=$(mktemp)
     local layers=$(cat "$s/.meta/layers" 2>/dev/null || echo "")
@@ -232,7 +233,8 @@ _cgroup_teardown() { :; }
 # ── Secret proxy injection ────────────────────────────────────────────
 
 _inject_secret_placeholders() {
-    local id="$1" s=$(sdir "$id")
+    local id="$1"
+    local s=$(sdir "$id")
     local secrets_file="$DATA/secrets.json"
     [ ! -f "$secrets_file" ] && return 0
 
@@ -506,7 +508,8 @@ _chroot_restore_sandbox() {
 # ── Chroot backend: Destroy ──────────────────────────────────────────
 
 _chroot_destroy_sandbox() {
-    local id="$1" s=$(sdir "$id")
+    local id="$1"
+    local s=$(sdir "$id")
     [ ! -d "$s" ] && return 0
 
     # Ephemeral mode: auto-snapshot to S3 before destroying
@@ -771,7 +774,8 @@ _firecracker_restore_sandbox() {
 # ── Firecracker backend: Destroy ─────────────────────────────────────
 
 _firecracker_destroy_sandbox() {
-    local id="$1" s=$(sdir "$id")
+    local id="$1"
+    local s=$(sdir "$id")
     [ ! -d "$s" ] && return 0
 
     # Ephemeral mode: auto-snapshot to S3 before destroying
@@ -858,7 +862,8 @@ mounted() {
 # ── Info ───────────────────────────────────────────────────────────────
 
 sandbox_info() {
-    local id="$1" s=$(sdir "$id")
+    local id="$1"
+    local s=$(sdir "$id")
     [ ! -d "$s/.meta" ] && return 1
 
     local layers=$(cat "$s/.meta/layers" 2>/dev/null || echo "")

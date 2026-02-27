@@ -4,7 +4,7 @@
 > change without notice. Not recommended for production use.
 
 Composable sandboxes from stacked squashfs layers. The PorteuX pattern,
-distro-agnostic. Dual backend: chroot (default) or Firecracker microVM.
+distro-agnostic. Three backends: chroot (default), gVisor (runsc), or Firecracker microVM.
 
 ## Quick Start
 
@@ -30,7 +30,7 @@ and the sandbox runtime. One Docker container runs:
 
 - The HTTP API server (busybox httpd + CGI shell scripts)
 - The sandbox lifecycle manager (create, exec, snapshot, restore, destroy)
-- The sandbox host (overlayfs mounts, cgroups, network namespaces, or Firecracker VMs)
+- The sandbox host (overlayfs mounts, cgroups, network namespaces, gVisor containers, or Firecracker VMs)
 - Optional background services (reaper, secret proxy, Tailscale)
 
 **HTTPS secret injection** — Set `SQUASH_PROXY_HTTPS=1` to enable transparent
@@ -47,8 +47,8 @@ sandboxed commands. This means:
 - **Deploy one container** — that's the whole system
 - **`--privileged` is required** — the container directly manipulates kernel
   resources (loop mounts, overlayfs, cgroups, network namespaces)
-- **Sandbox escape = host compromise** in chroot mode — Firecracker mode
-  provides a stronger VM boundary
+- **Sandbox escape = host compromise** in chroot mode — gVisor mode provides
+  user-space kernel isolation, Firecracker mode provides a full VM boundary
 
 ## How it works
 
@@ -70,18 +70,25 @@ A sandbox is a stack of read-only squashfs layers + a writable overlay:
 └─────────────────────────────┘
 ```
 
-Operations: create (mount layers as overlayfs), exec (unshare + chroot),
-activate (add layer + remount), snapshot (mksquashfs upper/),
-restore (mount snapshot as layer + clear upper), destroy (unmount + rm).
+Operations: create (mount layers as overlayfs), exec (unshare + chroot, or
+runsc exec, or vsock), activate (add layer + remount), snapshot (mksquashfs
+upper/), restore (mount snapshot as layer + clear upper), destroy (unmount + rm).
 
 ## Backends
 
-| Backend       | Isolation              | Requires             |
-|---------------|------------------------|----------------------|
-| `chroot`      | overlayfs + unshare    | Privileged container |
-| `firecracker` | microVM + vsock        | `/dev/kvm`           |
+| Backend       | Isolation                        | Requires             |
+|---------------|----------------------------------|----------------------|
+| `chroot`      | overlayfs + unshare              | Privileged container |
+| `gvisor`      | overlayfs + runsc (user-space kernel) | Privileged container + `runsc` binary |
+| `firecracker` | microVM + vsock                  | `/dev/kvm`           |
 
 Set via `SQUASH_BACKEND` env var. The API is identical regardless of backend.
+
+**gVisor** sits between chroot and Firecracker: it reuses the same overlayfs
+mount infrastructure as chroot (so snapshot/restore/activate work identically)
+but isolates processes through gVisor's Sentry — a user-space kernel that
+intercepts all syscalls without requiring `/dev/kvm`. This provides stronger
+isolation than plain namespaces without the overhead of a full microVM.
 
 ## API
 
@@ -170,8 +177,9 @@ on exceed), `max_lifetime_s` (auto-destroyed by `sq-reaper`),
 `SQUASH_MAX_SANDBOXES` (default 100 concurrent sandboxes).
 
 **Namespace isolation** — Each sandbox exec runs in its own mount, PID, IPC,
-and UTS namespaces (`unshare --mount --pid --ipc --uts`). Every sandbox also
-gets a dedicated network namespace with veth pair, regardless of `allow_net`.
+and UTS namespaces (`unshare --mount --pid --ipc --uts` for chroot, or via
+OCI spec for gVisor). Every sandbox also gets a dedicated network namespace
+with veth pair, regardless of `allow_net`.
 
 **Network egress** — `allow_net` field on create. `[]` = allow all (default),
 `["api.anthropic.com"]` = whitelist, `["none"]` = block all. Every sandbox
@@ -241,6 +249,9 @@ Runs as a privileged Docker container on any provider.
 # Chroot backend (default)
 docker compose up -d
 
+# gVisor backend (requires runsc installed in the image)
+SQUASH_BACKEND=gvisor docker compose up -d
+
 # Firecracker backend (requires /dev/kvm)
 docker compose -f docker-compose.firecracker.yml up -d
 ```
@@ -252,7 +263,7 @@ etc. — anything that supports privileged containers.
 
 | Variable              | Default                       | Purpose                              |
 |-----------------------|-------------------------------|--------------------------------------|
-| `SQUASH_BACKEND`      | `chroot`                      | `chroot` or `firecracker`            |
+| `SQUASH_BACKEND`      | `chroot`                      | `chroot`, `gvisor`, or `firecracker` |
 | `SQUASH_DATA`         | `/data`                       | Root directory for all state         |
 | `SQUASH_PORT`         | `8080`                        | HTTP API listen port                 |
 | `SQUASH_AUTH_TOKEN`   | `""` (no auth)                | Bearer token for API authentication  |
@@ -269,10 +280,15 @@ etc. — anything that supports privileged containers.
 ## Known limitations
 
 - **Chroot: shared kernel** — a kernel exploit inside a sandbox could compromise
-  the host. Firecracker mode mitigates this with a separate guest kernel.
+  the host. gVisor mode mitigates this with a user-space kernel (Sentry) that
+  intercepts syscalls. Firecracker mode provides the strongest boundary with a
+  separate guest kernel in a microVM.
 - **Chroot: UID mapping in privileged containers** — `--map-root-user` helps but
   effective isolation depends on the container runtime's user namespace config.
-  Use Firecracker mode for stronger isolation.
+  Use gVisor or Firecracker mode for stronger isolation.
+- **gVisor: compatibility** — gVisor's Sentry does not implement every Linux
+  syscall. Some programs (especially those using `io_uring`, eBPF, or niche
+  `ioctl`s) may fail. Test your workload before deploying.
 - **Secret proxy modes** — Default HTTP mode doesn't handle HTTPS. Set
   `SQUASH_PROXY_HTTPS=1` for full HTTPS support (generates a MITM CA).
 - **Seccomp optional** — chroot relies on namespace isolation by default. Apply
@@ -304,6 +320,7 @@ and how much is implemented in-language vs. delegated to external tools.
 | Feature | Rust | Zig | Odin | CL | Janet |
 |---------|------|-----|------|----|-------|
 | Chroot backend | ✓ | ✓ | ✓ | ✓ | ✓ |
+| gVisor backend | — | — | — | ✓ | — |
 | Firecracker backend | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Native S3 (in-language) | ✓ | ✓ | — | ✓ | — |
 | S3 via shell (`sq-s3`) | — | — | ✓ | — | ✓ |

@@ -5,7 +5,7 @@
 Add a Firecracker microVM backend to Squash alongside the existing chroot mode,
 plus three security features inspired by Deno Sandbox: resource limits, network
 egress control, and secret materialization. The API surface stays identical —
-the backend is a deployment-time choice via `SQUASH_BACKEND=chroot|firecracker`.
+the backend is a deployment-time choice via `SQUASH_BACKEND=chroot|gvisor|firecracker`.
 
 ## Current State
 
@@ -17,7 +17,7 @@ the backend is a deployment-time choice via `SQUASH_BACKEND=chroot|firecracker`.
 
 ## Desired End State
 
-- Two backends behind the same API, selected by `SQUASH_BACKEND` env var
+- Three backends behind the same API, selected by `SQUASH_BACKEND` env var
 - Per-sandbox CPU, memory, and lifetime limits
 - Per-sandbox network egress whitelisting (`allow_net`)
 - Secret proxy that injects credentials only for approved outbound requests
@@ -51,12 +51,12 @@ the backend is a deployment-time choice via `SQUASH_BACKEND=chroot|firecracker`.
                      │  SQUASH_BACKEND=?            │
                      └──┬───────────────────────┬──┘
                         │                       │
-           ┌────────────▼─────────┐  ┌─────────▼──────────────┐
-           │  chroot backend      │  │  firecracker backend    │
-           │  overlayfs+unshare   │  │  microVM+vsock          │
-           │  cgroups v2          │  │  native resource limits │
-           │  netns+nftables      │  │  tap+nftables           │
-           └──────────────────────┘  └─────────────────────────┘
+           ┌────────────▼─────────┐  ┌─────────▼──────────────┐  ┌──────────▼───────────┐
+           │  chroot backend      │  │  gvisor backend         │  │  firecracker backend  │
+           │  overlayfs+unshare   │  │  overlayfs+runsc        │  │  microVM+vsock        │
+           │  cgroups v2          │  │  OCI spec resources     │  │  native resource lim. │
+           │  netns+nftables      │  │  netns+nftables         │  │  tap+nftables         │
+           └──────────────────────┘  └─────────────────────────┘  └───────────────────────┘
 
                      ┌─────────────────────────────┐
                      │  sq-secret-proxy (optional)  │
@@ -95,6 +95,7 @@ wrappers:
 create_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_create_sandbox "$@" ;;
+        gvisor)      _gvisor_create_sandbox "$@" ;;
         firecracker) _firecracker_create_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
@@ -103,6 +104,7 @@ create_sandbox() {
 exec_in_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_exec_in_sandbox "$@" ;;
+        gvisor)      _gvisor_exec_in_sandbox "$@" ;;
         firecracker) _firecracker_exec_in_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
@@ -140,6 +142,7 @@ json_ok "$(jq -n \
 #### Automated:
 - [ ] All existing API calls return identical results
 - [ ] Health endpoint reports `"backend":"chroot"`
+- [ ] `SQUASH_BACKEND=gvisor` dispatches to gvisor backend (CL impl complete)
 - [ ] `SQUASH_BACKEND=firecracker` returns clear "not implemented" errors
 
 #### Manual:

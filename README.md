@@ -6,13 +6,34 @@
 Composable sandboxes from stacked squashfs layers. The PorteuX pattern,
 distro-agnostic. Three backends: chroot (default), gVisor (runsc), or Firecracker microVM.
 
+## Choose Your Implementation
+
+The sandbox daemon is available in multiple language implementations. **Pick one** —
+they all expose the same HTTP API and work with the same shared tooling.
+
+| Implementation | Build / Image | Best for |
+|----------------|---------------|----------|
+| **Rust** (default) | `nix build .#squashd-rust` / `nix build .#image-rust` | Production use — native S3, native HTTPS proxy, async, most self-contained |
+| **Zig** | `nix build .#squashd-zig` / `nix build .#image-zig` | Small binary (2.3MB), low dependency surface |
+| **Odin** | `nix build .#squashd-odin` / `nix build .#image-odin` | Smallest binary (838KB) |
+| **Janet** | `nix build .#squashd-janet` / `nix build .#image-janet` | Simplest deployment, smallest codebase (~1.9k LOC) |
+| **Common Lisp** | `nix build .#squashd-cl` / `nix build .#image-cl` | REPL-driven development, gVisor backend support |
+| **Shell** | `nix build .#squashd-shell` / `nix build .#image-shell` | Zero compilation, busybox httpd + CGI scripts |
+
+> **Default:** `nix build .#squashd` and `nix build .#image` build the **Rust** implementation.
+> See [Implementation Details](#language-implementations) at the bottom for a full feature matrix.
+
 ## Quick Start
 
 ```sh
+# Pick your image: image-rust (default), image-zig, image-odin, image-janet, image-cl, image-shell
+nix build .#image-rust
+docker load < result
+
 docker run -d --privileged \
   -p 8080:8080 \
   -v squash-data:/data \
-  ghcr.io/pyrex41/sq-sandbox:latest
+  sq-sandbox-rust:latest
 
 # Create a sandbox
 curl -X POST localhost:8080/cgi-bin/api/sandboxes \
@@ -243,14 +264,18 @@ docker run --rm --privileged \
 
 ## Deployment
 
-Runs as a privileged Docker container on any provider.
+Build the image for your chosen implementation and run as a privileged Docker container.
 
 ```sh
+# Build your chosen image (see "Choose Your Implementation" above)
+nix build .#image-rust    # or image-zig, image-odin, image-janet, image-cl, image-shell
+docker load < result
+
 # Chroot backend (default)
-docker compose up -d
+docker run -d --privileged -p 8080:8080 -v squash-data:/data sq-sandbox-rust:latest
 
 # gVisor backend (requires runsc installed in the image)
-SQUASH_BACKEND=gvisor docker compose up -d
+SQUASH_BACKEND=gvisor docker run -d --privileged -p 8080:8080 -v squash-data:/data sq-sandbox-rust:latest
 
 # Firecracker backend (requires /dev/kvm)
 docker compose -f docker-compose.firecracker.yml up -d
@@ -302,18 +327,22 @@ Not for untrusted multi-tenant. No GPU passthrough. No live migration between ba
 
 ## Language Implementations
 
-The sandbox daemon is implemented in five languages on parallel branches. All
-share the same core model (squashfs + overlayfs, cgroups, netns, secrets
-injection) and expose the same HTTP API, but differ in runtime, dependencies,
-and how much is implemented in-language vs. delegated to external tools.
+> You already picked an implementation in [Choose Your Implementation](#choose-your-implementation)
+> above. This section has the detailed comparison if you want to understand the
+> trade-offs or switch.
 
-| Implementation | Branch | LOC (src) | Runtime | HTTP Stack |
-|----------------|--------|-----------|---------|------------|
-| **Rust** | `feat/rust` | ~11k | Async (Tokio) | Axum + Tower |
-| **Zig** | `feat/zig` | ~10k | Sync, thread pool | std.http (custom routing) |
-| **Odin** | `feat/odin` | ~5k | Sync, thread pool | Custom (worker pool + bounded channels) |
-| **Common Lisp** | `feat/cl` | ~3.5k | SBCL + bordeaux-threads | Clack/Woo (libev) + Ningle |
-| **Janet** | `feat/janet` | ~1.9k | Fibers (ev/go) | net/server (stdlib) |
+All implementations share the same core model (squashfs + overlayfs, cgroups,
+netns, secrets injection) and expose the same HTTP API, but differ in runtime,
+dependencies, and how much is implemented in-language vs. delegated to external
+tools. The source for each lives under `impl/<language>/`.
+
+| Implementation | Source | LOC | Runtime | HTTP Stack |
+|----------------|--------|-----|---------|------------|
+| **Rust** | `impl/rust/` | ~11k | Async (Tokio) | Axum + Tower |
+| **Zig** | `impl/zig/` | ~10k | Sync, thread pool | std.http (custom routing) |
+| **Odin** | `impl/odin/` | ~5k | Sync, thread pool | Custom (worker pool + bounded channels) |
+| **Common Lisp** | `impl/cl/` | ~3.5k | SBCL + bordeaux-threads | Clack/Woo (libev) + Ningle |
+| **Janet** | `impl/janet/` | ~1.9k | Fibers (ev/go) | net/server (stdlib) |
 
 ### Feature Matrix
 

@@ -1,7 +1,12 @@
 # OCI image construction for sq-sandbox
 #
-# Each image layers: runtime deps → shared scripts → proxy → daemon binary
+# Pick ONE image to build — each bundles a different daemon implementation
+# but they all expose the same HTTP API and use the same shared tooling.
+#
 # Usage: nix build .#image-rust  →  docker load < result
+#        nix build .#image       →  builds the default (Rust)
+#
+# Each image layers: runtime deps → shared scripts → proxy → daemon binary
 { pkgs, self-packages }:
 let
   # Common runtime dependencies for all images

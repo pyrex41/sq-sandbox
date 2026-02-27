@@ -19,6 +19,8 @@
           (import ./nix/modules.nix { inherit pkgs; });
 
         # ── Daemon builds + proxy ─────────────────────────────────────
+        # Default implementation: Rust (most self-contained, native S3 + HTTPS proxy)
+        # Override by building a specific variant: nix build .#squashd-zig, etc.
         daemons = pkgs.lib.optionalAttrs isLinux {
 
           sq-secret-proxy = pkgs.stdenv.mkDerivation {
@@ -160,7 +162,13 @@
           };
         };
 
-        packages = modules // daemons // images;
+        # Default aliases: `nix build .#squashd` and `nix build .#image` use Rust
+        defaults = pkgs.lib.optionalAttrs isLinux {
+          squashd = daemons.squashd-rust;
+          image   = images.image-rust;
+        };
+
+        packages = modules // daemons // images // defaults;
       }
     );
 }

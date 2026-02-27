@@ -55,10 +55,11 @@
     (and val (or (string= val "1") (string-equal val "true")))))
 
 (defun parse-backend (val)
-  "Parse backend string to keyword. Returns :CHROOT or :FIRECRACKER."
+  "Parse backend string to keyword. Returns :CHROOT, :FIRECRACKER, or :GVISOR."
   (let ((s (string-downcase (or val "chroot"))))
     (cond
       ((string= s "firecracker") :firecracker)
+      ((string= s "gvisor") :gvisor)
       (t :chroot))))
 
 (defun config-from-env ()
@@ -69,7 +70,7 @@
      SQUASH_PORT         — HTTP port (default 8080)
      SQUASH_MAX_SANDBOXES — max concurrent sandboxes (default 100)
      SQUASH_UPPER_LIMIT_MB — tmpfs upper layer size in MB (default 512)
-     SQUASH_BACKEND      — sandbox backend: chroot or firecracker (default chroot)
+     SQUASH_BACKEND      — sandbox backend: chroot, firecracker, or gvisor (default chroot)
      SQUASH_AUTH_TOKEN   — bearer token for API auth (optional)
      SQUASH_S3_BUCKET    — S3 bucket for module sync (optional)
      SQUASH_S3_REGION    — S3 region (default us-east-2)

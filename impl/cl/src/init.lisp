@@ -60,6 +60,51 @@ Returns NIL if no valid index is present."
     (log:info "init: recovered firecracker sandbox ~A" id)
     sandbox))
 
+(defun recover-gvisor-sandbox (manager id sandbox-dir meta
+                               layers cpu memory-mb allow-net
+                               max-lifetime-s created owner task)
+  "Recover a gVisor sandbox: remount filesystems, recreate netns,
+   regenerate OCI config, and restart the runsc container."
+  (let* ((config (manager-config manager))
+         (mounts (remount-sandbox-filesystems manager sandbox-dir id layers)))
+    (when (null mounts)
+      (log:warn "init: ~A gvisor remount failed, cleaning up" id)
+      (ignore-errors (cleanup-sandbox-dir sandbox-dir))
+      (return-from recover-gvisor-sandbox nil))
+    ;; Recreate netns (no cgroup — runsc manages its own)
+    (let ((netns (handler-case
+                     (setup-netns config id allow-net)
+                   (error (e)
+                     (log:warn "init: ~A gvisor netns recovery failed: ~A" id e)
+                     nil))))
+      (ignore-errors
+        (seed-resolv-conf sandbox-dir netns))
+      ;; Regenerate OCI config and restart container
+      (let ((bundle-dir (format nil "~A/oci" sandbox-dir))
+            (merged-path (format nil "~A/merged" sandbox-dir)))
+        (handler-case
+            (progn
+              (gvisor-write-oci-config bundle-dir merged-path
+                                        (when netns (netns-handle-name netns))
+                                        (coerce (or cpu 2.0) 'single-float)
+                                        (truncate (or memory-mb 1024)))
+              (gvisor-create-and-start config id bundle-dir))
+          (error (e)
+            (log:warn "init: ~A gvisor container restart failed: ~A" id e))))
+      ;; Build sandbox struct and register
+      (let ((sandbox (%make-sandbox
+                       :id id
+                       :state :ready
+                       :mounts mounts
+                       :netns netns
+                       :cgroup nil
+                       :created (or created (get-unix-time))
+                       :last-active (get-unix-time)
+                       :max-lifetime-s (or max-lifetime-s 0))))
+        (register-recovered-sandbox manager sandbox :owner owner :task task)
+        (log:info "init: recovered gvisor sandbox ~A (~D layers)" id (length layers))
+        sandbox))))
+
 (defun recover-sandbox (manager id data-dir)
   "Attempt to recover a single sandbox by re-reading its metadata and
    remounting its filesystem layers. Returns the sandbox on success, or
@@ -80,45 +125,51 @@ Returns NIL if no valid index is present."
                  (allow-net (or (getf meta :allow-net) nil))
                  (max-lifetime-s (or (getf meta :max-lifetime-s) 0))
                  (created (or (getf meta :created) (get-unix-time))))
-            (if (eq (config-backend config) :firecracker)
-                (recover-firecracker-sandbox manager id sandbox-dir meta)
-                ;; Chroot recovery path.
-                (let ((mounts (remount-sandbox-filesystems
-                               manager sandbox-dir id layers)))
-                  (when (null mounts)
-                    (log:warn "init: ~A remount failed, cleaning up" id)
-                    (ignore-errors (cleanup-sandbox-dir sandbox-dir))
-                    (return-from recover-sandbox nil))
-                  ;; Recreate cgroup/netns for recovered sandbox so exec + teardown
-                  ;; retain isolation/enforcement after daemon restart.
-                  (let ((cgroup (handler-case
-                                    (create-cgroup id
-                                                   (coerce cpu 'single-float)
-                                                   (truncate memory-mb))
-                                  (error (e)
-                                    (log:warn "init: ~A cgroup recovery failed: ~A" id e)
-                                    nil)))
-                        (netns (handler-case
-                                   (setup-netns config id allow-net)
+            (case (config-backend config)
+              (:firecracker
+               (recover-firecracker-sandbox manager id sandbox-dir meta))
+              (:gvisor
+               (recover-gvisor-sandbox manager id sandbox-dir meta
+                                       layers cpu memory-mb allow-net
+                                       max-lifetime-s created owner task))
+              (otherwise
+               ;; Chroot recovery path.
+               (let ((mounts (remount-sandbox-filesystems
+                              manager sandbox-dir id layers)))
+                 (when (null mounts)
+                   (log:warn "init: ~A remount failed, cleaning up" id)
+                   (ignore-errors (cleanup-sandbox-dir sandbox-dir))
+                   (return-from recover-sandbox nil))
+                 ;; Recreate cgroup/netns for recovered sandbox so exec + teardown
+                 ;; retain isolation/enforcement after daemon restart.
+                 (let ((cgroup (handler-case
+                                   (create-cgroup id
+                                                  (coerce cpu 'single-float)
+                                                  (truncate memory-mb))
                                  (error (e)
-                                   (log:warn "init: ~A netns recovery failed: ~A" id e)
-                                   nil))))
-                    (ignore-errors
-                      (seed-resolv-conf sandbox-dir netns))
-                    ;; Build sandbox struct and register with manager
-                    (let ((sandbox (%make-sandbox
-                                    :id id
-                                    :state :ready
-                                    :mounts mounts
-                                    :netns netns
-                                    :cgroup cgroup
-                                    :created created
-                                    :last-active (get-unix-time)
-                                    :max-lifetime-s max-lifetime-s)))
-                      (register-recovered-sandbox manager sandbox
-                                                  :owner owner :task task)
-                      (log:info "init: recovered ~A (~D layers)" id (length layers))
-                      sandbox))))))
+                                   (log:warn "init: ~A cgroup recovery failed: ~A" id e)
+                                   nil)))
+                       (netns (handler-case
+                                  (setup-netns config id allow-net)
+                                (error (e)
+                                  (log:warn "init: ~A netns recovery failed: ~A" id e)
+                                  nil))))
+                   (ignore-errors
+                     (seed-resolv-conf sandbox-dir netns))
+                   ;; Build sandbox struct and register with manager
+                   (let ((sandbox (%make-sandbox
+                                   :id id
+                                   :state :ready
+                                   :mounts mounts
+                                   :netns netns
+                                   :cgroup cgroup
+                                   :created created
+                                   :last-active (get-unix-time)
+                                   :max-lifetime-s max-lifetime-s)))
+                     (register-recovered-sandbox manager sandbox
+                                                 :owner owner :task task)
+                     (log:info "init: recovered ~A (~D layers)" id (length layers))
+                     sandbox)))))))
       (error (e)
         (log:warn "init: failed to recover ~A: ~A" id e)
         (ignore-errors (cleanup-sandbox-dir sandbox-dir))

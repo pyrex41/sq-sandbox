@@ -115,9 +115,10 @@
       (lambda (params)
         (declare (ignore params))
         (handler-case
-            (let* ((backend (if (eq (config-backend *config*) :firecracker)
-                                "firecracker"
-                                "chroot"))
+            (let* ((backend (case (config-backend *config*)
+                                (:firecracker "firecracker")
+                                (:gvisor "gvisor")
+                                (otherwise "chroot")))
                    (sb-count (manager-sandbox-count *manager*))
                    (mod-count (count-modules *config*))
                    (base-ready (base-module-exists-p *config*)))

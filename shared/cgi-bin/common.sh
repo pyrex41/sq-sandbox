@@ -999,12 +999,174 @@ _firecracker_mounted() {
     [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null
 }
 
+# ── gVisor backend ────────────────────────────────────────────────────
+#
+# Uses runsc (gVisor) for process isolation with the same overlayfs
+# infrastructure as the chroot backend. Provides user-space kernel
+# isolation (Sentry) without requiring /dev/kvm like Firecracker.
+
+RUNSC_ROOT="${SQUASH_DATA:-/data}/runsc"
+
+_gvisor_container_id() { echo "sq-$1"; }
+
+_gvisor_write_oci_config() {
+    local id="$1" merged_path="$2" netns_name="$3" cpu="$4" mem_mb="$5"
+    local s=$(sdir "$id")
+    local bundle_dir="$s/oci"
+    local cpu_quota=$(( ${cpu:-2} * 100000 ))
+    local mem_bytes=$(( ${mem_mb:-1024} * 1048576 ))
+    mkdir -p "$bundle_dir"
+
+    local netns_json=""
+    if [ -n "$netns_name" ]; then
+        netns_json=',{"type":"network","path":"/var/run/netns/'"$netns_name"'"}'
+    fi
+
+    cat > "$bundle_dir/config.json" <<EOCFG
+{"ociVersion":"1.0.0","process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["sleep","infinity"],"env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","HOME=/root","USER=root","TERM=xterm"],"cwd":"/"},"root":{"path":"$merged_path","readonly":false},"mounts":[{"destination":"/proc","type":"proc","source":"proc"},{"destination":"/dev","type":"tmpfs","source":"tmpfs","options":["nosuid","strictatime","mode=755","size=65536k"]},{"destination":"/dev/pts","type":"devpts","source":"devpts","options":["nosuid","noexec","newinstance","ptmxmode=0666","mode=0620"]},{"destination":"/sys","type":"sysfs","source":"sysfs","options":["nosuid","noexec","nodev","ro"]}],"linux":{"namespaces":[{"type":"pid"},{"type":"ipc"},{"type":"uts"},{"type":"mount"}${netns_json}],"resources":{"memory":{"limit":${mem_bytes}},"cpu":{"quota":${cpu_quota},"period":100000}}}}
+EOCFG
+}
+
+_gvisor_create_sandbox() {
+    local id="$1" layers="$2" cpu="$3" mem="$4" lifetime="$5" allow_net="$6"
+    local s=$(sdir "$id")
+    local cid=$(_gvisor_container_id "$id")
+    local merged="$s/merged"
+    local bundle="$s/oci"
+
+    mkdir -p "$s/upper" "$s/merged" "$s/.meta/log" "$s/images" "$s/snapshots"
+
+    # Mount tmpfs + squashfs + overlay (same as chroot)
+    _chroot_mount_layers "$id" "$layers"
+
+    # Setup netns (same as chroot)
+    _setup_network "$id" "$allow_net"
+    local netns_name="squash-$id"
+
+    # Seed resolv.conf
+    _seed_resolv_conf "$id"
+
+    # Write OCI config
+    _gvisor_write_oci_config "$id" "$merged" "$netns_name" "$cpu" "$mem"
+
+    # Start runsc container
+    mkdir -p "$RUNSC_ROOT"
+    runsc --root="$RUNSC_ROOT" --overlay2=none create --bundle="$bundle" "$cid" || {
+        echo "runsc create failed" >&2; return 1
+    }
+    runsc --root="$RUNSC_ROOT" start "$cid" || {
+        runsc --root="$RUNSC_ROOT" delete --force "$cid" 2>/dev/null
+        echo "runsc start failed" >&2; return 1
+    }
+
+    # Write metadata
+    _write_meta "$id" "$layers" "$cpu" "$mem" "$lifetime"
+}
+
+_gvisor_exec_in_sandbox() {
+    local id="$1" cmd="$2" workdir="${3:-/}" timeout_s="${4:-300}"
+    local cid=$(_gvisor_container_id "$id")
+    local s=$(sdir "$id")
+
+    local stdout_file=$(mktemp) stderr_file=$(mktemp)
+    local start_ts=$(date +%s)
+
+    timeout "${timeout_s}s" runsc --root="$RUNSC_ROOT" exec \
+        --user=root "--cwd=$workdir" "$cid" \
+        /bin/sh -c "$cmd" \
+        >"$stdout_file" 2>"$stderr_file"
+    local exit_code=$?
+
+    local end_ts=$(date +%s)
+    local stdout_str=$(head -c 65536 "$stdout_file")
+    local stderr_str=$(head -c 65536 "$stderr_file")
+    rm -f "$stdout_file" "$stderr_file"
+
+    # Write exec log
+    local seq=$(_next_seq "$id")
+    local duration_ms=$(( (end_ts - start_ts) * 1000 ))
+    _write_exec_log "$id" "$seq" "$cmd" "$workdir" "$exit_code" \
+                    "$start_ts" "$end_ts" "$duration_ms" \
+                    "$stdout_str" "$stderr_str"
+
+    # Output JSON result
+    jq -n --arg ec "$exit_code" --arg out "$stdout_str" --arg err "$stderr_str" \
+           --argjson started "$start_ts" --argjson finished "$end_ts" \
+           --argjson dur "$duration_ms" --argjson seq "$seq" \
+        '{exit_code:($ec|tonumber),stdout:$out,stderr:$err,started:$started,finished:$finished,duration_ms:$dur,seq:$seq}'
+}
+
+_gvisor_activate_module() {
+    local id="$1" module="$2"
+    local cid=$(_gvisor_container_id "$id")
+
+    # Stop the container
+    runsc --root="$RUNSC_ROOT" kill "$cid" SIGKILL 2>/dev/null || true
+    sleep 0.1
+    runsc --root="$RUNSC_ROOT" delete --force "$cid" 2>/dev/null || true
+
+    # Remount overlay with new layer (same as chroot)
+    _chroot_activate_module "$id" "$module"
+
+    # Regenerate OCI config and restart
+    local s=$(sdir "$id")
+    local netns_name="squash-$id"
+    _gvisor_write_oci_config "$id" "$s/merged" "$netns_name" 2 1024
+    runsc --root="$RUNSC_ROOT" --overlay2=none create --bundle="$s/oci" "$cid"
+    runsc --root="$RUNSC_ROOT" start "$cid"
+}
+
+_gvisor_snapshot_sandbox() {
+    # gVisor uses same host-side overlayfs as chroot — snapshot is identical
+    _chroot_snapshot_sandbox "$@"
+}
+
+_gvisor_restore_sandbox() {
+    local id="$1" label="$2"
+    local cid=$(_gvisor_container_id "$id")
+
+    # Stop the container
+    runsc --root="$RUNSC_ROOT" kill "$cid" SIGKILL 2>/dev/null || true
+    sleep 0.1
+    runsc --root="$RUNSC_ROOT" delete --force "$cid" 2>/dev/null || true
+
+    # Restore overlay (same as chroot)
+    _chroot_restore_sandbox "$id" "$label"
+
+    # Regenerate OCI config and restart
+    local s=$(sdir "$id")
+    local netns_name="squash-$id"
+    _gvisor_write_oci_config "$id" "$s/merged" "$netns_name" 2 1024
+    runsc --root="$RUNSC_ROOT" --overlay2=none create --bundle="$s/oci" "$cid"
+    runsc --root="$RUNSC_ROOT" start "$cid"
+}
+
+_gvisor_destroy_sandbox() {
+    local id="$1"
+    local cid=$(_gvisor_container_id "$id")
+
+    # Stop runsc container
+    runsc --root="$RUNSC_ROOT" kill "$cid" SIGKILL 2>/dev/null || true
+    sleep 0.1
+    runsc --root="$RUNSC_ROOT" delete --force "$cid" 2>/dev/null || true
+
+    # Unmount filesystems (same as chroot)
+    _chroot_destroy_sandbox "$id"
+}
+
+_gvisor_mounted() {
+    local id="$1"
+    local cid=$(_gvisor_container_id "$id")
+    runsc --root="$RUNSC_ROOT" state "$cid" 2>/dev/null | grep -q '"running"'
+}
+
 # ── Backend dispatch wrappers ─────────────────────────────────────────
 
 create_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_create_sandbox "$@" ;;
         firecracker) _firecracker_create_sandbox "$@" ;;
+        gvisor)      _gvisor_create_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }
@@ -1013,6 +1175,7 @@ exec_in_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_exec_in_sandbox "$@" ;;
         firecracker) _firecracker_exec_in_sandbox "$@" ;;
+        gvisor)      _gvisor_exec_in_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }
@@ -1021,6 +1184,7 @@ activate_module() {
     case "$BACKEND" in
         chroot)      _chroot_activate_module "$@" ;;
         firecracker) _firecracker_activate_module "$@" ;;
+        gvisor)      _gvisor_activate_module "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }
@@ -1029,6 +1193,7 @@ snapshot_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_snapshot_sandbox "$@" ;;
         firecracker) _firecracker_snapshot_sandbox "$@" ;;
+        gvisor)      _gvisor_snapshot_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }
@@ -1037,6 +1202,7 @@ restore_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_restore_sandbox "$@" ;;
         firecracker) _firecracker_restore_sandbox "$@" ;;
+        gvisor)      _gvisor_restore_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }
@@ -1045,6 +1211,7 @@ destroy_sandbox() {
     case "$BACKEND" in
         chroot)      _chroot_destroy_sandbox "$@" ;;
         firecracker) _firecracker_destroy_sandbox "$@" ;;
+        gvisor)      _gvisor_destroy_sandbox "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }
@@ -1053,6 +1220,7 @@ mounted() {
     case "$BACKEND" in
         chroot)      _chroot_mounted "$@" ;;
         firecracker) _firecracker_mounted "$@" ;;
+        gvisor)      _gvisor_mounted "$@" ;;
         *) echo "unknown backend: $BACKEND" >&2; return 1 ;;
     esac
 }

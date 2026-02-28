@@ -13,6 +13,12 @@ Backend :: enum {
 	Firecracker,
 }
 
+Upper_Backend :: enum {
+	Tmpfs,
+	Btrfs,
+	Loop,
+}
+
 Config :: struct {
 	backend:            Backend,
 	data_dir:           string,
@@ -28,11 +34,14 @@ Config :: struct {
 	proxy_https:        bool,
 	tailscale_authkey:  Maybe(string),
 	tailscale_hostname: string,
+	upper_backend:      Upper_Backend,
+	local_cache_dir:    string,
 	// Cached derived paths — computed once at startup, never re-allocated.
 	_modules_dir:       string,
 	_sandboxes_dir:     string,
 	_secrets_path:      string,
 	_proxy_ca_dir:      string,
+	_bus_sock:          string,
 }
 
 // Parse configuration from environment variables.
@@ -69,6 +78,17 @@ config_from_env :: proc(allocator := context.allocator) -> Config {
 
 	data_dir := get_env("SQUASH_DATA", "/data")
 
+	ub_str := get_env("SQUASH_UPPER_BACKEND", "tmpfs")
+	ub: Upper_Backend = .Tmpfs
+	if ub_str == "btrfs" {
+		ub = .Btrfs
+	} else if ub_str == "loop" {
+		ub = .Loop
+	}
+
+	cache_dir := get_env("SQUASH_LOCAL_CACHE_DIR", fmt.tprintf("%s/cache", data_dir))
+	bus_sock := get_env("SQUASH_BUS_SOCK", fmt.tprintf("%s/.sq-bus.sock", data_dir))
+
 	return Config{
 		backend            = .Firecracker if get_env("SQUASH_BACKEND", "") == "firecracker" else .Chroot,
 		data_dir           = data_dir,
@@ -84,11 +104,14 @@ config_from_env :: proc(allocator := context.allocator) -> Config {
 		proxy_https        = get_env("SQUASH_PROXY_HTTPS", "") == "1",
 		tailscale_authkey  = maybe_env("TAILSCALE_AUTHKEY"),
 		tailscale_hostname = get_env("TAILSCALE_HOSTNAME", "squash"),
+		upper_backend      = ub,
+		local_cache_dir    = cache_dir,
 		// Cache derived paths once — avoids repeated tprintf allocations.
 		_modules_dir       = fmt.aprintf("%s/modules", data_dir),
 		_sandboxes_dir     = fmt.aprintf("%s/sandboxes", data_dir),
 		_secrets_path      = fmt.aprintf("%s/secrets.json", data_dir),
 		_proxy_ca_dir      = fmt.aprintf("%s/proxy-ca", data_dir),
+		_bus_sock          = bus_sock,
 	}
 }
 
@@ -111,4 +134,8 @@ secrets_path :: proc(c: ^Config) -> string {
 
 proxy_ca_dir :: proc(c: ^Config) -> string {
 	return c._proxy_ca_dir
+}
+
+bus_sock_path :: proc(c: ^Config) -> string {
+	return c._bus_sock
 }

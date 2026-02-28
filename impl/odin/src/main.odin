@@ -12,6 +12,12 @@ main :: proc() {
 		os.exit(1)
 	}
 
+	// Start sq-sync sidecar (if available and not already running)
+	if !os.exists(bus_sock_path(&config)) && _command_exists("sq-sync") {
+		_ = run_cmd("sq-sync", "--daemon")
+		fmt.eprintln("[main] sq-sync sidecar started")
+	}
+
 	manager := manager_init(&config, context.allocator)
 	defer manager_destroy(&manager)
 	manager_recover_from_disk(&manager)

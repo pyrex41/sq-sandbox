@@ -661,7 +661,12 @@ _chroot_snapshot_sandbox() {
     jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
         '{label:$label,created:$created,size:$size}' >> "$s/.meta/snapshots.jsonl"
 
-    _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    # Notify sidecar for background S3 push (preferred) or push directly
+    if command -v sq-sync >/dev/null 2>&1; then
+        sq-sync --notify "{\"op\":\"push\",\"path\":\"$snapfile\",\"key\":\"sandboxes/$id/snapshots/$label.squashfs\"}"
+    elif _s3_enabled; then
+        sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    fi
 
     echo "$snapfile"
 }
@@ -935,7 +940,12 @@ _firecracker_snapshot_sandbox() {
     jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
         '{label:$label,created:$created,size:$size}' >> "$s/.meta/snapshots.jsonl"
 
-    _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    # Notify sidecar for background S3 push (preferred) or push directly
+    if command -v sq-sync >/dev/null 2>&1; then
+        sq-sync --notify "{\"op\":\"push\",\"path\":\"$snapfile\",\"key\":\"sandboxes/$id/snapshots/$label.squashfs\"}"
+    elif _s3_enabled; then
+        sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    fi
 
     echo "$snapfile"
 }

@@ -315,6 +315,33 @@ _log "wg module definition exists"
 
 echo
 
+# ── Sync Sidecar ─────────────────────────────────────────────────
+echo "=== Sync Sidecar ==="
+
+_log "sq-sync exists and shows help"
+if command -v sq-sync >/dev/null 2>&1; then
+    sq-sync --help >/dev/null 2>&1 && _pass || _fail "sq-sync help failed"
+else
+    _skip "sq-sync not on PATH"
+fi
+
+_log "sq-sync notify spools when bus is down"
+if command -v sq-sync >/dev/null 2>&1; then
+    export SQUASH_LOCAL_CACHE_DIR="/tmp/sq-test-spool-$$"
+    export SQUASH_BUS_SOCK="/tmp/sq-test-nosock-$$.sock"
+    sq-sync --notify '{"op":"sync_modules"}' 2>/dev/null
+    [ -d "/tmp/sq-test-spool-$$/spool" ] && _pass || _fail "spool dir not created"
+    rm -rf "/tmp/sq-test-spool-$$" "/tmp/sq-test-nosock-$$.sock"
+    unset SQUASH_LOCAL_CACHE_DIR SQUASH_BUS_SOCK
+else
+    _skip "sq-sync not on PATH"
+fi
+
+_log "bus.rs module exists"
+[ -f "$SCRIPT_DIR/../../impl/rust/src/bus.rs" ] && _pass || _skip "bus.rs not found"
+
+echo
+
 # ── Cleanup & Summary ─────────────────────────────────────────────
 # Clean up any straggling test sandboxes
 for tid in test-iv test-fs test-cg test-net test-nonet test-sec test-tmpfs test-lim1 test-lim2 test-lim3 test-sub1 test-sub2 test-reap test-wg; do

@@ -26,6 +26,9 @@ if [ -f "${SQUASH_DATA:-/data}/secrets.json" ]; then
     fi
 fi
 
+# Start sync sidecar (handles S3 push/pull in the background)
+command -v sq-sync >/dev/null 2>&1 && sq-sync --daemon
+
 # Tailscale network setup (background — non-blocking)
 [ -n "${TAILSCALE_AUTHKEY:-}" ] && setup-tailscale &
 

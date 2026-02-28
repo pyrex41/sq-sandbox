@@ -303,6 +303,14 @@ pub async fn snapshot_sandbox(
     .await
     .map_err(sandbox_error_to_api)?;
 
+    // Notify sidecar for background S3 push (fire-and-forget)
+    let snap_path = state.config.sandboxes_dir()
+        .join(&id)
+        .join("snapshots")
+        .join(format!("{}.squashfs", label));
+    let s3_key = format!("snapshots/{}/{}.squashfs", id, label);
+    state.bus.notify_push(&snap_path, &s3_key);
+
     info!(sandbox_id = %id, label = %label, size, "snapshot created");
 
     Ok(Json(SnapshotResponse {

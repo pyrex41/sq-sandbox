@@ -417,15 +417,41 @@ docker run -d --privileged \
 When `SQUASH_S3_BUCKET` is empty (or unset), all S3 logic is automatically disabled.
 Existing behavior with `SQUASH_EPHEMERAL=1` is fully preserved.
 
-#### Background delta sync
+#### Sync sidecar (`sq-sync`)
 
-After any snapshot, changes are queued for incremental push to S3 via a SQLite-backed
-queue at `$SQUASH_LOCAL_CACHE_DIR/sync.db`. Process the queue explicitly:
+The sandbox process never touches S3 directly. Instead, a lightweight sidecar
+(`sq-sync`) listens on a Unix domain socket at `/data/.sq-bus.sock` for
+notifications. The sandbox writes snapshots to local disk and drops a small
+JSON message on the bus — the sidecar handles S3 upload, retries, and caching
+in the background. The sandbox never blocks on network I/O for durability.
+
+```
+Sandbox → writes squashfs → drops {"op":"push","path":"...","key":"..."} on bus → done
+                                          ↓
+                        sq-sync sidecar → reads bus → S3 push (with retry)
+                                        → periodic module sync (every 5 min)
+                                        → file-based spool for offline resilience
+```
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `SQUASH_BUS_SOCK` | `/data/.sq-bus.sock` | Unix socket path for sidecar IPC |
+| `SQUASH_SYNC_INTERVAL` | `300` | Seconds between periodic module syncs |
+
+The sidecar starts automatically via the entrypoint. Manual control:
 
 ```sh
-sq-ctl sync --background    # drain the sync queue
+sq-sync                     # start in foreground
+sq-sync --daemon            # start in background (writes PID file)
+sq-sync --status            # check if running
+sq-sync --stop              # stop the sidecar
+sq-sync --notify '{"op":"sync_modules"}'   # trigger manual sync
+sq-ctl sync --background    # drain file-based spool
 sq-ctl sync sandbox-id      # bi-directional sync (existing behavior)
 ```
+
+If the sidecar is down, notifications are spooled to
+`$SQUASH_LOCAL_CACHE_DIR/spool/` and drained when the sidecar restarts.
 
 ### Kernel-Level WireGuard
 

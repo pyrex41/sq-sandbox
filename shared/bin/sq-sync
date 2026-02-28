@@ -1,0 +1,276 @@
+#!/bin/sh
+# sq-sync — sidecar process for background S3 synchronization.
+#
+# Listens on a Unix domain socket for snapshot/module push notifications
+# from the sandbox process. The sandbox never touches S3 directly; it writes
+# files to local disk and drops a JSON notification on the bus.
+#
+# Protocol (newline-delimited JSON on Unix domain socket):
+#   {"op":"push","path":"/data/.../snap.squashfs","key":"snapshots/id/snap.squashfs"}
+#   {"op":"push_manifest","id":"sandbox-id","path":"/tmp/manifest.json"}
+#   {"op":"sync_modules"}
+#   {"op":"sync_snapshots","id":"sandbox-id"}
+#   {"op":"shutdown"}
+#
+# The sidecar also runs a periodic sync loop to pull new modules from S3.
+#
+# Usage:
+#   sq-sync                       # foreground mode
+#   sq-sync --daemon              # background mode (writes PID file)
+#   sq-sync --notify <json>       # send a single notification to the bus
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+BUS_SOCK="${SQUASH_BUS_SOCK:-$DATA/.sq-bus.sock}"
+CACHE="${SQUASH_LOCAL_CACHE_DIR:-${HOME:+$HOME/.cache/sq-sandbox}}"
+CACHE="${CACHE:-/tmp/sq-sandbox-cache}"
+SYNC_INTERVAL="${SQUASH_SYNC_INTERVAL:-300}"  # seconds between periodic syncs
+PIDFILE="$DATA/.sq-sync.pid"
+
+log() { echo "[sq-sync] $(date +%H:%M:%S) $*" >&2; }
+
+# ── Notify (client mode) ───────────────────────────────────────────
+
+# Send a single notification to the bus socket.
+# Args: $1 = JSON message
+notify() {
+    local msg="$1"
+    if [ -S "$BUS_SOCK" ]; then
+        printf '%s\n' "$msg" | socat - UNIX-CONNECT:"$BUS_SOCK" 2>/dev/null || {
+            log "WARN: bus not reachable, queueing to file"
+            _queue_to_file "$msg"
+        }
+    else
+        _queue_to_file "$msg"
+    fi
+}
+
+# Queue a message to a spool file when the bus socket is unavailable.
+_queue_to_file() {
+    local msg="$1"
+    local spool="$CACHE/spool"
+    mkdir -p "$spool"
+    local ts
+    ts=$(date +%s%N 2>/dev/null || date +%s)
+    printf '%s\n' "$msg" > "$spool/$ts.msg"
+}
+
+# Drain any spooled messages (called when the bus comes up).
+_drain_spool() {
+    local spool="$CACHE/spool"
+    [ -d "$spool" ] || return 0
+    for f in "$spool"/*.msg; do
+        [ -f "$f" ] || continue
+        local msg
+        msg=$(cat "$f")
+        _process_message "$msg" && rm -f "$f"
+    done
+}
+
+# ── Message processing ──────────────────────────────────────────────
+
+_process_message() {
+    local msg="$1"
+    local op
+    op=$(echo "$msg" | jq -r '.op // empty' 2>/dev/null) || return 1
+
+    case "$op" in
+        push)
+            local path key
+            path=$(echo "$msg" | jq -r '.path')
+            key=$(echo "$msg" | jq -r '.key')
+            _do_push "$path" "$key"
+            ;;
+        push_manifest)
+            local id path
+            id=$(echo "$msg" | jq -r '.id')
+            path=$(echo "$msg" | jq -r '.path')
+            _do_push "$path" "sandboxes/$id/manifest.json"
+            ;;
+        sync_modules)
+            _do_sync_modules
+            ;;
+        sync_snapshots)
+            local id
+            id=$(echo "$msg" | jq -r '.id')
+            _do_sync_snapshots "$id"
+            ;;
+        cache_module)
+            local path
+            path=$(echo "$msg" | jq -r '.path')
+            _do_cache_module "$path"
+            ;;
+        shutdown)
+            log "shutdown requested"
+            _cleanup
+            exit 0
+            ;;
+        *)
+            log "WARN: unknown op: $op"
+            return 1
+            ;;
+    esac
+}
+
+# ── S3 operations (via sq-s3) ───────────────────────────────────────
+
+_s3_ok() { [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; }
+
+_do_push() {
+    local path="$1" key="$2"
+    [ -f "$path" ] || { log "WARN: file not found: $path"; return 1; }
+
+    # Cache locally first
+    _do_cache_file "$path" "$key"
+
+    # Push to S3 if configured
+    if _s3_ok; then
+        log "push: $key ($(stat -c%s "$path" 2>/dev/null || echo '?') bytes)"
+        sq-s3 push "$path" "$key" 2>/dev/null && {
+            log "push OK: $key"
+            return 0
+        } || {
+            log "WARN: push failed: $key (will retry)"
+            _queue_to_file "{\"op\":\"push\",\"path\":\"$path\",\"key\":\"$key\"}"
+            return 1
+        }
+    else
+        log "push (local only): $key"
+    fi
+}
+
+_do_cache_file() {
+    local src="$1" key="$2"
+    mkdir -p "$CACHE/objects"
+    # Use key path as cache path (replacing / with __)
+    local cache_name
+    cache_name=$(echo "$key" | tr '/' '__')
+    local dest="$CACHE/objects/$cache_name"
+    [ -f "$dest" ] && return 0
+    cp "$src" "$dest" 2>/dev/null || true
+}
+
+_do_cache_module() {
+    local path="$1"
+    mkdir -p "$CACHE/modules"
+    local name
+    name=$(basename "$path")
+    local dest="$CACHE/modules/$name"
+    [ -f "$dest" ] && return 0
+    cp "$path" "$dest" 2>/dev/null || true
+    log "cached module: $name"
+}
+
+_do_sync_modules() {
+    _s3_ok || return 0
+    log "sync modules: start"
+    sq-s3 sync-modules 2>/dev/null
+    log "sync modules: done"
+}
+
+_do_sync_snapshots() {
+    local id="$1"
+    _s3_ok || return 0
+    log "sync snapshots ($id): start"
+    sq-s3 sync-snapshots "$id" 2>/dev/null
+    log "sync snapshots ($id): done"
+}
+
+# ── Periodic sync loop ──────────────────────────────────────────────
+
+_periodic_sync() {
+    while true; do
+        sleep "$SYNC_INTERVAL"
+        _drain_spool
+        _s3_ok && _do_sync_modules
+    done
+}
+
+# ── Bus listener (server mode) ──────────────────────────────────────
+
+_listen() {
+    # Remove stale socket
+    rm -f "$BUS_SOCK"
+
+    log "listening on $BUS_SOCK (S3: $(_s3_ok && echo enabled || echo disabled))"
+
+    # Start periodic sync in background
+    _periodic_sync &
+    local sync_pid=$!
+
+    # Drain any spooled messages
+    _drain_spool
+
+    # Listen for connections — socat forks a handler per connection
+    # Each connection can send multiple newline-delimited messages
+    socat UNIX-LISTEN:"$BUS_SOCK",fork,reuseaddr SYSTEM:'while IFS= read -r line; do
+        echo "$line" | '"$0"' --process-line
+    done' &
+    local socat_pid=$!
+
+    # Wait for termination
+    trap '_cleanup' INT TERM
+    wait $socat_pid 2>/dev/null || true
+    kill $sync_pid 2>/dev/null || true
+}
+
+_cleanup() {
+    rm -f "$BUS_SOCK" "$PIDFILE"
+    log "cleaned up"
+}
+
+# ── Main ────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --daemon)
+        _listen &
+        echo $! > "$PIDFILE"
+        log "daemonized (PID $(cat "$PIDFILE"))"
+        ;;
+    --notify)
+        [ -z "${2:-}" ] && { echo "usage: sq-sync --notify '<json>'" >&2; exit 1; }
+        notify "$2"
+        ;;
+    --process-line)
+        # Internal: called by socat fork for each line
+        while IFS= read -r line; do
+            _process_message "$line"
+        done
+        ;;
+    --status)
+        if [ -S "$BUS_SOCK" ]; then
+            echo "bus: up ($BUS_SOCK)"
+            [ -f "$PIDFILE" ] && echo "pid: $(cat "$PIDFILE")" || echo "pid: unknown"
+        else
+            echo "bus: down"
+        fi
+        ;;
+    --stop)
+        if [ -S "$BUS_SOCK" ]; then
+            notify '{"op":"shutdown"}'
+        elif [ -f "$PIDFILE" ]; then
+            kill "$(cat "$PIDFILE")" 2>/dev/null || true
+            rm -f "$PIDFILE"
+        fi
+        ;;
+    "")
+        _listen
+        ;;
+    *)
+        cat <<'EOF'
+usage: sq-sync [option]
+
+  (no args)         start bus listener (foreground)
+  --daemon          start bus listener (background, writes PID)
+  --notify <json>   send a notification to the bus
+  --status          check if bus is running
+  --stop            stop the bus
+
+Env vars:
+  SQUASH_BUS_SOCK          Unix socket path (default: /data/.sq-bus.sock)
+  SQUASH_SYNC_INTERVAL     seconds between periodic syncs (default: 300)
+  SQUASH_S3_BUCKET         S3 bucket (empty = local-only mode)
+  SQUASH_LOCAL_CACHE_DIR   local cache directory
+EOF
+        ;;
+esac

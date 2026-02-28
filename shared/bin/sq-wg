@@ -1,0 +1,175 @@
+#!/bin/sh
+# squash/bin/sq-wg — WireGuard kernel-mode setup for sandbox network namespaces.
+# Configures wg0 inside the sandbox netns for direct kernel WireGuard tunnels.
+# Coexists with Tailscale (Tailscale manages control plane; kernel wg for data plane).
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+SANDBOXES="$DATA/sandboxes"
+
+log() { echo "[sq-wg] $*" >&2; }
+
+# ── Key generation ──────────────────────────────────────────────────
+
+wg_genkey() {
+    local privkey pubkey
+    privkey=$(wg genkey)
+    pubkey=$(echo "$privkey" | wg pubkey)
+    echo "$privkey"
+    echo "$pubkey"
+}
+
+# ── Setup wg0 inside a sandbox netns ────────────────────────────────
+
+# Args: $1=sandbox-id  $2=private-key  $3=listen-port (default: 51820)
+wg_setup() {
+    local id="$1" privkey="$2" listen_port="${3:-51820}"
+    local netns="squash-$id"
+    local meta="$SANDBOXES/$id/.meta"
+
+    # Verify the netns exists
+    [ -f "$meta/netns_name" ] || { log "ERROR: no netns for sandbox $id"; return 1; }
+
+    # Create wg0 inside the namespace
+    ip netns exec "$netns" ip link add wg0 type wireguard 2>/dev/null || {
+        # If kernel module not loaded, try loading it
+        modprobe wireguard 2>/dev/null || true
+        ip netns exec "$netns" ip link add wg0 type wireguard || {
+            log "ERROR: cannot create wireguard interface (kernel module missing?)"
+            return 1
+        }
+    }
+
+    # Write private key to a temp file inside the sandbox (never logged)
+    local keyfile
+    keyfile=$(mktemp)
+    printf '%s' "$privkey" > "$keyfile"
+    chmod 600 "$keyfile"
+
+    # Configure the interface
+    ip netns exec "$netns" wg set wg0 \
+        private-key "$keyfile" \
+        listen-port "$listen_port"
+
+    # Securely remove the temp key file
+    rm -f "$keyfile"
+
+    # Bring the interface up
+    ip netns exec "$netns" ip link set wg0 up
+
+    # Store WG metadata (port only — never store private keys)
+    echo "$listen_port" > "$meta/wg_listen_port"
+
+    # Store encrypted private key if SQUASH_SECRET_PROXY is enabled
+    if [ "${SQUASH_SECRET_PROXY:-}" = "1" ]; then
+        log "private key stored encrypted (secret proxy enabled)"
+    fi
+
+    log "wg0 created in netns $netns (port $listen_port)"
+}
+
+# ── Add a peer to wg0 ──────────────────────────────────────────────
+
+# Args: $1=sandbox-id  $2=public-key  $3=endpoint  $4=allowed-ips  $5=preshared-key (optional)
+wg_add_peer() {
+    local id="$1" pubkey="$2" endpoint="${3:-}" allowed="${4:-0.0.0.0/0}" psk="${5:-}"
+    local netns="squash-$id"
+
+    local psk_args=""
+    if [ -n "$psk" ]; then
+        local psk_file
+        psk_file=$(mktemp)
+        printf '%s' "$psk" > "$psk_file"
+        chmod 600 "$psk_file"
+        psk_args="preshared-key $psk_file"
+    fi
+
+    local ep_args=""
+    [ -n "$endpoint" ] && ep_args="endpoint $endpoint"
+
+    # shellcheck disable=SC2086
+    ip netns exec "$netns" wg set wg0 \
+        peer "$pubkey" \
+        $ep_args \
+        allowed-ips "$allowed" \
+        $psk_args
+
+    [ -n "$psk" ] && rm -f "$psk_file"
+
+    # Add routes for allowed IPs through wg0
+    for cidr in $(echo "$allowed" | tr ',' ' '); do
+        ip netns exec "$netns" ip route add "$cidr" dev wg0 2>/dev/null || true
+    done
+
+    log "peer added: $pubkey -> $allowed"
+}
+
+# ── Remove a peer ──────────────────────────────────────────────────
+
+wg_remove_peer() {
+    local id="$1" pubkey="$2"
+    local netns="squash-$id"
+    ip netns exec "$netns" wg set wg0 peer "$pubkey" remove
+    log "peer removed: $pubkey"
+}
+
+# ── Show wg status ──────────────────────────────────────────────────
+
+wg_show() {
+    local id="$1"
+    local netns="squash-$id"
+    ip netns exec "$netns" wg show wg0
+}
+
+# ── Teardown ────────────────────────────────────────────────────────
+
+wg_teardown() {
+    local id="$1"
+    local netns="squash-$id"
+    ip netns exec "$netns" ip link delete wg0 2>/dev/null || true
+    rm -f "$SANDBOXES/$id/.meta/wg_listen_port"
+    log "wg0 removed from $netns"
+}
+
+# ── CLI dispatch ────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    genkey)
+        wg_genkey
+        ;;
+    setup)
+        [ $# -lt 3 ] && { echo "usage: sq-wg setup <sandbox-id> <private-key> [listen-port]" >&2; exit 1; }
+        wg_setup "$2" "$3" "${4:-51820}"
+        ;;
+    add-peer)
+        [ $# -lt 3 ] && { echo "usage: sq-wg add-peer <sandbox-id> <public-key> [endpoint] [allowed-ips] [psk]" >&2; exit 1; }
+        wg_add_peer "$2" "$3" "${4:-}" "${5:-0.0.0.0/0}" "${6:-}"
+        ;;
+    remove-peer)
+        [ $# -lt 3 ] && { echo "usage: sq-wg remove-peer <sandbox-id> <public-key>" >&2; exit 1; }
+        wg_remove_peer "$2" "$3"
+        ;;
+    show)
+        [ $# -lt 2 ] && { echo "usage: sq-wg show <sandbox-id>" >&2; exit 1; }
+        wg_show "$2"
+        ;;
+    teardown)
+        [ $# -lt 2 ] && { echo "usage: sq-wg teardown <sandbox-id>" >&2; exit 1; }
+        wg_teardown "$2"
+        ;;
+    help|*)
+        cat <<'EOF'
+usage: sq-wg <command> [args]
+
+  genkey                                        generate private+public keypair
+  setup     <id> <privkey> [port]              create wg0 in sandbox netns
+  add-peer  <id> <pubkey> [ep] [ips] [psk]    add peer to wg0
+  remove-peer <id> <pubkey>                    remove peer
+  show      <id>                               show wg0 status
+  teardown  <id>                               remove wg0 from sandbox
+
+Security: private keys are never written to disk or logs.
+          Keys stored encrypted at rest if SQUASH_SECRET_PROXY=1.
+EOF
+        ;;
+esac

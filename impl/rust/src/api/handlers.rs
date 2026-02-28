@@ -368,6 +368,114 @@ pub async fn get_logs(
     Ok(Json(logs.into_iter().map(exec_result_to_api).collect()))
 }
 
+// ── WireGuard ───────────────────────────────────────────────────────
+
+/// POST /cgi-bin/api/sandboxes/:id/wg/peers
+///
+/// Add WireGuard peers to the sandbox's wg0 interface. If wg0 does not exist,
+/// it is created with a fresh keypair. Peers are specified as a JSON array.
+pub async fn wg_add_peers(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(peers): Json<Vec<crate::sandbox::wireguard::WgPeer>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::sandbox::wireguard;
+
+    let handle = state
+        .sandbox_manager
+        .get(&id)
+        .map_err(|_| ApiError::not_found(format!("not found: {}", id)))?;
+
+    let sandbox = handle.lock().await;
+
+    // Require a network namespace
+    let netns_name = sandbox
+        .netns
+        .as_ref()
+        .map(|n| n.name().to_string())
+        .ok_or_else(|| ApiError::bad_request("sandbox has no network namespace"))?;
+
+    let meta_dir = sandbox.meta_dir();
+    drop(sandbox);
+
+    // Check if wg0 already exists by reading metadata
+    let wg_exists = meta_dir.join("wg_listen_port").exists();
+
+    if !wg_exists {
+        // Generate a keypair and set up wg0
+        let (privkey, pubkey) = wireguard::generate_keypair()
+            .map_err(|e| ApiError::internal(format!("wg genkey failed: {}", e)))?;
+
+        let wg = wireguard::WgHandle::setup(&id, &netns_name, &privkey, 51820)
+            .map_err(|e| ApiError::internal(format!("wg setup failed: {}", e)))?;
+
+        wg.write_metadata(&meta_dir)
+            .map_err(|e| ApiError::internal(format!("wg metadata: {}", e)))?;
+
+        // Store public key in metadata (not the private key)
+        std::fs::write(meta_dir.join("wg_public_key"), &pubkey)
+            .map_err(|e| ApiError::internal(format!("write pubkey: {}", e)))?;
+
+        // Add all peers
+        for peer in &peers {
+            wg.add_peer(peer)
+                .map_err(|e| ApiError::internal(format!("add peer: {}", e)))?;
+        }
+
+        // Prevent Drop from cleaning up — the interface should persist
+        std::mem::forget(wg);
+
+        Ok(Json(serde_json::json!({
+            "status": "ok",
+            "publicKey": pubkey,
+            "listenPort": 51820,
+            "peersAdded": peers.len(),
+        })))
+    } else {
+        // wg0 exists — just add peers via shell commands
+        for peer in &peers {
+            let mut args = vec![
+                "netns", "exec", &netns_name, "wg", "set", "wg0",
+                "peer", &peer.public_key,
+                "allowed-ips", &peer.allowed_ips,
+            ];
+            if !peer.endpoint.is_empty() {
+                args.push("endpoint");
+                args.push(&peer.endpoint);
+            }
+            let output = std::process::Command::new("ip").args(&args).output()
+                .map_err(|e| ApiError::internal(format!("wg set: {}", e)))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(ApiError::internal(format!("wg set failed: {}", stderr.trim())));
+            }
+
+            // Add routes
+            for cidr in peer.allowed_ips.split(',') {
+                let cidr = cidr.trim();
+                if !cidr.is_empty() {
+                    let _ = std::process::Command::new("ip")
+                        .args(["netns", "exec", &netns_name, "ip", "route", "add", cidr, "dev", "wg0"])
+                        .output();
+                }
+            }
+        }
+
+        let pubkey = std::fs::read_to_string(meta_dir.join("wg_public_key")).unwrap_or_default();
+        let port = std::fs::read_to_string(meta_dir.join("wg_listen_port"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(51820);
+
+        Ok(Json(serde_json::json!({
+            "status": "ok",
+            "publicKey": pubkey.trim(),
+            "listenPort": port,
+            "peersAdded": peers.len(),
+        })))
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Build a SandboxInfo response from a locked Sandbox.

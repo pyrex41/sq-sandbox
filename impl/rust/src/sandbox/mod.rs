@@ -14,6 +14,7 @@ pub mod mounts;
 #[cfg(target_os = "linux")]
 pub mod netns;
 pub mod snapshot;
+pub mod wireguard;
 
 use std::path::PathBuf;
 use std::sync::Arc;

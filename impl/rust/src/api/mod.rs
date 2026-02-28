@@ -46,6 +46,7 @@ pub fn router(
         .route("/cgi-bin/api/sandboxes/{id}/snapshot", post(handlers::snapshot_sandbox))
         .route("/cgi-bin/api/sandboxes/{id}/restore", post(handlers::restore_sandbox))
         .route("/cgi-bin/api/sandboxes/{id}/logs", get(handlers::get_logs))
+        .route("/cgi-bin/api/sandboxes/{id}/wg/peers", post(handlers::wg_add_peers))
         .route("/cgi-bin/api/modules", get(handlers::list_modules))
         .layer(axum_mw::from_fn_with_state(
             state.clone(),

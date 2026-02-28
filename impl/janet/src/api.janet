@@ -10,6 +10,7 @@
 (import validate :prefix "validate/")
 (import manager :prefix "manager/")
 (import modules :prefix "modules/")
+(import s3 :prefix "s3/")
 (import json)
 
 # ── Response helpers ──────────────────────────────────────────────────
@@ -224,6 +225,64 @@
 (defn- handle-logs [id manager]
   (json-response (manager/manager-exec-logs manager id) 200))
 
+(defn- handle-wg-peers [id req config manager]
+  (def data (parse-json-body req))
+  (def peers (if (indexed? data) data @[]))
+  (def sb (manager/manager-get manager id))
+  (when (not sb) (error (string/format "not found: %s" id)))
+  # Check for network namespace
+  (def sdir (get sb :dir))
+  (def netns-file (string sdir "/.meta/netns_name"))
+  (def netns-data (try (slurp netns-file) ([e] nil)))
+  (when (or (not netns-data) (= (length (string/trim netns-data)) 0))
+    (break (error-response "sandbox has no network namespace" 400)))
+  # Set up wg0 if not already present
+  (def port-file (string sdir "/.meta/wg_listen_port"))
+  (when (not (os/stat port-file))
+    (def [ok fib] (protect
+      (do
+        (def proc (os/spawn ["sq-wg" "genkey"] :p @{:out :pipe}))
+        (def out (ev/read (get proc :out) :all))
+        (os/proc-wait proc)
+        (string out))))
+    (when (not ok) (break (error-response "wg genkey failed" 500)))
+    (def lines (filter |(> (length $) 0)
+                 (map string/trim (string/split "\n" (string fib)))))
+    (when (< (length lines) 2) (break (error-response "wg genkey: bad output" 500)))
+    (def privkey (get lines 0))
+    (def pubkey (get lines 1))
+    (os/execute ["sq-wg" "setup" id privkey "51820"] :p)
+    (spit (string sdir "/.meta/wg_public_key") pubkey))
+  # Add each peer
+  (each peer peers
+    (def pk (get peer "publicKey"))
+    (when pk
+      (def ep (get peer "endpoint" ""))
+      (def ips (get peer "allowedIPs" "0.0.0.0/0"))
+      (def psk (get peer "presharedKey" ""))
+      (os/execute ["sq-wg" "add-peer" id pk ep ips psk] :p)))
+  # Read back metadata
+  (def pubkey (string/trim (try (slurp (string sdir "/.meta/wg_public_key")) ([e] ""))))
+  (json-response @{
+    :status "ok"
+    :publicKey pubkey
+    :listenPort 51820
+    :peersAdded (length peers)
+  } 200))
+
+# ── Bus notify helper ────────────────────────────────────────────────
+
+(defn- notify-snapshot-push
+  "Notify sq-sync sidecar to push snapshot to S3. Falls back to direct push."
+  [config local-path s3-key]
+  (def bus-sock (config/bus-sock-path config))
+  (when (and bus-sock (os/stat bus-sock))
+    (def msg (string/format `{"op":"push","path":"%s","key":"%s"}` local-path s3-key))
+    (try (os/execute ["sq-sync" "--notify" msg] :p) ([e] nil))
+    (break true))
+  # Fallback to direct S3 push
+  (s3/push-bg config local-path s3-key))
+
 # ── Request dispatch ─────────────────────────────────────────────────
 
 (defn- dispatch
@@ -273,6 +332,9 @@
 
         (and (= action "logs") (= method "GET"))
         (handle-logs id manager)
+
+        (and (= action "wg/peers") (= method "POST"))
+        (handle-wg-peers id req config manager)
 
         (error-response "not found" 404)))
 

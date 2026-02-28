@@ -39,6 +39,11 @@
     :proxy-https (env-bool "SQUASH_PROXY_HTTPS")
     :tailscale-authkey (env-or "TAILSCALE_AUTHKEY" nil)
     :tailscale-hostname (env-or "TAILSCALE_HOSTNAME" "squash")
+    :upper-backend (env-or "SQUASH_UPPER_BACKEND" "tmpfs")
+    :local-cache-dir (env-or "SQUASH_LOCAL_CACHE_DIR"
+                       (string (data-dir-from-env) "/cache"))
+    :bus-sock-path (env-or "SQUASH_BUS_SOCK"
+                    (string (data-dir-from-env) "/.sq-bus.sock"))
   })
 
 (defn modules-dir [config]
@@ -49,6 +54,9 @@
 
 (defn proxy-ca-dir [config]
   (string (get config :data-dir) "/proxy-ca"))
+
+(defn bus-sock-path [config]
+  (get config :bus-sock-path (string (get config :data-dir) "/.sq-bus.sock")))
 
 # ── Validation (fail-fast at startup) ───────────────────────────────────────
 

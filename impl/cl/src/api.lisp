@@ -301,6 +301,94 @@
             (json-response 500
               (list :|error| (format nil "~A" e)))))))
 
+;;; ── WireGuard peers route ────────────────────────────────────────────
+
+(setf (ningle:route *app* "/cgi-bin/api/sandboxes/:id/wg/peers" :method :POST)
+      (lambda (params)
+        (let ((id (cdr (assoc :id params))))
+          (handler-case
+              (let* ((body (parse-json-body ningle:*request*))
+                     (peers (if (listp body) body nil)))
+                ;; Require sandbox to exist with a netns
+                (let* ((sandbox (%lookup-sandbox *manager* id))
+                       (netns (when sandbox
+                                (let ((n (sandbox-netns sandbox)))
+                                  (when n (netns-handle-name n))))))
+                  (unless netns
+                    (return-from nil
+                      (json-response 400
+                        '(:|error| "sandbox has no network namespace"))))
+                  ;; Set up wg0 if not already present
+                  (let* ((meta-dir (format nil "~A/sandboxes/~A/.meta"
+                                          (config-data-dir *config*) id))
+                         (port-file (format nil "~A/wg_listen_port" meta-dir))
+                         (wg-exists (probe-file port-file)))
+                    (unless wg-exists
+                      ;; Generate keypair via sq-wg
+                      (let ((genkey-output
+                              (with-output-to-string (s)
+                                (uiop:run-program '("sq-wg" "genkey")
+                                  :output s :ignore-error-status t))))
+                        (let* ((lines (cl-ppcre:split "\\n"
+                                        (string-trim '(#\Space #\Newline #\Return)
+                                                     genkey-output)))
+                               (privkey (first lines))
+                               (pubkey (second lines)))
+                          (unless (and privkey pubkey)
+                            (return-from nil
+                              (json-response 500
+                                '(:|error| "wg genkey failed"))))
+                          ;; Setup wg0
+                          (uiop:run-program
+                            (list "sq-wg" "setup" id privkey "51820")
+                            :ignore-error-status t)
+                          ;; Store public key
+                          (with-open-file (out (format nil "~A/wg_public_key" meta-dir)
+                                           :direction :output :if-exists :supersede)
+                            (write-string pubkey out)))))
+                    ;; Add each peer
+                    (dolist (peer peers)
+                      (let ((pk (getf peer :|publicKey|))
+                            (ep (or (getf peer :|endpoint|) ""))
+                            (ips (or (getf peer :|allowedIPs|) "0.0.0.0/0"))
+                            (psk (or (getf peer :|presharedKey|) "")))
+                        (when pk
+                          (uiop:run-program
+                            (list "sq-wg" "add-peer" id pk ep ips psk)
+                            :ignore-error-status t))))
+                    ;; Read back metadata
+                    (let ((pubkey (handler-case
+                                     (string-trim '(#\Space #\Newline #\Return)
+                                       (uiop:read-file-string
+                                         (format nil "~A/wg_public_key" meta-dir)))
+                                   (error () ""))))
+                      (json-response 200
+                        (list :|status| "ok"
+                              :|publicKey| pubkey
+                              :|listenPort| 51820
+                              :|peersAdded| (length peers)))))))
+            (sandbox-error (e)
+              (json-response 404
+                (list :|error| (format nil "~A" e))))))))
+
+;;; ── Bus notify helper ──────────────────────────────────────────────
+
+(defun bus-notify-push (config local-path s3-key)
+  "Notify sq-sync sidecar to push a file to S3. Falls back to direct S3 push."
+  (let ((bus-sock (config-bus-sock-path config)))
+    (when (and bus-sock (probe-file bus-sock))
+      (let ((msg (format nil "{\"op\":\"push\",\"path\":\"~A\",\"key\":\"~A\"}"
+                         local-path s3-key)))
+        (ignore-errors
+          (uiop:run-program (list "sq-sync" "--notify" msg)
+                            :ignore-error-status t))
+        (return-from bus-notify-push t))))
+  ;; Fallback: direct S3 push
+  (when *s3-client*
+    (ignore-errors
+      (s3-push-bg *s3-client* local-path s3-key)))
+  nil)
+
 ;;; ── Conversion helpers ───────────────────────────────────────────────
 
 (defun exec-result-to-alist (result)

@@ -6,6 +6,7 @@ mod proxy;
 mod reaper;
 mod s3;
 mod sandbox;
+pub mod storage;
 mod validate;
 
 use std::sync::Arc;

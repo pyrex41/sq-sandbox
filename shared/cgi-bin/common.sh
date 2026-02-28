@@ -474,11 +474,18 @@ _chroot_create_sandbox() {
         mod_exists "$mod" || { echo "module not found: $mod" >&2; return 2; }
     done
 
-    # Build directory tree (upper is a size-limited tmpfs holding overlay data + workdir)
+    # Build directory tree — upper layer uses SQUASH_UPPER_BACKEND (default: tmpfs)
     mkdir -p "$s/images" "$s/upper" "$s/merged" "$s/.meta/log"
-    local upper_limit="${SQUASH_UPPER_LIMIT_MB:-512}"
-    mount -t tmpfs -o "size=${upper_limit}M" tmpfs "$s/upper"
-    mkdir -p "$s/upper/data" "$s/upper/work"
+    local storage_sh
+    storage_sh="$(dirname "$(dirname "$0")")/storage.sh"
+    if [ -f "$storage_sh" ]; then
+        . "$storage_sh"
+        upper_mount "$s/upper"
+    else
+        local upper_limit="${SQUASH_UPPER_LIMIT_MB:-512}"
+        mount -t tmpfs -o "size=${upper_limit}M" tmpfs "$s/upper"
+        mkdir -p "$s/upper/data" "$s/upper/work"
+    fi
 
     # Metadata as files
     echo "$owner"          > "$s/.meta/owner"

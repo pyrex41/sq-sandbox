@@ -368,3 +368,188 @@ and how much is implemented in-language vs. delegated to external tools.
 | Strongest typing | Rust, Zig |
 | Simplest deployment | Janet (single interpreter) |
 | Production hardening | Rust (tracing, error types, async, RAII) |
+
+## Advanced Networking & Storage
+
+### Hybrid Local-First Storage
+
+By default, sandbox upper layers use `tmpfs` (RAM-backed). New env vars enable
+persistent, faster storage backends and local caching:
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `SQUASH_UPPER_BACKEND` | `tmpfs` | Upper layer backend: `tmpfs`, `btrfs`, or `loop` |
+| `SQUASH_LOCAL_CACHE_DIR` | `~/.cache/sq-sandbox` | Local cache for modules and snapshots |
+| `SQUASH_UPPER_LIMIT_MB` | `512` | Size limit for tmpfs/loop backends |
+
+#### Upper backends
+
+- **tmpfs** (default): RAM-backed, zero-config. Fastest for ephemeral workloads. Data lost on reboot.
+- **btrfs**: Creates a btrfs subvolume per sandbox under `/data/upper/`. Enables near-instant
+  snapshots via `btrfs subvolume snapshot -r` (< 10ms). Requires the host volume to be btrfs-formatted.
+- **loop**: Sparse file + ext4 loopback mount. Works on any filesystem. Persists across restarts.
+
+```sh
+# Use btrfs for instant snapshots
+docker run -d --privileged \
+  -e SQUASH_UPPER_BACKEND=btrfs \
+  -v /path/to/btrfs-volume:/data \
+  ghcr.io/pyrex41/sq-sandbox:latest
+
+# Fast local snapshot (btrfs only, no mksquashfs overhead)
+sq-ctl snapshot dev fast-snap --local
+```
+
+#### Local cache
+
+Modules and snapshots are cached at `SQUASH_LOCAL_CACHE_DIR` even when S3 is enabled.
+This eliminates redundant S3 downloads on restart:
+
+```sh
+# Pure local mode (no S3)
+docker run -d --privileged \
+  -v squash-data:/data \
+  -v ~/.cache/sq-sandbox:/cache \
+  -e SQUASH_LOCAL_CACHE_DIR=/cache \
+  ghcr.io/pyrex41/sq-sandbox:latest
+```
+
+When `SQUASH_S3_BUCKET` is empty (or unset), all S3 logic is automatically disabled.
+Existing behavior with `SQUASH_EPHEMERAL=1` is fully preserved.
+
+#### Background delta sync
+
+After any snapshot, changes are queued for incremental push to S3 via a SQLite-backed
+queue at `$SQUASH_LOCAL_CACHE_DIR/sync.db`. Process the queue explicitly:
+
+```sh
+sq-ctl sync --background    # drain the sync queue
+sq-ctl sync sandbox-id      # bi-directional sync (existing behavior)
+```
+
+### Kernel-Level WireGuard
+
+First-class WireGuard support for sandbox-to-sandbox networking. Uses the kernel
+wireguard module (not userspace wireguard-go) for maximum throughput.
+
+#### Setup
+
+1. Activate the wireguard module:
+   ```sh
+   sq-ctl activate dev 030-wireguard
+   ```
+
+2. Add peers via API:
+   ```sh
+   curl -X POST localhost:8080/cgi-bin/api/sandboxes/dev/wg/peers \
+     -d '[{"publicKey":"PEER_PUBKEY","endpoint":"1.2.3.4:51820","allowedIPs":"10.0.0.0/24"}]'
+   ```
+
+3. Or via CLI:
+   ```sh
+   sq-ctl wg genkey                            # generate keypair
+   sq-ctl wg add-peer dev PUBKEY 1.2.3.4:51820 10.0.0.0/24
+   ```
+
+#### API: `POST /cgi-bin/api/sandboxes/:id/wg/peers`
+
+Request body (JSON array of peers):
+```json
+[
+  {
+    "publicKey": "base64-encoded-public-key",
+    "endpoint": "1.2.3.4:51820",
+    "allowedIPs": "10.0.0.0/24",
+    "presharedKey": "optional-base64-psk"
+  }
+]
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "publicKey": "sandbox-public-key",
+  "listenPort": 51820,
+  "peersAdded": 1
+}
+```
+
+#### Backend support
+
+| Backend | WireGuard support | Notes |
+|---------|-------------------|-------|
+| chroot | Kernel wg0 in sandbox netns | Full performance, coexists with Tailscale |
+| Firecracker | Guest kernel wireguard.ko | Config passed via vsock/cloud-init |
+| gVisor | Userspace only (document only) | Not implemented; use Tailscale instead |
+
+#### Security
+
+- Private keys **never leave the sandbox** — written to a temp file, passed to `wg set`, immediately deleted.
+- Keys are **never logged**.
+- If `SQUASH_SECRET_PROXY=1`, keys are stored encrypted at rest.
+- Existing `allow_net` iptables rules apply in front of wg0.
+
+#### Example: two-sandbox WireGuard tunnel
+
+```sh
+# Create two sandboxes
+sq-ctl create sb-a alice 000-base-alpine,030-wireguard
+sq-ctl create sb-b bob   000-base-alpine,030-wireguard
+
+# Generate keypairs (privkey on stderr, pubkey on stdout)
+KEY_A=$(sq-ctl wg genkey 2>/tmp/priv-a)
+KEY_B=$(sq-ctl wg genkey 2>/tmp/priv-b)
+
+# Set up WireGuard on each
+sq-wg setup sb-a "$(cat /tmp/priv-a)" 51820
+sq-wg setup sb-b "$(cat /tmp/priv-b)" 51821
+
+# Assign IPs
+ip netns exec squash-sb-a ip addr add 10.0.0.1/24 dev wg0
+ip netns exec squash-sb-b ip addr add 10.0.0.2/24 dev wg0
+
+# Add peers (cross-connect)
+sq-wg add-peer sb-a "$KEY_B" "$(ip netns exec squash-sb-b wg show wg0 | grep endpoint)" 10.0.0.2/32
+sq-wg add-peer sb-b "$KEY_A" "" 10.0.0.1/32
+
+# Test throughput
+sq-ctl exec sb-a "iperf3 -s -D"
+sq-ctl exec sb-b "iperf3 -c 10.0.0.1 -t 5"
+```
+
+### How to Test
+
+**Storage backends:**
+```sh
+# Tmpfs (default) — no special setup
+docker run -d --privileged -p 8080:8080 ghcr.io/pyrex41/sq-sandbox:latest
+sq-ctl create dev alice && sq-ctl snapshot dev test-snap
+
+# Btrfs backend
+mkfs.btrfs /dev/sdX && mount /dev/sdX /mnt/btrfs
+docker run -d --privileged -e SQUASH_UPPER_BACKEND=btrfs -v /mnt/btrfs:/data ...
+sq-ctl create dev alice && sq-ctl snapshot dev fast --local  # < 10ms
+
+# Loop backend
+docker run -d --privileged -e SQUASH_UPPER_BACKEND=loop ...
+
+# Local cache (no S3)
+docker run -d --privileged -e SQUASH_LOCAL_CACHE_DIR=/cache -v /tmp/cache:/cache ...
+
+# S3 fallback test
+docker run -d --privileged -e SQUASH_S3_BUCKET=my-bucket ...
+sq-ctl snapshot dev snap1
+sq-ctl sync --background  # push to S3
+```
+
+**WireGuard:**
+```sh
+# Requires: wireguard kernel module loaded on host
+modprobe wireguard
+
+docker run -d --privileged -p 8080:8080 ghcr.io/pyrex41/sq-sandbox:latest
+sq-ctl create sb1 alice 000-base-alpine,030-wireguard
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/sb1/wg/peers \
+  -d '[{"publicKey":"test","allowedIPs":"10.0.0.0/24"}]'
+```

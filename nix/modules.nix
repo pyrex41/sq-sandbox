@@ -12,4 +12,5 @@ in {
   module-nodejs22 = nodejs.nodejs22;
   module-golang = callModule ../modules/golang.nix;
   module-tailscale = callModule ../modules/tailscale.nix;
+  module-wireguard = callModule ../modules/wireguard.nix;
 }

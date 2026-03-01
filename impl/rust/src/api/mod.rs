@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::services::ServeDir;
 
+use crate::bus::Bus;
 use crate::config::Config;
 use crate::s3::S3Store;
 use crate::sandbox::manager::SandboxManager;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub sandbox_manager: Arc<SandboxManager>,
     pub s3: Option<Arc<S3Store>>,
+    pub bus: Arc<Bus>,
 }
 
 /// Build the complete API router with auth and content-type middleware.
@@ -27,11 +29,13 @@ pub fn router(
     config: Arc<Config>,
     sandbox_manager: Arc<SandboxManager>,
     s3: Option<Arc<S3Store>>,
+    bus: Arc<Bus>,
 ) -> Router {
     let state = AppState {
         config,
         sandbox_manager,
         s3,
+        bus,
     };
 
     // Routes that require authentication (when SQUASH_AUTH_TOKEN is set)
@@ -46,6 +50,7 @@ pub fn router(
         .route("/cgi-bin/api/sandboxes/{id}/snapshot", post(handlers::snapshot_sandbox))
         .route("/cgi-bin/api/sandboxes/{id}/restore", post(handlers::restore_sandbox))
         .route("/cgi-bin/api/sandboxes/{id}/logs", get(handlers::get_logs))
+        .route("/cgi-bin/api/sandboxes/{id}/wg/peers", post(handlers::wg_add_peers))
         .route("/cgi-bin/api/modules", get(handlers::list_modules))
         .layer(axum_mw::from_fn_with_state(
             state.clone(),

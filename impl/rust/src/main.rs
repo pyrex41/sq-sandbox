@@ -1,4 +1,5 @@
 mod api;
+pub mod bus;
 mod config;
 mod init;
 mod modules;
@@ -6,6 +7,7 @@ mod proxy;
 mod reaper;
 mod s3;
 mod sandbox;
+pub mod storage;
 mod validate;
 
 use std::sync::Arc;
@@ -41,6 +43,15 @@ async fn main() {
     } else {
         None
     };
+
+    // 3b. Set up IPC bus for sidecar communication
+    let bus = Arc::new(bus::Bus::from_data_dir(&config.data_dir));
+
+    // 3c. Start sq-sync sidecar (if not already running)
+    match bus::spawn_sidecar(&config.data_dir) {
+        Ok(()) => info!("sync sidecar ready"),
+        Err(e) => warn!("sync sidecar not started: {} (S3 push will be inline)", e),
+    }
 
     // 4. Create sandbox manager
     let sandbox_manager = Arc::new(sandbox::manager::SandboxManager::new(config.max_sandboxes));
@@ -88,7 +99,12 @@ async fn main() {
 
     // 9. Build API router and start server
     let port = config.port;
-    let app = api::router(Arc::clone(&config), Arc::clone(&sandbox_manager), s3.clone());
+    let app = api::router(
+        Arc::clone(&config),
+        Arc::clone(&sandbox_manager),
+        s3.clone(),
+        Arc::clone(&bus),
+    );
 
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await

@@ -474,11 +474,18 @@ _chroot_create_sandbox() {
         mod_exists "$mod" || { echo "module not found: $mod" >&2; return 2; }
     done
 
-    # Build directory tree (upper is a size-limited tmpfs holding overlay data + workdir)
+    # Build directory tree — upper layer uses SQUASH_UPPER_BACKEND (default: tmpfs)
     mkdir -p "$s/images" "$s/upper" "$s/merged" "$s/.meta/log"
-    local upper_limit="${SQUASH_UPPER_LIMIT_MB:-512}"
-    mount -t tmpfs -o "size=${upper_limit}M" tmpfs "$s/upper"
-    mkdir -p "$s/upper/data" "$s/upper/work"
+    local storage_sh
+    storage_sh="$(dirname "$(dirname "$0")")/storage.sh"
+    if [ -f "$storage_sh" ]; then
+        . "$storage_sh"
+        upper_mount "$s/upper"
+    else
+        local upper_limit="${SQUASH_UPPER_LIMIT_MB:-512}"
+        mount -t tmpfs -o "size=${upper_limit}M" tmpfs "$s/upper"
+        mkdir -p "$s/upper/data" "$s/upper/work"
+    fi
 
     # Metadata as files
     echo "$owner"          > "$s/.meta/owner"
@@ -654,7 +661,12 @@ _chroot_snapshot_sandbox() {
     jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
         '{label:$label,created:$created,size:$size}' >> "$s/.meta/snapshots.jsonl"
 
-    _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    # Notify sidecar for background S3 push (preferred) or push directly
+    if command -v sq-sync >/dev/null 2>&1; then
+        sq-sync --notify "{\"op\":\"push\",\"path\":\"$snapfile\",\"key\":\"sandboxes/$id/snapshots/$label.squashfs\"}"
+    elif _s3_enabled; then
+        sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    fi
 
     echo "$snapfile"
 }
@@ -928,7 +940,12 @@ _firecracker_snapshot_sandbox() {
     jq -n --arg label "$label" --arg created "$(date -Iseconds)" --argjson size "$size" \
         '{label:$label,created:$created,size:$size}' >> "$s/.meta/snapshots.jsonl"
 
-    _s3_enabled && sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    # Notify sidecar for background S3 push (preferred) or push directly
+    if command -v sq-sync >/dev/null 2>&1; then
+        sq-sync --notify "{\"op\":\"push\",\"path\":\"$snapfile\",\"key\":\"sandboxes/$id/snapshots/$label.squashfs\"}"
+    elif _s3_enabled; then
+        sq-s3 push-bg "$snapfile" "sandboxes/$id/snapshots/$label.squashfs"
+    fi
 
     echo "$snapfile"
 }

@@ -114,5 +114,37 @@ case "$action" in
         fi
         ;;
 
+    wg/peers)
+        [ "$method" = "POST" ] || { json_err 400 "POST only"; exit 0; }
+        require_json
+        body=$(read_body)
+        # Check for netns
+        netns_name=$(cat "$(sdir "$id")/.meta/netns_name" 2>/dev/null || echo "")
+        [ -z "$netns_name" ] && { json_err 400 "sandbox has no network namespace"; exit 0; }
+
+        # Set up wg0 if not already present
+        if [ ! -f "$(sdir "$id")/.meta/wg_listen_port" ]; then
+            keys=$(sq-wg genkey)
+            privkey=$(echo "$keys" | head -1)
+            pubkey=$(echo "$keys" | tail -1)
+            sq-wg setup "$id" "$privkey" 51820 || { json_err 500 "wg setup failed"; exit 0; }
+            echo "$pubkey" > "$(sdir "$id")/.meta/wg_public_key"
+        fi
+
+        # Add each peer
+        count=0
+        echo "$body" | jq -c '.[]' 2>/dev/null | while read -r peer; do
+            pk=$(echo "$peer" | jq -r '.publicKey')
+            ep=$(echo "$peer" | jq -r '.endpoint // ""')
+            ips=$(echo "$peer" | jq -r '.allowedIPs // "0.0.0.0/0"')
+            psk=$(echo "$peer" | jq -r '.presharedKey // ""')
+            sq-wg add-peer "$id" "$pk" "$ep" "$ips" "$psk"
+            count=$((count + 1))
+        done
+        pubkey=$(cat "$(sdir "$id")/.meta/wg_public_key" 2>/dev/null || echo "")
+        port=$(cat "$(sdir "$id")/.meta/wg_listen_port" 2>/dev/null || echo "51820")
+        json_ok "$(jq -n --arg pk "$pubkey" --argjson port "$port" '{status:"ok",publicKey:$pk,listenPort:$port}')"
+        ;;
+
     *) json_err 404 "unknown action: $action" ;;
 esac

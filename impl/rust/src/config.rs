@@ -7,6 +7,17 @@ pub enum Backend {
     Firecracker,
 }
 
+/// Upper layer storage backend for overlay writable layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpperBackend {
+    /// RAM-backed tmpfs (default, zero-config).
+    Tmpfs,
+    /// Btrfs subvolume under /data/upper — enables near-instant snapshots.
+    Btrfs,
+    /// Sparse loopback file + ext4/XFS overlay fallback.
+    Loop,
+}
+
 /// Top-level configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -20,6 +31,8 @@ pub struct Config {
     pub s3_prefix: String,
     pub ephemeral: bool,
     pub upper_limit_mb: u64,
+    pub upper_backend: UpperBackend,
+    pub local_cache_dir: PathBuf,
     pub max_sandboxes: usize,
     pub proxy_https: bool,
     pub tailscale_authkey: Option<String>,
@@ -67,6 +80,21 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(512);
 
+        let upper_backend = match std::env::var("SQUASH_UPPER_BACKEND").as_deref() {
+            Ok("btrfs") => UpperBackend::Btrfs,
+            Ok("loop") => UpperBackend::Loop,
+            _ => UpperBackend::Tmpfs,
+        };
+
+        let local_cache_dir = PathBuf::from(
+            std::env::var("SQUASH_LOCAL_CACHE_DIR")
+                .unwrap_or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|h| format!("{}/.cache/sq-sandbox", h))
+                        .unwrap_or_else(|_| "/tmp/sq-sandbox-cache".to_string())
+                }),
+        );
+
         let max_sandboxes = std::env::var("SQUASH_MAX_SANDBOXES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -92,6 +120,8 @@ impl Config {
             s3_prefix,
             ephemeral,
             upper_limit_mb,
+            upper_backend,
+            local_cache_dir,
             max_sandboxes,
             proxy_https,
             tailscale_authkey,
@@ -124,6 +154,21 @@ impl Config {
         self.data_dir.join("vm")
     }
 
+    /// Path to the local cache sync database.
+    pub fn sync_db_path(&self) -> PathBuf {
+        self.local_cache_dir.join("sync.db")
+    }
+
+    /// Path to cached modules in the local cache dir.
+    pub fn cache_modules_dir(&self) -> PathBuf {
+        self.local_cache_dir.join("modules")
+    }
+
+    /// Path to cached snapshots in the local cache dir.
+    pub fn cache_snapshots_dir(&self) -> PathBuf {
+        self.local_cache_dir.join("snapshots")
+    }
+
     /// Whether S3 is configured (bucket is set).
     pub fn s3_enabled(&self) -> bool {
         self.s3_bucket.is_some()
@@ -143,6 +188,8 @@ impl Default for Config {
             s3_prefix: String::new(),
             ephemeral: false,
             upper_limit_mb: 512,
+            upper_backend: UpperBackend::Tmpfs,
+            local_cache_dir: PathBuf::from("/tmp/sq-sandbox-cache"),
             max_sandboxes: 100,
             proxy_https: false,
             tailscale_authkey: None,
@@ -168,6 +215,7 @@ mod tests {
             "SQUASH_BACKEND", "SQUASH_DATA", "SQUASH_PORT", "SQUASH_AUTH_TOKEN",
             "SQUASH_S3_BUCKET", "SQUASH_S3_ENDPOINT", "SQUASH_S3_REGION",
             "SQUASH_S3_PREFIX", "SQUASH_EPHEMERAL", "SQUASH_UPPER_LIMIT_MB",
+            "SQUASH_UPPER_BACKEND", "SQUASH_LOCAL_CACHE_DIR",
             "SQUASH_MAX_SANDBOXES", "SQUASH_PROXY_HTTPS",
             "TAILSCALE_AUTHKEY", "TAILSCALE_HOSTNAME",
         ] {
@@ -182,6 +230,7 @@ mod tests {
         assert!(cfg.s3_bucket.is_none());
         assert!(!cfg.ephemeral);
         assert_eq!(cfg.upper_limit_mb, 512);
+        assert_eq!(cfg.upper_backend, UpperBackend::Tmpfs);
         assert_eq!(cfg.max_sandboxes, 100);
         assert!(!cfg.proxy_https);
         assert_eq!(cfg.s3_region, "us-east-1");
@@ -340,6 +389,35 @@ mod tests {
         assert!(Config::from_env().ephemeral);
 
         std::env::remove_var("SQUASH_EPHEMERAL");
+    }
+
+    #[test]
+    fn test_upper_backend_variants() {
+        let _env = env_lock();
+        std::env::set_var("SQUASH_UPPER_BACKEND", "btrfs");
+        assert_eq!(Config::from_env().upper_backend, UpperBackend::Btrfs);
+
+        std::env::set_var("SQUASH_UPPER_BACKEND", "loop");
+        assert_eq!(Config::from_env().upper_backend, UpperBackend::Loop);
+
+        std::env::set_var("SQUASH_UPPER_BACKEND", "tmpfs");
+        assert_eq!(Config::from_env().upper_backend, UpperBackend::Tmpfs);
+
+        std::env::set_var("SQUASH_UPPER_BACKEND", "unknown");
+        assert_eq!(Config::from_env().upper_backend, UpperBackend::Tmpfs);
+
+        std::env::remove_var("SQUASH_UPPER_BACKEND");
+    }
+
+    #[test]
+    fn test_local_cache_dir() {
+        let _env = env_lock();
+        std::env::set_var("SQUASH_LOCAL_CACHE_DIR", "/tmp/my-cache");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.local_cache_dir, PathBuf::from("/tmp/my-cache"));
+        assert_eq!(cfg.sync_db_path(), PathBuf::from("/tmp/my-cache/sync.db"));
+        assert_eq!(cfg.cache_modules_dir(), PathBuf::from("/tmp/my-cache/modules"));
+        std::env::remove_var("SQUASH_LOCAL_CACHE_DIR");
     }
 
     #[test]

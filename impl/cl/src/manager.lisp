@@ -785,12 +785,10 @@
                       (with-open-file (s snapfile :element-type '(unsigned-byte 8))
                         (file-length s))
                     (error () 0))))
-        ;; Background push to S3 if configured
-        (when *s3-client*
-          (ignore-errors
-            (s3-push-bg *s3-client* snapfile
-                        (format nil "sandboxes/~A/snapshots/~A.squashfs"
-                                id snap-label))))
+        ;; Prefer sq-sync sidecar for S3 push; fallback to direct
+        (bus-notify-push (manager-config manager) snapfile
+                         (format nil "sandboxes/~A/snapshots/~A.squashfs"
+                                 id snap-label))
         (values snap-label size)))))
 
 ;;; ── Restore ──────────────────────────────────────────────────────────

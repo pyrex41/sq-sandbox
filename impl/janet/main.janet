@@ -31,6 +31,13 @@
   (def [recovered failed] (init/init-recover cfg mgr))
   (eprintf "init: recovered %d sandboxes, %d failed\n" recovered failed)
 
+  # Start sq-sync sidecar (if available and not already running)
+  (def bus-sock (config/bus-sock-path cfg))
+  (when (and bus-sock (not (os/stat bus-sock)))
+    (when (= 0 (os/execute ["which" "sq-sync"] :p))
+      (os/execute ["sq-sync" "--daemon"] :p)
+      (eprintf "init: sq-sync sidecar started\n")))
+
   # Start secret proxy (if secrets.json exists)
   (proxy/start-proxy cfg)
 

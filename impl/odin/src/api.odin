@@ -10,7 +10,7 @@ import "core:sync"
 _api_config: ^Config
 _api_manager: ^Sandbox_Manager
 
-API_ROUTES: [11]Route = {
+API_ROUTES: [12]Route = {
 	{method = "GET", pattern = "/cgi-bin/health", handler = _handle_health},
 	{method = "GET", pattern = "/cgi-bin/api/sandboxes", handler = _handle_list_sandboxes},
 	{method = "POST", pattern = "/cgi-bin/api/sandboxes", handler = _handle_create_sandbox},
@@ -21,6 +21,7 @@ API_ROUTES: [11]Route = {
 	{method = "POST", pattern = "/cgi-bin/api/sandboxes/*/snapshot", handler = _handle_snapshot},
 	{method = "POST", pattern = "/cgi-bin/api/sandboxes/*/restore", handler = _handle_restore},
 	{method = "POST", pattern = "/cgi-bin/api/sandboxes/*/activate", handler = _handle_activate},
+	{method = "POST", pattern = "/cgi-bin/api/sandboxes/*/wg/peers", handler = _handle_wg_peers},
 	{method = "GET", pattern = "/cgi-bin/api/modules", handler = _handle_list_modules},
 }
 
@@ -60,6 +61,13 @@ Restore_Request_JSON :: struct {
 
 Activate_Request_JSON :: struct {
 	module: string `json:"module"`,
+}
+
+Wg_Peer_JSON :: struct {
+	publicKey:    string `json:"publicKey"`,
+	endpoint:     string `json:"endpoint"`,
+	allowedIPs:   string `json:"allowedIPs"`,
+	presharedKey: string `json:"presharedKey"`,
 }
 
 _handle_health :: proc(_: ^Http_Request, resp: ^Http_Response) {
@@ -548,6 +556,91 @@ _handle_activate :: proc(req: ^Http_Request, resp: ^Http_Response) {
 	_json_body(resp, 200, strings.to_string(b))
 }
 
+_handle_wg_peers :: proc(req: ^Http_Request, resp: ^Http_Response) {
+	if !_require_json(req, resp) {
+		return
+	}
+	id := _path_param(req, 0)
+	ms := manager_get(_api_manager, id)
+	if ms == nil {
+		_json_error(resp, 404, fmt.tprintf("not found: %s", id))
+		return
+	}
+
+	// Check for network namespace
+	netns_path := fmt.tprintf("%s/.meta/netns_name", ms.sandbox.dir)
+	netns_data, netns_ok := os.read_entire_file(netns_path, context.temp_allocator)
+	if !netns_ok || len(netns_data) == 0 {
+		_json_error(resp, 400, "sandbox has no network namespace")
+		return
+	}
+
+	// Set up wg0 if not already present
+	port_path := fmt.tprintf("%s/.meta/wg_listen_port", ms.sandbox.dir)
+	if !os.exists(port_path) {
+		keys, keys_ok := run_cmd_capture("sq-wg", "genkey")
+		if !keys_ok {
+			_json_error(resp, 500, "wg genkey failed")
+			return
+		}
+		// Parse: line 1 = privkey, line 2 = pubkey
+		privkey := ""
+		pubkey := ""
+		rest := keys
+		for line in strings.split_lines_iterator(&rest) {
+			trimmed := strings.trim_space(line)
+			if len(trimmed) == 0 { continue }
+			if len(privkey) == 0 {
+				privkey = trimmed
+			} else {
+				pubkey = trimmed
+				break
+			}
+		}
+		if len(privkey) == 0 || len(pubkey) == 0 {
+			_json_error(resp, 500, "wg genkey: bad output")
+			return
+		}
+		if !run_cmd("sq-wg", "setup", id, privkey, "51820") {
+			_json_error(resp, 500, "wg setup failed")
+			return
+		}
+		os.write_entire_file(fmt.tprintf("%s/.meta/wg_public_key", ms.sandbox.dir), transmute([]byte)pubkey)
+	}
+
+	// Parse and add each peer from the JSON array
+	peers: [dynamic]Wg_Peer_JSON
+	if err := json.unmarshal(req.body, &peers, allocator = context.temp_allocator); err != nil {
+		_json_error(resp, 400, "invalid JSON body (expected array of peers)")
+		return
+	}
+
+	for peer in peers {
+		pk := peer.publicKey
+		ep := peer.endpoint if len(peer.endpoint) > 0 else ""
+		ips := peer.allowedIPs if len(peer.allowedIPs) > 0 else "0.0.0.0/0"
+		psk := peer.presharedKey if len(peer.presharedKey) > 0 else ""
+		run_cmd("sq-wg", "add-peer", id, pk, ep, ips, psk)
+	}
+
+	// Read back metadata for response
+	pubkey_data, _ := os.read_entire_file(
+		fmt.tprintf("%s/.meta/wg_public_key", ms.sandbox.dir),
+		context.temp_allocator,
+	)
+	pubkey := strings.trim_space(string(pubkey_data))
+	port_data, _ := os.read_entire_file(port_path, context.temp_allocator)
+	port := strings.trim_space(string(port_data))
+	if len(port) == 0 {
+		port = "51820"
+	}
+
+	_json_body(resp, 200, fmt.tprintf(
+		`{"status":"ok","publicKey":"%s","listenPort":%s,"peersAdded":%d}`,
+		pubkey, port, len(peers),
+	))
+}
+
 _handle_list_modules :: proc(_: ^Http_Request, resp: ^Http_Response) {
 	mods := list_modules(_api_config, context.temp_allocator)
 	if len(mods) == 0 {
@@ -799,6 +892,15 @@ _s3_snapshot_key :: proc(id: string, label: string) -> string {
 }
 
 _push_snapshot_s3_bg :: proc(config: ^Config, id: string, label: string, local_path: string) {
+	// Prefer sq-sync sidecar (decoupled S3) over direct sq-s3 push
+	if _command_exists("sq-sync") && os.exists(bus_sock_path(config)) {
+		notify_msg := fmt.tprintf(
+			`{"op":"push","path":"%s","key":"%s"}`,
+			local_path, _s3_snapshot_key(id, label),
+		)
+		_ = run_cmd("sq-sync", "--notify", notify_msg)
+		return
+	}
 	if !_s3_enabled(config) {
 		return
 	}

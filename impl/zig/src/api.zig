@@ -19,6 +19,7 @@ const config_mod = @import("config.zig");
 const json_mod = @import("json.zig");
 const validate = @import("validate.zig");
 const exec_mod = @import("exec.zig");
+const jobs_mod = @import("jobs.zig");
 const mounts_mod = @import("mounts.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cgroup_mod = @import("cgroup.zig");
@@ -54,11 +55,15 @@ pub const Route = union(enum) {
     get_sandbox: []const u8,
     delete_sandbox: []const u8,
     exec_sandbox: []const u8,
+    exec_bg_sandbox: []const u8,
     exec_logs: []const u8,
     snapshot_sandbox: []const u8,
     restore_sandbox: []const u8,
     activate_sandbox: []const u8,
     list_modules,
+    job_status: struct { sandbox_id: []const u8, job_id: []const u8 },
+    job_logs: struct { sandbox_id: []const u8, job_id: []const u8 },
+    job_kill: struct { sandbox_id: []const u8, job_id: []const u8 },
     not_found,
 };
 
@@ -96,10 +101,30 @@ pub fn matchRoute(method: http.Method, target: []const u8) Route {
             if (!validate.validId(id)) return .not_found;
 
             if (eql(action, "exec")) return .{ .exec_sandbox = id };
+            if (eql(action, "exec-bg")) return .{ .exec_bg_sandbox = id };
             if (eql(action, "logs")) return .{ .exec_logs = id };
             if (eql(action, "snapshot")) return .{ .snapshot_sandbox = id };
             if (eql(action, "restore")) return .{ .restore_sandbox = id };
             if (eql(action, "activate")) return .{ .activate_sandbox = id };
+
+            // /cgi-bin/api/sandboxes/:id/jobs/:jid[/logs]
+            if (std.mem.startsWith(u8, action, "jobs/")) {
+                const jobs_rest = action["jobs/".len..];
+                // jobs_rest is "jid" or "jid/logs"
+                if (std.mem.indexOfScalar(u8, jobs_rest, '/')) |jslash| {
+                    const jid = jobs_rest[0..jslash];
+                    const jaction = jobs_rest[jslash + 1 ..];
+                    if (eql(jaction, "logs")) return .{ .job_logs = .{ .sandbox_id = id, .job_id = jid } };
+                    return .not_found;
+                } else {
+                    // GET = status, DELETE = kill
+                    return switch (method) {
+                        .GET => .{ .job_status = .{ .sandbox_id = id, .job_id = jobs_rest } },
+                        .DELETE => .{ .job_kill = .{ .sandbox_id = id, .job_id = jobs_rest } },
+                        else => .not_found,
+                    };
+                }
+            }
 
             return .not_found;
         } else {
@@ -119,6 +144,18 @@ pub fn matchRoute(method: http.Method, target: []const u8) Route {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+/// Write all bytes to a raw file descriptor (unbuffered).
+/// Used for SSE streaming where we need immediate delivery.
+fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const n = std.posix.write(fd, data[written..]) catch |err| {
+            return err;
+        };
+        written += n;
+    }
 }
 
 // ── Server ─────────────────────────────────────────────────────────────
@@ -184,7 +221,7 @@ fn handleConnection(conn: net.Server.Connection, cfg: *const Config, allocator: 
             log.debug("receiveHead error: {}", .{err});
             return;
         };
-        handleRequest(&request, cfg, allocator) catch |err| {
+        handleRequest(&request, cfg, allocator, conn.stream) catch |err| {
             log.debug("handleRequest error: {}", .{err});
             return;
         };
@@ -192,7 +229,7 @@ fn handleConnection(conn: net.Server.Connection, cfg: *const Config, allocator: 
 }
 
 /// Process a single HTTP request: auth check, route, dispatch.
-fn handleRequest(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
+fn handleRequest(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator, raw_stream: net.Stream) !void {
     const route = matchRoute(request.head.method, request.head.target);
 
     // Auth check — skip for health endpoint
@@ -217,11 +254,15 @@ fn handleRequest(request: *http.Server.Request, cfg: *const Config, allocator: s
         .get_sandbox => |id| try handleGetSandbox(request, cfg, id, allocator),
         .delete_sandbox => |id| try handleDeleteSandbox(request, cfg, id, allocator),
         .exec_sandbox => |id| try handleExec(request, cfg, id, allocator),
+        .exec_bg_sandbox => |id| try handleExecBg(request, cfg, id, allocator),
         .exec_logs => |id| try handleExecLogs(request, cfg, id, allocator),
         .snapshot_sandbox => |id| try handleSnapshot(request, cfg, id, allocator),
         .restore_sandbox => |id| try handleRestore(request, cfg, id, allocator),
         .activate_sandbox => |id| try handleActivate(request, cfg, id, allocator),
         .list_modules => try handleListModules(request, cfg, allocator),
+        .job_status => |ids| try handleJobStatus(request, ids.job_id, allocator),
+        .job_logs => |ids| try handleJobLogs(request, ids.job_id, allocator, raw_stream),
+        .job_kill => |ids| try handleJobKill(request, ids.job_id, allocator),
         .not_found => try sendJsonError(request, .not_found, "not found", allocator),
     }
 }
@@ -691,6 +732,238 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
     };
 
     try sendJson(request, .ok, allocator, exec_result);
+}
+
+// ── Background Exec Handlers ────────────────────────────────────────
+
+fn handleExecBg(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(request, allocator)) return;
+
+    var sb_dir_buf: [256]u8 = undefined;
+    const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+
+    var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
+        try sendJsonError(request, .not_found, err_msg, allocator);
+        return;
+    };
+
+    if (!isSandboxMounted(allocator, sandbox_path)) {
+        try sendJsonError(request, .bad_request, "not mounted", allocator);
+        return;
+    }
+
+    const parsed = readJsonBody(json_mod.ExecRequestJson, request, allocator) catch {
+        try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
+        return;
+    };
+    defer parsed.deinit();
+    const exec_req = parsed.value;
+
+    if (exec_req.cmd.len == 0) {
+        try sendJsonError(request, .bad_request, "cmd required", allocator);
+        return;
+    }
+
+    var mounted_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const merged_path = std.fmt.bufPrint(&mounted_path_buf, "{s}/merged", .{sandbox_path}) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+
+    const ctx = exec_mod.SandboxContext{
+        .merged_path = merged_path,
+    };
+
+    const bg_req = exec_mod.ExecRequest{
+        .cmd = exec_req.cmd,
+        .workdir = exec_req.effectiveWorkdir(),
+        .timeout_s = exec_req.effectiveTimeout(),
+    };
+
+    const job_id = exec_mod.execInSandboxBg(ctx, bg_req, id, sandbox_path) catch {
+        try sendJsonError(request, .internal_server_error, "failed to start background job", allocator);
+        return;
+    };
+
+    // Respond immediately with job ID
+    var body_buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"job_id\":{d},\"status\":\"running\"}}", .{job_id}) catch {
+        try sendJsonError(request, .internal_server_error, "format error", allocator);
+        return;
+    };
+    try sendJsonLiteral(request, .ok, body);
+}
+
+fn handleJobStatus(request: *http.Server.Request, job_id_str: []const u8, allocator: std.mem.Allocator) !void {
+    const registry = jobs_mod.getGlobal() orelse {
+        try sendJsonError(request, .internal_server_error, "no job registry", allocator);
+        return;
+    };
+
+    const job_id = std.fmt.parseInt(u32, job_id_str, 10) catch {
+        try sendJsonError(request, .bad_request, "invalid job_id", allocator);
+        return;
+    };
+
+    const entry = registry.get(job_id) orelse {
+        try sendJsonError(request, .not_found, "job not found", allocator);
+        return;
+    };
+
+    // Build JSON response manually
+    var body_buf: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_buf);
+    const w = stream.writer();
+
+    w.print("{{\"job_id\":{d},\"status\":\"{s}\",\"started\":{d}", .{
+        entry.id,
+        @tagName(entry.status),
+        entry.started,
+    }) catch {
+        try sendJsonError(request, .internal_server_error, "format error", allocator);
+        return;
+    };
+    if (entry.exit_code) |ec| {
+        w.print(",\"exit_code\":{d}", .{ec}) catch {};
+    }
+    if (entry.finished) |f| {
+        w.print(",\"finished\":{d}", .{f}) catch {};
+    }
+    w.writeAll("}") catch {};
+
+    try sendJsonLiteral(request, .ok, stream.getWritten());
+}
+
+fn handleJobLogs(
+    request: *http.Server.Request,
+    job_id_str: []const u8,
+    allocator: std.mem.Allocator,
+    raw_stream: net.Stream,
+) !void {
+    const registry = jobs_mod.getGlobal() orelse {
+        try sendJsonError(request, .internal_server_error, "no job registry", allocator);
+        return;
+    };
+
+    const job_id = std.fmt.parseInt(u32, job_id_str, 10) catch {
+        try sendJsonError(request, .bad_request, "invalid job_id", allocator);
+        return;
+    };
+
+    const entry = registry.get(job_id) orelse {
+        try sendJsonError(request, .not_found, "job not found", allocator);
+        return;
+    };
+
+    // Write raw SSE response headers directly to the underlying TCP stream,
+    // bypassing http.Server's request.respond() which expects a complete body.
+    // Connection: close ensures the keep-alive loop exits cleanly after streaming.
+    //
+    // Use posix.write for unbuffered, immediate delivery to the client.
+    const fd = raw_stream.handle;
+    writeAllFd(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n") catch return;
+
+    // Open stdout file and stream existing + new content
+    const stdout_path = entry.stdoutPath();
+    var file_offset: u64 = 0;
+
+    // Stream loop: read file, send as SSE, poll for new content
+    while (true) {
+        // Check current job status
+        const current = registry.get(job_id) orelse break;
+
+        // Try to read new content from file
+        const file = std.fs.openFileAbsolute(stdout_path, .{}) catch {
+            // File may not exist yet if job just started
+            if (current.status != .running) break;
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            continue;
+        };
+        defer file.close();
+
+        // Seek to where we left off
+        file.seekTo(file_offset) catch break;
+
+        // Read available data
+        var buf: [65536]u8 = undefined;
+        while (true) {
+            const n = file.read(&buf) catch break;
+            if (n == 0) break;
+
+            // Split into lines and send each as SSE data frame
+            var remaining = buf[0..n];
+            while (remaining.len > 0) {
+                if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl| {
+                    const line = remaining[0..nl];
+                    if (line.len > 0) {
+                        writeAllFd(fd, "data: ") catch return;
+                        writeAllFd(fd, line) catch return;
+                        writeAllFd(fd, "\n\n") catch return;
+                    }
+                    remaining = remaining[nl + 1 ..];
+                } else {
+                    // Partial line — don't advance offset past it
+                    break;
+                }
+            }
+            file_offset += n - remaining.len;
+        }
+
+        // If job is done, send final event and exit
+        if (current.status != .running) {
+            var done_buf: [128]u8 = undefined;
+            const done_msg = std.fmt.bufPrint(&done_buf, "event: done\ndata: {{\"exit_code\":{d}}}\n\n", .{
+                current.exit_code orelse -1,
+            }) catch break;
+            writeAllFd(fd, done_msg) catch {};
+            break;
+        }
+
+        // Poll interval
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+    }
+}
+
+fn handleJobKill(request: *http.Server.Request, job_id_str: []const u8, allocator: std.mem.Allocator) !void {
+    const registry = jobs_mod.getGlobal() orelse {
+        try sendJsonError(request, .internal_server_error, "no job registry", allocator);
+        return;
+    };
+
+    const job_id = std.fmt.parseInt(u32, job_id_str, 10) catch {
+        try sendJsonError(request, .bad_request, "invalid job_id", allocator);
+        return;
+    };
+
+    const entry = registry.get(job_id) orelse {
+        try sendJsonError(request, .not_found, "job not found", allocator);
+        return;
+    };
+
+    if (entry.status != .running) {
+        try sendJsonError(request, .bad_request, "job not running", allocator);
+        return;
+    }
+
+    if (entry.pid) |pid| {
+        std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
+            log.warn("failed to kill job {d} pid {d}: {}", .{ job_id, pid, err });
+        };
+    }
+
+    registry.complete(job_id, -1, .failed);
+
+    try sendJsonLiteral(request, .ok, "{\"status\":\"killed\"}");
 }
 
 fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {

@@ -15,6 +15,7 @@ pub const netns = @import("netns.zig");
 pub const sandbox_test = @import("sandbox_test.zig");
 pub const manager = @import("manager.zig");
 pub const firecracker = @import("firecracker.zig");
+pub const jobs = @import("jobs.zig");
 
 const log = std.log.scoped(.squashd);
 
@@ -62,6 +63,11 @@ pub fn main() !void {
     mgr.setGlobal();
     mgr.setDataDir(cfg.data_dir);
     mgr.recoverFromDisk(cfg.data_dir);
+
+    // 2b. Initialize background job registry
+    var job_registry = jobs.JobRegistry.init(allocator);
+    defer job_registry.deinit();
+    jobs.setGlobal(&job_registry);
 
     // 3. Start secret proxy (if secrets.json exists or proxy_https enabled)
     // Matches Rust: start when secrets_path().is_file()
@@ -169,4 +175,5 @@ test {
     _ = sandbox_test;
     _ = manager;
     _ = firecracker;
+    _ = jobs;
 }

@@ -7,6 +7,7 @@ const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.exec);
 const json_mod = @import("json.zig");
+const jobs_mod = @import("jobs.zig");
 
 /// Maximum bytes captured from stdout/stderr (64KB each).
 pub const max_output_bytes: usize = 65536;
@@ -356,6 +357,165 @@ pub fn freeExecLogs(allocator: std.mem.Allocator, logs: []json_mod.ExecResult) v
         allocator.free(entry.stderr);
     }
     allocator.free(logs);
+}
+
+// ── Background Exec ─────────────────────────────────────────────────────
+
+pub const BgExecError = error{
+    NoJobRegistry,
+    JobCreateFailed,
+    ForkFailed,
+    ThreadSpawnFailed,
+};
+
+/// Start a command in the background. Returns immediately with a job ID.
+/// A detached thread reads stdout line-by-line and writes to the job's
+/// stdout.jsonl file. On child exit, updates the job status in the registry.
+pub fn execInSandboxBg(
+    ctx: SandboxContext,
+    req: ExecRequest,
+    sandbox_id: []const u8,
+    sandbox_path: []const u8,
+) BgExecError!u32 {
+    const registry = jobs_mod.getGlobal() orelse return BgExecError.NoJobRegistry;
+
+    const job_id = registry.create(sandbox_id, req.cmd, sandbox_path) catch
+        return BgExecError.JobCreateFailed;
+
+    // Format timeout as string
+    var timeout_buf: [16]u8 = undefined;
+    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{req.timeout_s}) catch
+        return BgExecError.ForkFailed;
+
+    var child = std.process.Child.init(
+        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str },
+        std.heap.page_allocator,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Close;
+
+    child.spawn() catch {
+        registry.complete(job_id, -1, .failed);
+        return BgExecError.ForkFailed;
+    };
+
+    // Record PID
+    registry.setPid(job_id, child.id);
+
+    // Get stdout path from the job entry for the background thread
+    const entry = registry.get(job_id) orelse {
+        registry.complete(job_id, -1, .failed);
+        return BgExecError.JobCreateFailed;
+    };
+
+    // Spawn a detached thread to read output and wait for completion
+    const thread = std.Thread.spawn(.{}, bgWorker, .{
+        child,
+        job_id,
+        entry.stdout_path_buf,
+        entry.stdout_path_len,
+        entry.stderr_path_buf,
+        entry.stderr_path_len,
+    }) catch {
+        registry.complete(job_id, -1, .failed);
+        return BgExecError.ThreadSpawnFailed;
+    };
+    thread.detach();
+
+    return job_id;
+}
+
+/// Background worker thread: reads child stdout/stderr line-by-line,
+/// writes each line to the JSONL file, then waits for exit.
+fn bgWorker(
+    child_arg: std.process.Child,
+    job_id: u32,
+    stdout_path_buf: [std.fs.max_path_bytes]u8,
+    stdout_path_len: usize,
+    stderr_path_buf: [std.fs.max_path_bytes]u8,
+    stderr_path_len: usize,
+) void {
+    var child = child_arg;
+    const stdout_path = stdout_path_buf[0..stdout_path_len];
+    const stderr_path = stderr_path_buf[0..stderr_path_len];
+
+    const registry = jobs_mod.getGlobal() orelse return;
+
+    // Open stdout JSONL file for appending
+    const stdout_file = std.fs.createFileAbsolute(stdout_path, .{}) catch |err| {
+        log.warn("job {d}: failed to create stdout file {s}: {}", .{ job_id, stdout_path, err });
+        waitAndComplete(&child, job_id, registry);
+        return;
+    };
+    defer stdout_file.close();
+
+    // Open stderr file
+    const stderr_file = std.fs.createFileAbsolute(stderr_path, .{}) catch |err| {
+        log.warn("job {d}: failed to create stderr file {s}: {}", .{ job_id, stderr_path, err });
+        waitAndComplete(&child, job_id, registry);
+        return;
+    };
+    defer stderr_file.close();
+
+    // Read stdout line-by-line and write each line immediately
+    if (child.stdout) |*stdout_stream| {
+        var line_buf: [65536]u8 = undefined;
+        var line_len: usize = 0;
+
+        while (true) {
+            const byte_buf = stdout_stream.read(line_buf[line_len .. line_len + 1]) catch break;
+            if (byte_buf == 0) break; // EOF
+
+            if (line_buf[line_len] == '\n') {
+                // Write the complete line (including newline)
+                stdout_file.writeAll(line_buf[0 .. line_len + 1]) catch {};
+                line_len = 0;
+            } else {
+                line_len += 1;
+                if (line_len >= line_buf.len - 1) {
+                    // Buffer full, flush what we have
+                    stdout_file.writeAll(line_buf[0..line_len]) catch {};
+                    stdout_file.writeAll("\n") catch {};
+                    line_len = 0;
+                }
+            }
+        }
+        // Flush remaining data
+        if (line_len > 0) {
+            stdout_file.writeAll(line_buf[0..line_len]) catch {};
+            stdout_file.writeAll("\n") catch {};
+        }
+    }
+
+    // Read all stderr
+    if (child.stderr) |*stderr_stream| {
+        var buf: [65536]u8 = undefined;
+        while (true) {
+            const n = stderr_stream.read(&buf) catch break;
+            if (n == 0) break;
+            stderr_file.writeAll(buf[0..n]) catch {};
+        }
+    }
+
+    waitAndComplete(&child, job_id, registry);
+}
+
+fn waitAndComplete(child: *std.process.Child, job_id: u32, registry: *jobs_mod.JobRegistry) void {
+    const term = child.wait() catch {
+        registry.complete(job_id, -1, .failed);
+        return;
+    };
+
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @intCast(code),
+        .Signal => |sig| 128 + @as(i32, @intCast(sig)),
+        else => -1,
+    };
+
+    const status: jobs_mod.JobStatus = if (exit_code == 124) .timed_out else if (exit_code == 0) .completed else .failed;
+    registry.complete(job_id, exit_code, status);
+    log.info("job {d}: finished with exit_code={d} status={s}", .{ job_id, exit_code, @tagName(status) });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

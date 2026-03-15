@@ -25,7 +25,7 @@ do_mount() {
     mkdir -p "$mp"
 
     if command -v squashfuse >/dev/null 2>&1; then
-        squashfuse -o ro "$sqfs" "$mp" || die "squashfuse failed: $sqfs -> $mp"
+        squashfuse -o ro,allow_other "$sqfs" "$mp" || die "squashfuse failed: $sqfs -> $mp"
     else
         mount -o loop,ro -t squashfs "$sqfs" "$mp" || die "mount failed: $sqfs -> $mp"
     fi

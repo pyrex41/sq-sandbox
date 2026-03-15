@@ -352,7 +352,11 @@ fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config, alloca
 fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
     if (!requireJsonContentType(request, allocator)) return;
 
-    const parsed = readJsonBody(json_mod.CreateRequest, request, allocator) catch {
+    const parsed = readJsonBody(json_mod.CreateRequest, request, allocator) catch |err| {
+        log.warn("create: readJsonBody failed: {} (content_length={?})", .{
+            err,
+            request.head.content_length,
+        });
         try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
@@ -1830,7 +1834,7 @@ pub fn readJsonBody(comptime T: type, request: *http.Server.Request, allocator: 
     else
         request.readerExpectNone(&body_buf);
 
-    const body = body_reader.readAlloc(allocator, 1024 * 1024) catch {
+    const body = body_reader.allocRemaining(allocator, @enumFromInt(1024 * 1024)) catch {
         return error.BodyReadFailed;
     };
     defer allocator.free(body);

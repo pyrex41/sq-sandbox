@@ -28,9 +28,12 @@ do_mount() {
         log "mounting via fuse-overlayfs"
         fuse-overlayfs -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
     else
-        log "fuse-overlayfs not found, falling back to kernel overlayfs"
+        echo "[sq-mount-overlay] kernel fallback: lowerdir=$lower upperdir=$upper workdir=$work merged=$merged" >> /data/overlay-debug.log 2>/dev/null
         mount -t overlay overlay \
-            -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
+            -o "lowerdir=$lower,upperdir=$upper,workdir=$work,xino=off" "$merged" 2>>/data/overlay-debug.log
+        local rc=$?
+        echo "[sq-mount-overlay] mount exit: $rc" >> /data/overlay-debug.log 2>/dev/null
+        return $rc
     fi
 }
 

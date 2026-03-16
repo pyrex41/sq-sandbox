@@ -491,15 +491,89 @@ func (p *ProxyHandler) replaceHeaders(r *http.Request, host string) {
 
 // ── Main ─────────────────────────────────────────────────────────────
 
+// ensureCA generates a self-signed ECDSA CA if ca.crt/ca.key don't exist yet.
+func ensureCA(dir string) {
+	certPath := dir + "/ca.crt"
+	keyPath := dir + "/ca.key"
+
+	if _, err := os.Stat(certPath); err == nil {
+		return // already exists
+	}
+
+	log.Printf("generating CA certificate in %s", dir)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		log.Fatalf("cannot create CA dir: %v", err)
+	}
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		log.Fatalf("cannot generate CA key: %v", err)
+	}
+
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "sq-sandbox-proxy-ca"},
+		NotBefore:             time.Now().Add(-1 * time.Minute),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &caKey.PublicKey, caKey)
+	if err != nil {
+		log.Fatalf("cannot create CA cert: %v", err)
+	}
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		log.Fatalf("cannot write CA cert: %v", err)
+	}
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	certOut.Close()
+
+	keyBytes, err := x509.MarshalECPrivateKey(caKey)
+	if err != nil {
+		log.Fatalf("cannot marshal CA key: %v", err)
+	}
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		log.Fatalf("cannot write CA key: %v", err)
+	}
+	pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	keyOut.Close()
+
+	log.Printf("CA certificate generated")
+}
+
 func main() {
+	// Parse CLI flags for compatibility with squashd which passes
+	// --listen and --data-dir when spawning the proxy.
+	listenAddr := ":8888"
 	dataDir := os.Getenv("SQUASH_DATA")
 	if dataDir == "" {
 		dataDir = "/data"
+	}
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--listen":
+			if i+1 < len(os.Args) {
+				listenAddr = os.Args[i+1]
+				i++
+			}
+		case "--data-dir":
+			if i+1 < len(os.Args) {
+				dataDir = os.Args[i+1]
+				i++
+			}
+		}
 	}
 
 	secretsFile := dataDir + "/secrets.json"
 	caDir := dataDir + "/proxy-ca"
 
+	ensureCA(caDir)
 	secrets := loadSecrets(secretsFile)
 	caCert, caKey := loadCA(caDir)
 
@@ -511,14 +585,14 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:         ":8888",
+		Addr:         listenAddr,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0, // disabled — CONNECT hijacks bypass this anyway
 		IdleTimeout:  connIdleTimeout,
 	}
 
-	log.Printf("sq-secret-proxy-https starting on :8888 (%d secrets configured)", len(secrets.Secrets))
+	log.Printf("sq-secret-proxy-https starting on %s (%d secrets configured)", listenAddr, len(secrets.Secrets))
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

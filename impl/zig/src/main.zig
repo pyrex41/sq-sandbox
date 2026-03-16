@@ -103,33 +103,25 @@ pub fn main() !void {
 // ── Proxy and Tailscale startup ──────────────────────────────────────
 
 /// Start the HTTPS forward proxy in a background thread.
-/// Shells out to the bundled sq-proxy helper or spawns an inline listener.
-fn startProxy(cfg: *const config.Config) void {
-    var proxy_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const proxy_path = std.fmt.bufPrint(&proxy_path_buf, "{s}/proxy/sq-proxy", .{cfg.data_dir}) catch "sq-proxy";
-
-    var child = std.process.Child.init(
-        &.{ proxy_path, "--listen", "0.0.0.0:8888", "--data-dir", cfg.data_dir },
-        std.heap.page_allocator,
-    );
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch {
-        // Fallback to PATH lookup if bundled helper does not exist.
-        var fallback = std.process.Child.init(
-            &.{ "sq-proxy", "--listen", "0.0.0.0:8888", "--data-dir", cfg.data_dir },
+/// Spawns the Go binary sq-secret-proxy-https which auto-generates its CA cert.
+fn startProxy(_: *const config.Config) void {
+    // Try bundled path first, then PATH lookup
+    const bin_names = [_][]const u8{ "sq-secret-proxy-https", "sq-proxy" };
+    for (bin_names) |name| {
+        var child = std.process.Child.init(
+            &.{ name },
             std.heap.page_allocator,
         );
-        fallback.stdin_behavior = .Ignore;
-        fallback.stdout_behavior = .Ignore;
-        fallback.stderr_behavior = .Ignore;
-        fallback.spawn() catch |err| {
-            log.warn("HTTPS proxy: failed to start: {}", .{err});
-            return;
-        };
-    };
-    log.info("HTTPS proxy started on :8888", .{});
+        // Set SQUASH_DATA so the Go binary finds secrets.json and proxy-ca/
+        child.env_map = null; // inherit parent env (includes SQUASH_DATA)
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        child.spawn() catch continue;
+        log.info("HTTPS proxy started on :8888 (binary: {s})", .{name});
+        return;
+    }
+    log.warn("HTTPS proxy: failed to start — no proxy binary found", .{});
 }
 
 /// Start tailscale in a background thread.

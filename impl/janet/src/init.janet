@@ -5,8 +5,6 @@
 (import sandbox :prefix "sandbox/")
 (import mounts :prefix "mounts/")
 (import meta)
-(import cgroup)
-(import netns)
 (import lock)
 
 (defn- fc-backend? [config]
@@ -33,12 +31,13 @@
   result)
 
 (defn remount-sandbox [config sandbox-dir id layers]
-  "Remount tmpfs, squashfs, overlay. Returns mounts table or nil."
+  "Remount squashfs layers and overlay. Returns mounts table or nil."
   (def mod-dir (config/modules-dir config))
   (def upper-path (string sandbox-dir "/upper"))
   (def merged-path (string sandbox-dir "/merged"))
   (try (do
-    (def tmpfs (mounts/mount-tmpfs upper-path (or (get config :upper-limit-mb) 512)))
+    (mounts/ensure-dir (string upper-path "/data"))
+    (mounts/ensure-dir (string upper-path "/work"))
     (def sqfs-mounts @[])
     (each layer layers
       (def mod-path (string mod-dir "/" layer ".squashfs"))
@@ -46,7 +45,7 @@
       (array/push sqfs-mounts (mounts/mount-squashfs mod-path mp)))
     (def lower (array/slice (map |(get $ :mount-point) sqfs-mounts)))
     (def overlay (mounts/mount-overlay lower (string upper-path "/data") (string upper-path "/work") merged-path))
-    @{:squashfs-mounts sqfs-mounts :tmpfs tmpfs :overlay overlay :snapshot-mount nil})
+    @{:squashfs-mounts sqfs-mounts :overlay overlay :snapshot-mount nil})
     ([e] (eprintf "init remount error for %s: %s\n" id (string e)) nil)))
 
 (defn recover-sandbox [manager id data-dir]
@@ -59,7 +58,7 @@
     (return nil))
   (if (fc-backend? cfg)
     (do
-      # Firecracker recovery: no host overlay/cgroup/netns reconstruction.
+      # Firecracker recovery: no host overlay reconstruction.
       (def cid (or (get meta-data "cid")
                    (read-int-file (string sandbox-dir "/.meta/cid"))))
       (when (not cid)
@@ -98,20 +97,11 @@
       (when (not mounts)
         (try (os/execute ["rm" "-rf" sandbox-dir] :p) ([e] nil))
         (return nil))
-      (def cg (try (cgroup/create-cgroup id (get meta-data "cpu" 2) (get meta-data "memory_mb" 1024)) ([e] nil)))
-      (def ns (try (netns/setup-netns id (get meta-data "allow_net")) ([e] nil)))
-      (when ns
-        (def etc-dir (string sandbox-dir "/upper/data/etc"))
-        (mounts/ensure-dir etc-dir)
-        (spit (string etc-dir "/resolv.conf")
-              (string "nameserver " (string/format "10.200.%d.1" (get ns :index)) "\n")))
       (def sandbox @{
         :id id
         :dir sandbox-dir
         :state :ready
         :mounts mounts
-        :cgroup cg
-        :netns ns
         :created (get meta-data "created" (math/floor (os/time)))
         :last-active (math/floor (os/time))
         :exec-count 0

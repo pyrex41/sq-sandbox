@@ -34,10 +34,61 @@
         "type": "github"
       }
     },
+    "nixpkgs-unstable": {
+      "locked": {
+        "lastModified": 1771369470,
+        "narHash": "sha256-0NBlEBKkN3lufyvFegY4TYv5mCNHbi5OmBDrzihbBMQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0182a361324364ae3f436a63005877674cf45efb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nullclaw-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1771871761,
+        "narHash": "sha256-HZDXXMWJzstxrl1oJg2Uj8s8RvMvMmgMQ3w7MQGqmwo=",
+        "owner": "nullclaw",
+        "repo": "nullclaw",
+        "rev": "fb46afe66409406c2a0d77653dd7b11f4f5d0996",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nullclaw",
+        "repo": "nullclaw",
+        "type": "github"
+      }
+    },
+    "odin-claw-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1771563262,
+        "narHash": "sha256-AXCKLThxBVrIfpT/T65c3KONTi7eBDxGMysDVeE7c5A=",
+        "owner": "pyrex41",
+        "repo": "odin-claw",
+        "rev": "0a4f30bd3dac550744fda3e366ba977dc61b92ef",
+        "type": "github"
+      },
+      "original": {
+        "owner": "pyrex41",
+        "repo": "odin-claw",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "nixpkgs-unstable": "nixpkgs-unstable",
+        "nullclaw-src": "nullclaw-src",
+        "odin-claw-src": "odin-claw-src"
       }
     },
     "systems": {

@@ -5,13 +5,6 @@ import "core:os"
 import "core:strings"
 
 // ---------------------------------------------------------------------------
-// Mount flags (from <sys/mount.h>)
-// ---------------------------------------------------------------------------
-
-MS_RDONLY  :: 1
-MNT_DETACH :: 2
-
-// ---------------------------------------------------------------------------
 // Mount_Error enum
 // ---------------------------------------------------------------------------
 
@@ -33,7 +26,7 @@ _to_cstr :: proc(s: string) -> cstring {
 }
 
 // ---------------------------------------------------------------------------
-// Squashfs_Mount
+// Squashfs_Mount — uses sq-mount-layer helper
 // ---------------------------------------------------------------------------
 
 Squashfs_Mount :: struct {
@@ -46,18 +39,7 @@ squashfs_mount :: proc(
 	mount_point: string,
 	allocator := context.allocator,
 ) -> (Squashfs_Mount, Mount_Error) {
-	// Ensure mount point directory exists
-	if !os.exists(mount_point) {
-		if os.make_directory(mount_point) != nil {
-			return {}, .Create_Dir_Failed
-		}
-	}
-
-	src := _to_cstr(squashfs_path)
-	tgt := _to_cstr(mount_point)
-
-	rc := c_mount(src, tgt, "squashfs", MS_RDONLY, nil)
-	if rc != 0 {
+	if !run_cmd("sq-mount-layer", squashfs_path, mount_point) {
 		return {}, .Mount_Failed
 	}
 
@@ -69,72 +51,13 @@ squashfs_mount :: proc(
 
 squashfs_unmount :: proc(m: ^Squashfs_Mount) {
 	if m.active {
-		tgt := _to_cstr(m.mount_point)
-		c_umount2(tgt, MNT_DETACH)
+		run_cmd("sq-mount-layer", "--unmount", m.mount_point)
 		m.active = false
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Tmpfs_Mount
-// ---------------------------------------------------------------------------
-
-Tmpfs_Mount :: struct {
-	mount_point: string,
-	active:      bool,
-}
-
-tmpfs_mount :: proc(
-	mount_point: string,
-	size_mb: u64,
-	allocator := context.allocator,
-) -> (result: Tmpfs_Mount, err: Mount_Error) {
-	// Ensure mount point directory exists
-	if !os.exists(mount_point) {
-		if os.make_directory(mount_point) != nil {
-			return {}, .Create_Dir_Failed
-		}
-	}
-
-	tgt := _to_cstr(mount_point)
-	opts := fmt.ctprintf("size=%dm", size_mb)
-
-	rc := c_mount("tmpfs", tgt, "tmpfs", 0, rawptr(opts))
-	if rc != 0 {
-		return {}, .Mount_Failed
-	}
-
-	// Rollback: unmount if subdir creation fails below.
-	result.active = true
-	result.mount_point = strings.clone(mount_point, allocator)
-	defer if err != .None {
-		c_umount2(tgt, MNT_DETACH)
-		result.active = false
-	}
-
-	// Create overlay subdirectories (data for upperdir, work for workdir)
-	if os.make_directory(fmt.tprintf("%s/data", mount_point)) != nil {
-		err = .Subdir_Create_Failed
-		return
-	}
-	if os.make_directory(fmt.tprintf("%s/work", mount_point)) != nil {
-		err = .Subdir_Create_Failed
-		return
-	}
-
-	return
-}
-
-tmpfs_unmount :: proc(m: ^Tmpfs_Mount) {
-	if m.active {
-		tgt := _to_cstr(m.mount_point)
-		c_umount2(tgt, MNT_DETACH)
-		m.active = false
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Overlay_Mount
+// Overlay_Mount — uses sq-mount-overlay helper
 // ---------------------------------------------------------------------------
 
 Overlay_Mount :: struct {
@@ -142,8 +65,9 @@ Overlay_Mount :: struct {
 	active:      bool,
 }
 
-// Mount an overlayfs.
+// Mount an overlayfs via sq-mount-overlay.
 // lower_components: ordered highest-priority first (snapshot, then descending numeric modules).
+// sq-mount-overlay takes colon-separated lowerdir string.
 overlay_mount :: proc(
 	lower_components: []string,
 	upper_data: string,
@@ -151,30 +75,18 @@ overlay_mount :: proc(
 	merged: string,
 	allocator := context.allocator,
 ) -> (Overlay_Mount, Mount_Error) {
-	// Ensure merged directory exists
-	if !os.exists(merged) {
-		if os.make_directory(merged) != nil {
-			return {}, .Create_Dir_Failed
-		}
-	}
-
-	// Build options string: "lowerdir=A:B:C,upperdir=X,workdir=Y"
+	// Build colon-separated lowerdir string for sq-mount-overlay
 	buf: [4096]byte
 	b := strings.builder_from_bytes(buf[:])
-	strings.write_string(&b, "lowerdir=")
 	for comp, i in lower_components {
 		if i > 0 {
 			strings.write_byte(&b, ':')
 		}
 		strings.write_string(&b, comp)
 	}
-	fmt.sbprintf(&b, ",upperdir=%s,workdir=%s", upper_data, work)
+	lower_str := strings.to_string(b)
 
-	tgt := _to_cstr(merged)
-	opts := _to_cstr(strings.to_string(b))
-
-	rc := c_mount("overlay", tgt, "overlay", 0, rawptr(opts))
-	if rc != 0 {
+	if !run_cmd("sq-mount-overlay", lower_str, upper_data, work, merged) {
 		return {}, .Mount_Failed
 	}
 
@@ -186,20 +98,19 @@ overlay_mount :: proc(
 
 overlay_unmount :: proc(m: ^Overlay_Mount) {
 	if m.active {
-		tgt := _to_cstr(m.merged_path)
-		c_umount2(tgt, MNT_DETACH)
+		run_cmd("sq-mount-overlay", "--unmount", m.merged_path)
 		m.active = false
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Sandbox_Mounts — aggregate of all mounts for a single sandbox
+// (tmpfs removed — unprivileged mode uses plain directories)
 // ---------------------------------------------------------------------------
 
 Sandbox_Mounts :: struct {
 	sqfs_mounts:    [dynamic]Squashfs_Mount,
 	snapshot_mount: Maybe(Squashfs_Mount),
-	tmpfs:          Tmpfs_Mount,
 	overlay:        Overlay_Mount,
 }
 
@@ -213,10 +124,7 @@ sandbox_mounts_destroy :: proc(mounts: ^Sandbox_Mounts) {
 		squashfs_unmount(snap)
 	}
 
-	// 3. Tmpfs upper layer
-	tmpfs_unmount(&mounts.tmpfs)
-
-	// 4. Squashfs module layers in reverse order
+	// 3. Squashfs module layers in reverse order
 	#reverse for &m in mounts.sqfs_mounts {
 		squashfs_unmount(&m)
 	}
@@ -229,7 +137,7 @@ sandbox_mounts_destroy :: proc(mounts: ^Sandbox_Mounts) {
 // Mount order:
 //   1. Squashfs module images
 //   2. Snapshot layer (optional)
-//   3. Tmpfs upper layer
+//   3. Create upper/work directories (plain dirs, no tmpfs)
 //   4. Overlay combining all layers
 //
 // On failure at any step, previously mounted layers are torn down in
@@ -241,7 +149,6 @@ Sandbox_Setup_Params :: struct {
 	modules_dir:    string,
 	layers:         []string,   // module names (e.g., ["000-base-alpine", "010-python"])
 	snapshot_path:  Maybe(string), // path to snapshot .squashfs if any
-	upper_size_mb:  u64,
 }
 
 sandbox_mounts_setup :: proc(
@@ -279,10 +186,15 @@ sandbox_mounts_setup :: proc(
 		result.snapshot_mount = snap
 	}
 
-	// 3. Tmpfs upper layer
-	upper_mp := fmt.tprintf("%s/upper", params.sandbox_dir)
-	result.tmpfs, err = tmpfs_mount(upper_mp, params.upper_size_mb, allocator)
-	if err != .None {
+	// 3. Create upper/work directories (no tmpfs — just plain dirs)
+	upper_data := fmt.tprintf("%s/upper/data", params.sandbox_dir)
+	work_dir := fmt.tprintf("%s/upper/work", params.sandbox_dir)
+	if os.make_directory(upper_data) != nil && !os.exists(upper_data) {
+		err = .Subdir_Create_Failed
+		return
+	}
+	if os.make_directory(work_dir) != nil && !os.exists(work_dir) {
+		err = .Subdir_Create_Failed
 		return
 	}
 
@@ -297,8 +209,6 @@ sandbox_mounts_setup :: proc(
 		append(&lower_components, m.mount_point)
 	}
 
-	upper_data := fmt.tprintf("%s/upper/data", params.sandbox_dir)
-	work_dir := fmt.tprintf("%s/upper/work", params.sandbox_dir)
 	merged := fmt.tprintf("%s/merged", params.sandbox_dir)
 
 	result.overlay, err = overlay_mount(lower_components[:], upper_data, work_dir, merged, allocator)

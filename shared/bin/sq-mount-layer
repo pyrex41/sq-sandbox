@@ -1,0 +1,84 @@
+#!/bin/sh
+# squash/bin/sq-mount-layer — mount/unmount squashfs layers (unprivileged)
+#
+# Usage:
+#   sq-mount-layer <squashfs-file> <mount-point>   Mount read-only
+#   sq-mount-layer --unmount <mount-point>          Unmount
+#
+# Prefers squashfuse (no root needed). Falls back to kernel loop mount.
+
+set -eu
+
+log() { echo "[sq-mount-layer] $*"; }
+die() { echo "[sq-mount-layer] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: $0 <squashfs-file> <mount-point>"
+    echo "       $0 --unmount <mount-point>"
+    exit 1
+}
+
+do_mount() {
+    local sqfs="$1" mp="$2"
+
+    [ -f "$sqfs" ] || die "squashfs file not found: $sqfs"
+    mkdir -p "$mp"
+
+    if command -v squashfuse >/dev/null 2>&1; then
+        # Run squashfuse in foreground mode (-f) as a background process.
+        # Avoids squashfuse's daemonize path which can close the squashfs fd
+        # when inherited fds are present in the parent process (e.g. a daemon
+        # with open sockets). Uses notify_pipe to block until squashfuse has
+        # attempted the mount (regardless of status byte written).
+        notify_pipe="/tmp/sq-notify-$$"
+        mkfifo "$notify_pipe" || die "mkfifo failed"
+        squashfuse -f -o ro,allow_other,notify_pipe="$notify_pipe" \
+            "$sqfs" "$mp" </dev/null >/dev/null 2>/dev/null &
+        sqfs_pid=$!
+        # Block until squashfuse writes its readiness signal (any byte = attempt complete)
+        read -r _status < "$notify_pipe" || true
+        rm -f "$notify_pipe"
+        # Verify the mount is actually serving requests, not just registered.
+        # squashfuse may write 'f' for non-fatal reasons (e.g. allow_other) before
+        # it is ready; poll until opendir succeeds (FUSE INIT handshake complete).
+        retries=0
+        while [ $retries -lt 20 ]; do
+            ls "$mp" >/dev/null 2>&1 && break
+            retries=$((retries + 1))
+            sleep 0.1
+        done
+        ls "$mp" >/dev/null 2>&1 || die "squashfuse mount not readable: $sqfs -> $mp (pid=$sqfs_pid)"
+    else
+        mount -o loop,ro -t squashfs "$sqfs" "$mp" || die "mount failed: $sqfs -> $mp"
+    fi
+}
+
+do_unmount() {
+    local mp="$1"
+
+    mountpoint -q "$mp" 2>/dev/null || die "not a mountpoint: $mp"
+
+    if command -v fusermount >/dev/null 2>&1 && fusermount -u "$mp" 2>/dev/null; then
+        return 0
+    fi
+
+    umount "$mp" 2>/dev/null && return 0
+    umount -l "$mp" 2>/dev/null && return 0
+
+    die "unmount failed: $mp"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+case "${1:-}" in
+    --unmount|-u)
+        [ $# -lt 2 ] && usage
+        do_unmount "$2"
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        [ $# -lt 2 ] && usage
+        do_mount "$1" "$2"
+        ;;
+esac

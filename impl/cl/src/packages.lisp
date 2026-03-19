@@ -35,4 +35,56 @@
            #:*app*
            #:build-app
            #:json-response
-           #:make-auth-middleware))
+           #:make-auth-middleware
+
+           ;; Config
+           #:config
+           #:make-config
+           #:config-from-env
+           #:config-data-dir
+           #:config-max-sandboxes
+           #:config-upper-limit-mb
+           #:config-backend
+
+           ;; Manager
+           #:manager
+           #:make-manager
+           #:manager-create-sandbox
+           #:manager-destroy-sandbox
+           #:manager-exec
+           #:manager-snapshot
+           #:manager-restore
+           #:manager-activate-module
+           #:manager-sandbox-info
+           #:manager-sandbox-count
+           #:list-sandbox-infos
+           #:manager-exec-logs
+
+           ;; Exec result
+           #:exec-result
+           #:make-exec-result
+           #:exec-result-exit-code
+           #:exec-result-stdout
+           #:exec-result-stderr
+           #:exec-result-started
+           #:exec-result-finished
+           #:exec-result-duration-ms
+           #:exec-result-seq
+
+           ;; Sandbox struct
+           #:sandbox
+           #:sandbox-id
+           #:sandbox-state
+           #:sandbox-created
+           #:sandbox-last-active
+           #:sandbox-exec-count
+
+           ;; Modules
+           #:list-available-modules
+           #:module-exists-p
+
+           ;; Recovery
+           #:init-recover
+
+           ;; Reaper
+           #:reaper-loop))

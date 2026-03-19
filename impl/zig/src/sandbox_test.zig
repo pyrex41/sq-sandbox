@@ -253,13 +253,6 @@ test "mount structures have idempotent deinit" {
     sqfs.deinit(); // Should not panic
     sqfs.deinit(); // Second call should also not panic
 
-    var tmpfs = mounts.TmpfsMount{
-        .mount_point = "/nonexistent",
-        .active = false,
-    };
-    tmpfs.deinit();
-    tmpfs.deinit();
-
     var overlay = mounts.OverlayMount{
         .merged_path = "/nonexistent",
         .active = false,

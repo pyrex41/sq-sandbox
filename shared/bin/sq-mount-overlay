@@ -1,0 +1,80 @@
+#!/bin/sh
+# squash/bin/sq-mount-overlay — create/remove overlay filesystems
+#
+# Usage:
+#   sq-mount-overlay <lowerdir:...> <upperdir> <workdir> <merged>
+#   sq-mount-overlay --unmount <merged>
+#
+# Mount mode tries fuse-overlayfs first (unprivileged), then falls back
+# to kernel overlayfs.  Unmount mode tries fusermount -u, then umount,
+# then umount -l.
+
+set -eu
+
+log() { echo "[sq-mount-overlay] $*"; }
+die() { echo "[sq-mount-overlay] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: $0 <lowerdir:...> <upperdir> <workdir> <merged>"
+    echo "       $0 --unmount <merged>"
+    exit 1
+}
+
+do_mount() {
+    local lower="$1" upper="$2" work="$3" merged="$4"
+    mkdir -p "$merged"
+
+    if command -v fuse-overlayfs >/dev/null 2>&1; then
+        log "mounting via fuse-overlayfs"
+        # Run fuse-overlayfs in foreground mode (-f) as a background process.
+        # Avoids the daemonize path which closes all non-stdio inherited fds,
+        # including the lowerdir fd — leaving the overlay with no lower layer.
+        # (Same issue as squashfuse: squashd inherits fd 3 → its own binary,
+        # and fuse-overlayfs opens lowerdir at fd 4, then daemonize closes it.)
+        fuse-overlayfs -f -o "lowerdir=$lower,upperdir=$upper,workdir=$work" \
+            "$merged" </dev/null >/dev/null 2>/dev/null &
+        # Wait until the mount is serving requests
+        retries=0
+        while [ $retries -lt 20 ]; do
+            mountpoint -q "$merged" 2>/dev/null && ls "$merged" >/dev/null 2>&1 && break
+            retries=$((retries + 1))
+            sleep 0.1
+        done
+        mountpoint -q "$merged" 2>/dev/null && ls "$merged" >/dev/null 2>&1 || \
+            die "fuse-overlayfs mount failed or not readable: $merged"
+    else
+        echo "[sq-mount-overlay] kernel fallback: lowerdir=$lower upperdir=$upper workdir=$work merged=$merged" >> /data/overlay-debug.log 2>/dev/null
+        mount -t overlay overlay \
+            -o "lowerdir=$lower,upperdir=$upper,workdir=$work,xino=off" "$merged" 2>>/data/overlay-debug.log
+        local rc=$?
+        echo "[sq-mount-overlay] mount exit: $rc" >> /data/overlay-debug.log 2>/dev/null
+        return $rc
+    fi
+}
+
+do_unmount() {
+    local mp="$1"
+    if command -v fusermount >/dev/null 2>&1 && fusermount -u "$mp" 2>/dev/null; then
+        log "unmounted $mp (fusermount)"
+    elif umount "$mp" 2>/dev/null; then
+        log "unmounted $mp (umount)"
+    elif umount -l "$mp" 2>/dev/null; then
+        log "lazy-unmounted $mp (umount -l)"
+    else
+        die "failed to unmount $mp"
+    fi
+}
+
+case "${1:---help}" in
+    --unmount)
+        [ $# -eq 2 ] || usage
+        do_unmount "$2"
+        ;;
+    --help|-h)
+        usage
+        ;;
+    *)
+        [ $# -eq 4 ] || usage
+        do_mount "$1" "$2" "$3" "$4"
+        ;;
+esac

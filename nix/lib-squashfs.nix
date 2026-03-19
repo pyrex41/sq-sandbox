@@ -17,8 +17,7 @@ in {
       mksquashfs "$rootfs" "$out" \
         -comp zstd -Xcompression-level 15 -b 128K \
         -noappend -no-xattrs -no-exports -all-root \
-        -no-hardlinks -processors 1 -root-mode 0755 \
-        -repro-time 0
+        -no-hardlinks -processors 1 -root-mode 0755
       rm -rf "$rootfs"
     '';
 

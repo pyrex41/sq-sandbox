@@ -2,11 +2,12 @@
 set -eu
 
 usage() {
-    echo "Usage: sq-exec <merged-root> <cmd> [workdir] [timeout]" >&2
+    echo "Usage: sq-exec <merged-root> <cmd> [workdir] [timeout] [net]" >&2
     echo "  merged-root  overlayfs merged directory (chroot/bwrap target)" >&2
     echo "  cmd          shell command to execute" >&2
     echo "  workdir      working directory inside sandbox (default: /)" >&2
     echo "  timeout      seconds before kill (default: 300)" >&2
+    echo "  net          1=slirp4netns outbound networking, 0=offline (default: 0)" >&2
     exit 1
 }
 
@@ -16,9 +17,83 @@ root="$1"
 cmd="$2"
 workdir="${3:-/}"
 timeout_s="${4:-300}"
+net="${5:-0}"
 
 # Try bubblewrap first (unprivileged, pivot_root-based)
 if command -v bwrap >/dev/null 2>&1; then
+    if [ "$net" = "1" ] && command -v slirp4netns >/dev/null 2>&1; then
+        # Network-enabled sandbox: bwrap with --unshare-net + slirp4netns user-mode NAT.
+        # slirp4netns provides outbound internet access without CAP_NET_ADMIN.
+        # The host proxy at localhost:8888 is reachable from inside as 10.0.2.2:8888.
+        tmpdir=$(mktemp -d)
+        trap 'rm -rf "$tmpdir"' EXIT
+
+        # Start bwrap with --info-fd writing to a regular file (non-blocking).
+        # bwrap forks the child, writes the child PID to info-fd, then waits for the child.
+        timeout "$timeout_s" bwrap \
+            --bind "$root" / \
+            --dev /dev \
+            --proc /proc \
+            --tmpfs /tmp \
+            --tmpfs /run \
+            --ro-bind /etc/resolv.conf /etc/resolv.conf \
+            --unshare-pid \
+            --unshare-ipc \
+            --unshare-uts \
+            --unshare-net \
+            --die-with-parent \
+            --info-fd 4 \
+            --chdir "$workdir" \
+            /bin/sh -c "$cmd" \
+            4>"$tmpdir/bwrap-info.json" &
+        bwrap_pid=$!
+
+        # Wait for bwrap to fork child and write info JSON (typically < 5ms).
+        sleep 0.05
+
+        # Parse child PID from bwrap info JSON: {"child-pid":12345,...}
+        child_pid=""
+        if [ -s "$tmpdir/bwrap-info.json" ]; then
+            child_pid=$(sed 's/.*"child-pid": *\([0-9]*\).*/\1/' "$tmpdir/bwrap-info.json")
+        fi
+
+        slirp_pid=""
+        if printf '%s' "${child_pid:-}" | grep -qE '^[0-9]+$' 2>/dev/null; then
+            # Set up a fifo for slirp4netns ready notification.
+            # slirp4netns writes one byte to --ready-fd when the interface is configured.
+            mkfifo "$tmpdir/slirp-ready"
+
+            # Start slirp4netns in background; the write-open of the ready-fifo (fd 4)
+            # blocks until we open the read end below.
+            slirp4netns \
+                --configure \
+                --mtu=65520 \
+                --ready-fd 4 \
+                "$child_pid" eth0 \
+                4>"$tmpdir/slirp-ready" \
+                >/dev/null 2>&1 &
+            slirp_pid=$!
+
+            # Open the read end of the ready fifo; this unblocks slirp4netns's fd-open,
+            # then blocks here until slirp4netns writes its ready signal.
+            cat "$tmpdir/slirp-ready" >/dev/null 2>/dev/null || true
+        else
+            echo "[sq-exec] slirp4netns: could not get bwrap child PID" >&2
+        fi
+
+        # Wait for sandbox command to complete
+        wait $bwrap_pid
+        rc=$?
+
+        if [ -n "$slirp_pid" ]; then
+            kill "$slirp_pid" 2>/dev/null || true
+            wait "$slirp_pid" 2>/dev/null || true
+        fi
+
+        exit $rc
+    fi
+
+    # Offline sandbox (net=0 or slirp4netns unavailable): fully isolated network namespace
     timeout "$timeout_s" bwrap \
         --bind "$root" / \
         --dev /dev \
@@ -29,6 +104,7 @@ if command -v bwrap >/dev/null 2>&1; then
         --unshare-pid \
         --unshare-ipc \
         --unshare-uts \
+        --unshare-net \
         --die-with-parent \
         --chdir "$workdir" \
         /bin/sh -c "$cmd" && exit 0 || rc=$?
@@ -43,6 +119,7 @@ if command -v bwrap >/dev/null 2>&1; then
 fi
 
 # Fallback: unshare + chroot (works as root, or with user namespaces)
+# Note: no network isolation in this fallback path
 exec timeout "$timeout_s" \
     unshare --mount --pid --ipc --uts --fork --map-root-user \
     chroot "$root" \

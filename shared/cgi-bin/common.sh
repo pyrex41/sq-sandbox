@@ -241,8 +241,8 @@ _inject_secret_placeholders() {
     local env_dir="$s/upper/data/etc/profile.d"
     mkdir -p "$env_dir"
 
-    # Proxy address — sandboxes inherit host networking, so localhost works
-    local proxy_host="127.0.0.1"
+    # Proxy address — sandboxes use slirp4netns; host loopback is at the gateway IP
+    local proxy_host="10.0.2.2"
 
     # Generate env script with placeholders + proxy config
     {
@@ -380,8 +380,15 @@ _chroot_exec_in_sandbox() {
     local out=$(mktemp) err=$(mktemp)
     local rc=0
 
+    # Determine if sandbox has network access (allow_net is non-empty JSON array)
+    local allow_net_raw net_flag="0"
+    allow_net_raw=$(cat "$s/.meta/allow_net" 2>/dev/null || echo "[]")
+    if [ "$allow_net_raw" != "[]" ] && [ -n "$allow_net_raw" ]; then
+        net_flag="1"
+    fi
+
     # Execute via bubblewrap (unprivileged) or unshare+chroot (fallback)
-    sq-exec "$s/merged" "$cmd" "$workdir" "$timeout_s" \
+    sq-exec "$s/merged" "$cmd" "$workdir" "$timeout_s" "$net_flag" \
         >"$out" 2>"$err" || rc=$?
 
     local t1=$(date -Iseconds)

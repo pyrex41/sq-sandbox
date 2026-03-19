@@ -68,6 +68,9 @@ pub const SandboxContext = struct {
     netns_name: ?[]const u8 = null,
     /// Cgroup path for resource limits. Null if no cgroup.
     cgroup_path: ?[]const u8 = null,
+    /// Enable slirp4netns outbound networking (--unshare-net + slirp4netns).
+    /// False = fully offline (--unshare-net with no networking).
+    net_enabled: bool = false,
 };
 
 pub const ExecError = error{
@@ -93,8 +96,9 @@ pub fn execInSandbox(
     const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{req.timeout_s}) catch
         return ExecError.ForkFailed;
 
+    const net_str = if (ctx.net_enabled) "1" else "0";
     var child = std.process.Child.init(
-        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str },
+        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str, net_str },
         allocator,
     );
     child.stdout_behavior = .Pipe;
@@ -387,8 +391,9 @@ pub fn execInSandboxBg(
     const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{req.timeout_s}) catch
         return BgExecError.ForkFailed;
 
+    const net_str = if (ctx.net_enabled) "1" else "0";
     var child = std.process.Child.init(
-        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str },
+        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str, net_str },
         std.heap.page_allocator,
     );
     child.stdout_behavior = .Pipe;
@@ -561,6 +566,7 @@ test "SandboxContext defaults" {
     const ctx = SandboxContext{ .merged_path = "/tmp/merged" };
     try std.testing.expectEqual(@as(?[]const u8, null), ctx.log_dir);
     try std.testing.expectEqual(@as(?*SeqCounter, null), ctx.seq_counter);
+    try std.testing.expectEqual(false, ctx.net_enabled);
 }
 
 test "max_output_bytes is 64KB" {

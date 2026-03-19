@@ -26,7 +26,22 @@ do_mount() {
 
     if command -v fuse-overlayfs >/dev/null 2>&1; then
         log "mounting via fuse-overlayfs"
-        fuse-overlayfs -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
+        # Run fuse-overlayfs in foreground mode (-f) as a background process.
+        # Avoids the daemonize path which closes all non-stdio inherited fds,
+        # including the lowerdir fd — leaving the overlay with no lower layer.
+        # (Same issue as squashfuse: squashd inherits fd 3 → its own binary,
+        # and fuse-overlayfs opens lowerdir at fd 4, then daemonize closes it.)
+        fuse-overlayfs -f -o "lowerdir=$lower,upperdir=$upper,workdir=$work" \
+            "$merged" </dev/null >/dev/null 2>/dev/null &
+        # Wait until the mount is serving requests
+        retries=0
+        while [ $retries -lt 20 ]; do
+            mountpoint -q "$merged" 2>/dev/null && ls "$merged" >/dev/null 2>&1 && break
+            retries=$((retries + 1))
+            sleep 0.1
+        done
+        mountpoint -q "$merged" 2>/dev/null && ls "$merged" >/dev/null 2>&1 || \
+            die "fuse-overlayfs mount failed or not readable: $merged"
     else
         echo "[sq-mount-overlay] kernel fallback: lowerdir=$lower upperdir=$upper workdir=$work merged=$merged" >> /data/overlay-debug.log 2>/dev/null
         mount -t overlay overlay \

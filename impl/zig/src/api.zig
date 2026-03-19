@@ -683,6 +683,11 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
     defer if (netns_name) |s| allocator.free(s);
     const cgroup_path = readMetaFile(allocator, sandbox_path, "cgroup_path") catch null;
     defer if (cgroup_path) |s| allocator.free(s);
+    const allow_net_raw = readMetaFile(allocator, sandbox_path, "allow_net") catch null;
+    defer if (allow_net_raw) |s| allocator.free(s);
+    const net_enabled = if (allow_net_raw) |raw|
+        !std.mem.eql(u8, raw, "[]") and raw.len > 2
+    else false;
 
     // Execute in sandbox — use the real exec module
     var exec_ctx = exec_mod.SandboxContext{
@@ -690,6 +695,7 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
         .netns_name = netns_name,
         .cgroup_path = cgroup_path,
         .log_dir = log_dir,
+        .net_enabled = net_enabled,
     };
 
     // Create a sequence counter initialized to current seq
@@ -784,8 +790,15 @@ fn handleExecBg(request: *http.Server.Request, cfg: *const Config, id: []const u
         return;
     };
 
+    const bg_allow_net_raw = readMetaFile(allocator, sandbox_path, "allow_net") catch null;
+    defer if (bg_allow_net_raw) |s| allocator.free(s);
+    const bg_net_enabled = if (bg_allow_net_raw) |raw|
+        !std.mem.eql(u8, raw, "[]") and raw.len > 2
+    else false;
+
     const ctx = exec_mod.SandboxContext{
         .merged_path = merged_path,
+        .net_enabled = bg_net_enabled,
     };
 
     const bg_req = exec_mod.ExecRequest{

@@ -69,6 +69,9 @@ pub fn main() !void {
     defer job_registry.deinit();
     jobs.setGlobal(&job_registry);
 
+    // 2c. Start sq-sync sidecar (if not already running)
+    startSyncSidecar(&cfg);
+
     // 3. Start secret proxy (if secrets.json exists or proxy_https enabled)
     // Matches Rust: start when secrets_path().is_file()
     if (cfg.secretsExist() or cfg.proxy_https) {
@@ -146,6 +149,31 @@ fn startTailscale(cfg: *const config.Config) void {
         return;
     };
     log.info("tailscale startup command issued for {s}", .{cfg.tailscale_hostname});
+}
+
+/// Start the sq-sync sidecar daemon if it is available and not already running.
+fn startSyncSidecar(cfg: *const config.Config) void {
+    var bus_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const bus_path = cfg.busSockPath(&bus_buf) catch return;
+
+    // Already running?
+    std.fs.accessAbsolute(bus_path, .{}) catch {
+        // Socket doesn't exist — try to start the sidecar
+        var child = std.process.Child.init(
+            &.{ "sq-sync", "--daemon" },
+            std.heap.page_allocator,
+        );
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch |err| {
+            log.warn("sq-sync sidecar: failed to start: {}", .{err});
+            return;
+        };
+        log.info("sq-sync sidecar started", .{});
+        return;
+    };
+    log.info("sq-sync sidecar already running", .{});
 }
 
 // ── Pull in tests from all modules ──────────────────────────────────

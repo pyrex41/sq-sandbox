@@ -60,6 +60,7 @@ pub const Route = union(enum) {
     snapshot_sandbox: []const u8,
     restore_sandbox: []const u8,
     activate_sandbox: []const u8,
+    wg_peers: []const u8,
     list_modules,
     job_status: struct { sandbox_id: []const u8, job_id: []const u8 },
     job_logs: struct { sandbox_id: []const u8, job_id: []const u8 },
@@ -106,6 +107,7 @@ pub fn matchRoute(method: http.Method, target: []const u8) Route {
             if (eql(action, "snapshot")) return .{ .snapshot_sandbox = id };
             if (eql(action, "restore")) return .{ .restore_sandbox = id };
             if (eql(action, "activate")) return .{ .activate_sandbox = id };
+            if (eql(action, "wg/peers")) return .{ .wg_peers = id };
 
             // /cgi-bin/api/sandboxes/:id/jobs/:jid[/logs]
             if (std.mem.startsWith(u8, action, "jobs/")) {
@@ -259,6 +261,7 @@ fn handleRequest(request: *http.Server.Request, cfg: *const Config, allocator: s
         .snapshot_sandbox => |id| try handleSnapshot(request, cfg, id, allocator),
         .restore_sandbox => |id| try handleRestore(request, cfg, id, allocator),
         .activate_sandbox => |id| try handleActivate(request, cfg, id, allocator),
+        .wg_peers => |id| try handleWgPeers(request, cfg, id, allocator),
         .list_modules => try handleListModules(request, cfg, allocator),
         .job_status => |ids| try handleJobStatus(request, ids.job_id, allocator),
         .job_logs => |ids| try handleJobLogs(request, ids.job_id, allocator, raw_stream),
@@ -1439,6 +1442,182 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     try sendJson(request, .ok, allocator, info);
 }
 
+fn handleWgPeers(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(request, allocator)) return;
+
+    var sb_dir_buf: [256]u8 = undefined;
+    const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+
+    // Check sandbox exists
+    var sandbox_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sandbox_path = std.fmt.bufPrint(&sandbox_path_buf, "{s}/{s}", .{ sb_dir_path, id }) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
+        try sendJsonError(request, .not_found, err_msg, allocator);
+        return;
+    };
+
+    // Check for network namespace
+    const netns_name = readMetaFile(allocator, sandbox_path, "netns_name") catch {
+        try sendJsonError(request, .bad_request, "sandbox has no network namespace", allocator);
+        return;
+    };
+    defer allocator.free(netns_name);
+
+    if (std.mem.trim(u8, netns_name, " \n\r").len == 0) {
+        try sendJsonError(request, .bad_request, "sandbox has no network namespace", allocator);
+        return;
+    }
+
+    // Set up wg0 if not already present
+    var port_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const port_path = std.fmt.bufPrint(&port_path_buf, "{s}/.meta/wg_listen_port", .{sandbox_path}) catch {
+        try sendJsonError(request, .internal_server_error, "path error", allocator);
+        return;
+    };
+    var pubkey_str: [64]u8 = undefined;
+    var pubkey_len: usize = 0;
+
+    const wg_port_exists = blk: {
+        std.fs.accessAbsolute(port_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!wg_port_exists) {
+        // Generate keypair via sq-wg genkey
+        const genkey_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "sq-wg", "genkey" },
+        }) catch {
+            try sendJsonError(request, .internal_server_error, "wg genkey failed", allocator);
+            return;
+        };
+        defer {
+            allocator.free(genkey_result.stdout);
+            allocator.free(genkey_result.stderr);
+        }
+
+        if (genkey_result.term.Exited != 0) {
+            try sendJsonError(request, .internal_server_error, "wg genkey failed", allocator);
+            return;
+        }
+
+        // Parse: line 1 = privkey, line 2 = pubkey
+        var lines = std.mem.splitScalar(u8, genkey_result.stdout, '\n');
+        const privkey = std.mem.trim(u8, lines.next() orelse "", " \r");
+        const pubkey = std.mem.trim(u8, lines.next() orelse "", " \r");
+
+        if (privkey.len == 0 or pubkey.len == 0) {
+            try sendJsonError(request, .internal_server_error, "wg genkey: bad output", allocator);
+            return;
+        }
+
+        // Setup wg0
+        const setup_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "sq-wg", "setup", id, privkey, "51820" },
+        }) catch {
+            try sendJsonError(request, .internal_server_error, "wg setup failed", allocator);
+            return;
+        };
+        defer {
+            allocator.free(setup_result.stdout);
+            allocator.free(setup_result.stderr);
+        }
+
+        if (setup_result.term.Exited != 0) {
+            try sendJsonError(request, .internal_server_error, "wg setup failed", allocator);
+            return;
+        }
+
+        // Store public key in metadata
+        writeMetaFile(sandbox_path, "wg_public_key", pubkey);
+
+        @memcpy(pubkey_str[0..pubkey.len], pubkey);
+        pubkey_len = pubkey.len;
+    } else {
+        // Read existing public key
+        const pk: ?[]u8 = readMetaFile(allocator, sandbox_path, "wg_public_key") catch null;
+        defer if (pk) |p| allocator.free(p);
+        if (pk) |p| {
+            const trimmed_pk = std.mem.trim(u8, p, " \n\r");
+            if (trimmed_pk.len > 0 and trimmed_pk.len <= pubkey_str.len) {
+                @memcpy(pubkey_str[0..trimmed_pk.len], trimmed_pk);
+                pubkey_len = trimmed_pk.len;
+            }
+        }
+    }
+
+    // Read request body for peers array
+    // The body is a JSON array of peer objects — shell out to sq-wg add-peer for each
+    const body_bytes = request.reader().readAllAlloc(allocator, 1024 * 1024) catch {
+        try sendJsonError(request, .bad_request, "failed to read body", allocator);
+        return;
+    };
+    defer allocator.free(body_bytes);
+
+    // Parse as JSON array — count peers and add each via sq-wg
+    // Simple approach: parse with std.json
+    var peers_added: usize = 0;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_bytes, .{}) catch {
+        try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
+        return;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .array) {
+        try sendJsonError(request, .bad_request, "expected JSON array of peers", allocator);
+        return;
+    }
+
+    for (parsed.value.array.items) |peer_val| {
+        if (peer_val != .object) continue;
+        const obj = peer_val.object;
+        const pk = if (obj.get("publicKey")) |v| switch (v) {
+            .string => |s| s,
+            else => continue,
+        } else continue;
+
+        const ep = if (obj.get("endpoint")) |v| switch (v) {
+            .string => |s| s,
+            else => "",
+        } else "";
+        const ips = if (obj.get("allowedIPs")) |v| switch (v) {
+            .string => |s| s,
+            else => "0.0.0.0/0",
+        } else "0.0.0.0/0";
+        const psk = if (obj.get("presharedKey")) |v| switch (v) {
+            .string => |s| s,
+            else => "",
+        } else "";
+
+        const add_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "sq-wg", "add-peer", id, pk, ep, ips, psk },
+        }) catch continue;
+        allocator.free(add_result.stdout);
+        allocator.free(add_result.stderr);
+
+        peers_added += 1;
+    }
+
+    // Build response
+    var resp_buf: [512]u8 = undefined;
+    const resp_body = std.fmt.bufPrint(&resp_buf, "{{\"status\":\"ok\",\"publicKey\":\"{s}\",\"listenPort\":51820,\"peersAdded\":{d}}}", .{ pubkey_str[0..pubkey_len], peers_added }) catch {
+        try sendJsonError(request, .internal_server_error, "response error", allocator);
+        return;
+    };
+
+    try sendJsonLiteral(request, .ok, resp_body);
+}
+
 fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
     var mod_dir_buf: [256]u8 = undefined;
     const mod_dir_path = cfg.modulesDir(&mod_dir_buf) catch {
@@ -1603,15 +1782,8 @@ fn doFirecrackerSnapshot(
         .size = stat.size,
     };
 
-    // Push to S3 in background (matches Rust)
-    if (cfg.s3Enabled()) {
-        if (s3_mod.S3Client.fromEnv()) |s3_client| {
-            var s3_key_buf: [512]u8 = undefined;
-            if (std.fmt.bufPrint(&s3_key_buf, "sandboxes/{s}/snapshots/{s}.squashfs", .{ id, label })) |s3_key| {
-                s3_client.pushBg(allocator, snap_path, s3_key);
-            } else |_| {}
-        }
-    }
+    // Prefer sq-sync sidecar for S3 push; fallback to direct S3 push
+    notifySnapshotPush(cfg, allocator, snap_path, id, label);
 
     try sendJson(request, .ok, allocator, result);
 }
@@ -1757,7 +1929,38 @@ fn doSnapshot(
         .size = stat.size,
     };
 
-    // Push to S3 in background (matches Rust)
+    // Prefer sq-sync sidecar for S3 push; fallback to direct S3 push
+    notifySnapshotPush(cfg, allocator, snap_path, id, label);
+
+    try sendJson(request, .ok, allocator, result);
+}
+
+// ── Bus Notify Helper ──────────────────────────────────────────────────
+
+/// Notify the sq-sync sidecar to push a snapshot to S3.
+/// Falls back to direct S3 push if the sidecar is unavailable.
+fn notifySnapshotPush(cfg: *const Config, allocator: std.mem.Allocator, snap_path: []const u8, id: []const u8, label: []const u8) void {
+    // Check if sq-sync bus socket exists
+    var bus_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (cfg.busSockPath(&bus_path_buf)) |bus_path| {
+        if (std.fs.accessAbsolute(bus_path, .{})) |_| {
+            // Build the notify JSON and shell out to sq-sync --notify
+            var notify_buf: [1024]u8 = undefined;
+            var s3_key_buf2: [512]u8 = undefined;
+            const s3_key = std.fmt.bufPrint(&s3_key_buf2, "sandboxes/{s}/snapshots/{s}.squashfs", .{ id, label }) catch return;
+            const notify_msg = std.fmt.bufPrint(&notify_buf, "{{\"op\":\"push\",\"path\":\"{s}\",\"key\":\"{s}\"}}", .{ snap_path, s3_key }) catch return;
+
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "sq-sync", "--notify", notify_msg },
+            }) catch return;
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+            return;
+        } else |_| {}
+    } else |_| {}
+
+    // Fallback: direct S3 push
     if (cfg.s3Enabled()) {
         if (s3_mod.S3Client.fromEnv()) |s3_client| {
             var s3_key_buf: [512]u8 = undefined;
@@ -1766,8 +1969,6 @@ fn doSnapshot(
             } else |_| {}
         }
     }
-
-    try sendJson(request, .ok, allocator, result);
 }
 
 // ── Content-Type Enforcement ───────────────────────────────────────────
@@ -2672,6 +2873,14 @@ test "matchRoute activate" {
 test "matchRoute list modules" {
     const r = matchRoute(.GET, "/cgi-bin/api/modules");
     try std.testing.expect(r == .list_modules);
+}
+
+test "matchRoute wg peers" {
+    const r = matchRoute(.POST, "/cgi-bin/api/sandboxes/sb1/wg/peers");
+    switch (r) {
+        .wg_peers => |id| try std.testing.expectEqualStrings("sb1", id),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "matchRoute not found" {

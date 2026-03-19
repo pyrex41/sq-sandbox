@@ -321,9 +321,14 @@
 
   (def st (try (os/stat snapfile) ([e] nil)))
   (def size (if st (get st :size 0) 0))
-  # S3 push in background
+  # Prefer sq-sync sidecar for S3 push; fallback to direct
   (def s3-key (string "snapshots/" id "/" lbl ".squashfs"))
-  (s3/push-bg cfg snapfile s3-key)
+  (def bus-sock (config/bus-sock-path cfg))
+  (if (and bus-sock (os/stat bus-sock))
+    (do
+      (def msg (string/format `{"op":"push","path":"%s","key":"%s"}` snapfile s3-key))
+      (try (os/execute ["sq-sync" "--notify" msg] :p) ([e] nil)))
+    (s3/push-bg cfg snapfile s3-key))
   [lbl size])
 
 (defn manager-restore [manager id label]

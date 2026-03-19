@@ -51,6 +51,9 @@
     (setf *s3-client* (make-s3-client-from-config *config*))
     (log:info "s3: configured for bucket ~A" (config-s3-bucket *config*)))
 
+  ;; 6b. Start sq-sync sidecar (if available and not already running)
+  (start-sync-sidecar *config*)
+
   ;; 7. Start Go secret proxy (via uiop:launch-program)
   (when (secrets-exist-p *config*)
     (start-go-proxy *config*))
@@ -91,6 +94,20 @@
           (shutdown)))
     ;; Block forever — the reaper and HTTP server run in background threads.
     (bt:wait-on-semaphore (bt:make-semaphore :name "main-block"))))
+
+;;; ── Sync sidecar management ──────────────────────────────────────────
+
+(defun start-sync-sidecar (config)
+  "Start the sq-sync sidecar daemon if available and not already running."
+  (let ((bus-sock (config-bus-sock-path config)))
+    (when (and bus-sock (not (probe-file bus-sock)))
+      (handler-case
+          (progn
+            (uiop:run-program '("sq-sync" "--daemon")
+                              :ignore-error-status t)
+            (log:info "sq-sync sidecar started"))
+        (error (e)
+          (log:warn "sq-sync sidecar: failed to start: ~A" e))))))
 
 ;;; ── Go proxy management ───────────────────────────────────────────────
 

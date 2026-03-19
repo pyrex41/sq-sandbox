@@ -29,6 +29,7 @@
                (:file "exec")
                (:file "sandbox")
                (:file "firecracker")
+               (:file "gvisor")
                (:file "manager")
                (:file "meta")
                (:file "modules")

@@ -5,6 +5,12 @@ pub const Backend = enum {
     firecracker,
 };
 
+pub const UpperBackend = enum {
+    tmpfs,
+    btrfs,
+    loop,
+};
+
 pub const Config = struct {
     backend: Backend = .chroot,
     /// Prefer SQUASH_DATA_DIR, fallback to SQUASH_DATA, then /data
@@ -21,6 +27,8 @@ pub const Config = struct {
     proxy_https: bool = false,
     tailscale_authkey: ?[]const u8 = null,
     tailscale_hostname: []const u8 = "squash",
+    upper_backend: UpperBackend = .tmpfs,
+    local_cache_dir: ?[]const u8 = null,
 
     /// Directory path for squashfs module files.
     pub fn modulesDir(self: *const Config, buf: []u8) ![]const u8 {
@@ -81,8 +89,32 @@ pub const Config = struct {
         if (getEnvNonEmpty("SQUASH_PROXY_HTTPS")) |v| cfg.proxy_https = std.mem.eql(u8, v, "1");
         cfg.tailscale_authkey = getEnvNonEmpty("TAILSCALE_AUTHKEY");
         if (getEnvNonEmpty("TAILSCALE_HOSTNAME")) |v| cfg.tailscale_hostname = v;
+        if (getEnvNonEmpty("SQUASH_UPPER_BACKEND")) |v| {
+            if (std.mem.eql(u8, v, "btrfs")) {
+                cfg.upper_backend = .btrfs;
+            } else if (std.mem.eql(u8, v, "loop")) {
+                cfg.upper_backend = .loop;
+            }
+        }
+        cfg.local_cache_dir = getEnvNonEmpty("SQUASH_LOCAL_CACHE_DIR");
 
         return cfg;
+    }
+
+    /// Path to IPC bus socket: {data_dir}/.sq-bus.sock or SQUASH_BUS_SOCK
+    pub fn busSockPath(self: *const Config, buf: []u8) ![]const u8 {
+        if (getEnvNonEmpty("SQUASH_BUS_SOCK")) |v| {
+            return std.fmt.bufPrint(buf, "{s}", .{v});
+        }
+        return std.fmt.bufPrint(buf, "{s}/.sq-bus.sock", .{self.data_dir});
+    }
+
+    /// Local cache directory: local_cache_dir or {data_dir}/cache
+    pub fn cacheDir(self: *const Config, buf: []u8) ![]const u8 {
+        if (self.local_cache_dir) |d| {
+            return std.fmt.bufPrint(buf, "{s}", .{d});
+        }
+        return std.fmt.bufPrint(buf, "{s}/cache", .{self.data_dir});
     }
 
     pub fn s3Enabled(self: *const Config) bool {
@@ -185,4 +217,23 @@ test "vmDir builds correct path" {
     var buf: [256]u8 = undefined;
     const path = try cfg.vmDir(&buf);
     try std.testing.expectEqualStrings("/mnt/data/vm", path);
+}
+
+test "default upper_backend is tmpfs" {
+    const cfg = Config{};
+    try std.testing.expectEqual(UpperBackend.tmpfs, cfg.upper_backend);
+}
+
+test "busSockPath builds correct path" {
+    const cfg = Config{ .data_dir = "/mnt/data" };
+    var buf: [256]u8 = undefined;
+    const path = try cfg.busSockPath(&buf);
+    try std.testing.expectEqualStrings("/mnt/data/.sq-bus.sock", path);
+}
+
+test "cacheDir builds correct path" {
+    const cfg = Config{};
+    var buf: [256]u8 = undefined;
+    const path = try cfg.cacheDir(&buf);
+    try std.testing.expectEqualStrings("/data/cache", path);
 }

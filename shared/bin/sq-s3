@@ -364,34 +364,43 @@ sync_snapshots() {
 
 # ── CLI dispatch ────────────────────────────────────────────────────
 
-[ -z "$BUCKET" ] && { log "ERROR: SQUASH_S3_BUCKET is not set"; exit 1; }
+# When SQUASH_S3_BUCKET is empty, S3 is disabled — pure local mode.
+# Functions that require S3 will exit early or error.
+_s3_disabled() { [ -z "$BUCKET" ]; }
 
 case "${1:-help}" in
     push)
         [ $# -lt 3 ] && { echo "usage: sq-s3 push <local-path> <s3-key>" >&2; exit 1; }
+        _s3_disabled && { log "S3 disabled (no bucket), skipping push"; exit 0; }
         s3_push "$2" "$3"
         ;;
     pull)
         [ $# -lt 3 ] && { echo "usage: sq-s3 pull <s3-key> <local-path>" >&2; exit 1; }
+        _s3_disabled && { log "S3 disabled (no bucket), skipping pull"; exit 1; }
         s3_pull "$2" "$3"
         ;;
     exists)
         [ $# -lt 2 ] && { echo "usage: sq-s3 exists <s3-key>" >&2; exit 1; }
+        _s3_disabled && exit 1
         s3_exists "$2"
         ;;
     list)
         [ $# -lt 2 ] && { echo "usage: sq-s3 list <s3-prefix>" >&2; exit 1; }
+        _s3_disabled && exit 0
         s3_list "$2"
         ;;
     push-bg)
         [ $# -lt 3 ] && { echo "usage: sq-s3 push-bg <local-path> <s3-key>" >&2; exit 1; }
+        _s3_disabled && exit 0
         s3_push_bg "$2" "$3"
         ;;
     sync-modules)
+        _s3_disabled && { log "S3 disabled, skipping module sync"; exit 0; }
         sync_modules
         ;;
     sync-snapshots)
         [ $# -lt 2 ] && { echo "usage: sq-s3 sync-snapshots <sandbox-id>" >&2; exit 1; }
+        _s3_disabled && { log "S3 disabled, skipping snapshot sync"; exit 0; }
         sync_snapshots "$2"
         ;;
     help|*)

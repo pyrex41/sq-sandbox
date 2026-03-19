@@ -24,7 +24,10 @@
   (s3-secret-key  nil      :type (or null simple-string))
   (s3-endpoint    nil      :type (or null simple-string))
   (proxy-https    nil      :type boolean)
-  (secrets-dir    nil      :type (or null simple-string)))
+  (secrets-dir    nil      :type (or null simple-string))
+  (upper-backend  :tmpfs   :type keyword)
+  (local-cache-dir nil     :type (or null simple-string))
+  (bus-sock-path  nil      :type (or null simple-string)))
 
 ;;; ── Derived paths ──────────────────────────────────────────────────
 
@@ -55,11 +58,20 @@
     (and val (or (string= val "1") (string-equal val "true")))))
 
 (defun parse-backend (val)
-  "Parse backend string to keyword. Returns :CHROOT or :FIRECRACKER."
+  "Parse backend string to keyword. Returns :CHROOT, :FIRECRACKER, or :GVISOR."
   (let ((s (string-downcase (or val "chroot"))))
     (cond
       ((string= s "firecracker") :firecracker)
+      ((string= s "gvisor") :gvisor)
       (t :chroot))))
+
+(defun parse-upper-backend (val)
+  "Parse upper backend string to keyword. Returns :TMPFS, :BTRFS, or :LOOP."
+  (let ((s (string-downcase (or val "tmpfs"))))
+    (cond
+      ((string= s "btrfs") :btrfs)
+      ((string= s "loop")  :loop)
+      (t :tmpfs))))
 
 (defun config-from-env ()
   "Create a config struct from environment variables.
@@ -69,7 +81,7 @@
      SQUASH_PORT         — HTTP port (default 8080)
      SQUASH_MAX_SANDBOXES — max concurrent sandboxes (default 100)
      SQUASH_UPPER_LIMIT_MB — tmpfs upper layer size in MB (default 512)
-     SQUASH_BACKEND      — sandbox backend: chroot or firecracker (default chroot)
+     SQUASH_BACKEND      — sandbox backend: chroot, firecracker, or gvisor (default chroot)
      SQUASH_AUTH_TOKEN   — bearer token for API auth (optional)
      SQUASH_S3_BUCKET    — S3 bucket for module sync (optional)
      SQUASH_S3_REGION    — S3 region (default us-east-2)
@@ -95,7 +107,12 @@
    :s3-secret-key  (env-or "SQUASH_S3_SECRET_KEY" nil)
    :s3-endpoint    (env-or "SQUASH_S3_ENDPOINT" nil)
    :proxy-https    (env-bool "SQUASH_PROXY_HTTPS")
-   :secrets-dir    (env-or "SQUASH_SECRETS_DIR" nil))))
+   :secrets-dir    (env-or "SQUASH_SECRETS_DIR" nil)
+   :upper-backend  (parse-upper-backend (env-or "SQUASH_UPPER_BACKEND" "tmpfs"))
+   :local-cache-dir (env-or "SQUASH_LOCAL_CACHE_DIR"
+                             (format nil "~A/cache" data-dir))
+   :bus-sock-path  (env-or "SQUASH_BUS_SOCK"
+                           (format nil "~A/.sq-bus.sock" data-dir)))))
 
 ;;; ── Helpers used by main.lisp ──────────────────────────────────────
 

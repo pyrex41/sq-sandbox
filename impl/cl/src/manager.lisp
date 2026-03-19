@@ -112,20 +112,28 @@
 (defun %create-sandbox-inner (manager id &key owner layers task cpu
                                              memory-mb max-lifetime-s
                                              allow-net)
-  "Inner sandbox creation — dispatches to chroot or firecracker backend.
+  "Inner sandbox creation — dispatches to chroot, firecracker, or gvisor backend.
    Called with the manager slot already reserved."
   (let ((config (manager-config manager)))
-    (if (eq (config-backend config) :firecracker)
-        (%create-sandbox-firecracker manager id
-                                     :owner owner :layers layers :task task
-                                     :cpu cpu :memory-mb memory-mb
-                                     :max-lifetime-s max-lifetime-s
-                                     :allow-net allow-net)
-        (%create-sandbox-chroot manager id
-                                :owner owner :layers layers :task task
-                                :cpu cpu :memory-mb memory-mb
-                                :max-lifetime-s max-lifetime-s
-                                :allow-net allow-net))))
+    (case (config-backend config)
+      (:firecracker
+       (%create-sandbox-firecracker manager id
+                                    :owner owner :layers layers :task task
+                                    :cpu cpu :memory-mb memory-mb
+                                    :max-lifetime-s max-lifetime-s
+                                    :allow-net allow-net))
+      (:gvisor
+       (%create-sandbox-gvisor manager id
+                               :owner owner :layers layers :task task
+                               :cpu cpu :memory-mb memory-mb
+                               :max-lifetime-s max-lifetime-s
+                               :allow-net allow-net))
+      (otherwise
+       (%create-sandbox-chroot manager id
+                               :owner owner :layers layers :task task
+                               :cpu cpu :memory-mb memory-mb
+                               :max-lifetime-s max-lifetime-s
+                               :allow-net allow-net)))))
 
 ;;; ── Chroot creation ──────────────────────────────────────────────────
 
@@ -293,6 +301,122 @@
           (ignore-errors (firecracker-teardown-network id index))
           (release-netns-index index))))))
 
+;;; ── gVisor creation ─────────────────────────────────────────────────
+
+(defun %create-sandbox-gvisor (manager id &key owner layers task cpu
+                                              memory-mb max-lifetime-s
+                                              allow-net)
+  "gVisor backend: same overlayfs stack as chroot, but uses runsc for isolation.
+   Creates overlay mounts, netns, generates OCI config, then starts runsc container."
+  (let* ((config (manager-config manager))
+         (layers (or layers '("000-base-alpine")))
+         (sandbox-dir (format nil "~A/sandboxes/~A"
+                              (config-data-dir config) id))
+         (upper-path (format nil "~A/upper" sandbox-dir))
+         (merged-path (format nil "~A/merged" sandbox-dir))
+         (meta-dir (format nil "~A/.meta/log" sandbox-dir))
+         (bundle-dir (format nil "~A/oci" sandbox-dir)))
+
+    ;; Create directory tree
+    (ensure-directories-exist (format nil "~A/" meta-dir))
+    (ensure-directories-exist (format nil "~A/images/" sandbox-dir))
+    (ensure-directories-exist (format nil "~A/snapshots/" sandbox-dir))
+
+    ;; 1. Mount tmpfs for upper layer
+    (with-rollback-on-error (tmpfs
+                             (mount-tmpfs upper-path
+                                          (or (config-upper-limit-mb config) 512))
+                             (unmount-tmpfs tmpfs))
+
+      ;; 2. Mount squashfs layers
+      (let ((sqfs-mounts (make-array (length layers))))
+        (unwind-protect
+             (progn
+               (loop for layer in layers
+                     for i from 0
+                     for mod-path = (format nil "~A/~A.squashfs"
+                                            (modules-dir config) layer)
+                     for mp = (format nil "~A/images/~A.squashfs"
+                                      sandbox-dir layer)
+                     do (setf (aref sqfs-mounts i)
+                              (restart-case
+                                  (mount-squashfs mod-path mp)
+                                (pull-from-s3-and-retry ()
+                                  :report (lambda (s)
+                                            (format s "Pull ~A from S3" layer))
+                                  :test (lambda (c)
+                                          (declare (ignore c))
+                                          (not (null *s3-client*)))
+                                  (funcall 's3-pull-module *s3-client* layer)
+                                  (mount-squashfs mod-path mp)))))
+
+               ;; 3. Overlay
+               (let* ((lower-components
+                        (loop for m across sqfs-mounts
+                              collect (squashfs-mount-mount-point m)))
+                      (overlay (mount-overlay lower-components
+                                              (format nil "~A/data" upper-path)
+                                              (format nil "~A/work" upper-path)
+                                              merged-path)))
+
+                 (with-rollback-on-error (overlay-guard overlay
+                                          (unmount-overlay overlay-guard))
+
+                   ;; 4. Network namespace (same as chroot)
+                   (with-rollback-on-error (netns
+                                            (setup-netns config id allow-net)
+                                            (teardown-netns netns))
+
+                     ;; 5. Seed resolv.conf
+                     (ignore-errors
+                       (seed-resolv-conf sandbox-dir netns))
+
+                     ;; 6. Inject secret placeholders
+                     (ignore-errors
+                       (funcall 'inject-secret-placeholders config sandbox-dir netns))
+
+                     ;; 7. Generate OCI config.json
+                     (gvisor-write-oci-config bundle-dir merged-path
+                                              (when netns
+                                                (netns-handle-name netns))
+                                              (or cpu 2.0)
+                                              (or memory-mb 1024))
+
+                     ;; 8. Start runsc container
+                     (gvisor-create-and-start config id bundle-dir)
+
+                     ;; 9. Write metadata
+                     (ignore-errors
+                       (write-sandbox-meta config id
+                                           :owner (or owner "anon")
+                                           :layers layers
+                                           :task (or task "")
+                                           :cpu (or cpu 2.0)
+                                           :memory-mb (or memory-mb 1024)
+                                           :max-lifetime-s (or max-lifetime-s 0)
+                                           :allow-net allow-net))
+
+                     ;; Build and return the sandbox struct
+                     ;; (mounts populated like chroot; cgroup nil — runsc manages its own)
+                     (let ((sandbox
+                             (%make-sandbox
+                              :id id
+                              :state :ready
+                              :mounts (make-sandbox-mounts
+                                       :squashfs-mounts sqfs-mounts
+                                       :tmpfs tmpfs
+                                       :overlay overlay)
+                              :netns netns
+                              :cgroup nil
+                              :created (get-unix-time)
+                              :last-active (get-unix-time)
+                              :max-lifetime-s (or max-lifetime-s 0))))
+                       sandbox))))))
+
+          ;; Cleanup squashfs on error
+          (loop for m across sqfs-mounts
+                when m do (ignore-errors (unmount-squashfs m))))))))
+
 ;;; ── Destroy sandbox ─────────────────────────────────────────────────
 
 (defun manager-destroy-sandbox (manager id)
@@ -313,16 +437,22 @@
            (sandbox-dir (format nil "~A/sandboxes/~A"
                                 (config-data-dir config) id))
            (meta-dir (format nil "~A/.meta/log" sandbox-dir)))
-      (if (eq (config-backend config) :firecracker)
-          ;; Firecracker: stop VM + teardown tap network
-          (let ((index (when (sandbox-netns sandbox)
-                         (netns-handle-index (sandbox-netns sandbox)))))
-            (ignore-errors (firecracker-stop-vm id meta-dir))
-            (when index
-              (ignore-errors (firecracker-teardown-network id index))
-              (release-netns-index index)))
-          ;; Chroot: unmount filesystems, teardown netns, remove cgroup
-          (destroy-sandbox sandbox))
+      (case (config-backend config)
+        (:firecracker
+         ;; Firecracker: stop VM + teardown tap network
+         (let ((index (when (sandbox-netns sandbox)
+                        (netns-handle-index (sandbox-netns sandbox)))))
+           (ignore-errors (firecracker-stop-vm id meta-dir))
+           (when index
+             (ignore-errors (firecracker-teardown-network id index))
+             (release-netns-index index))))
+        (:gvisor
+         ;; gVisor: stop runsc container, then unmount like chroot
+         (ignore-errors (gvisor-stop config id))
+         (destroy-sandbox sandbox))
+        (otherwise
+         ;; Chroot: unmount filesystems, teardown netns, remove cgroup
+         (destroy-sandbox sandbox)))
       ;; Clean up sandbox directory (best effort)
       (ignore-errors (uiop:delete-directory-tree
                       (pathname sandbox-dir) :validate t)))
@@ -349,36 +479,54 @@
     (let* ((config (manager-config manager))
            (sandbox-dir (format nil "~A/sandboxes/~A"
                                 (config-data-dir config) id)))
-      (if (eq (config-backend config) :firecracker)
-          ;; Firecracker: exec via vsock
-          (let* ((meta-dir (format nil "~A/.meta/log" sandbox-dir))
-                 (cid-path (format nil "~A/cid" meta-dir))
-                 (cid (handler-case
-                          (parse-integer
-                           (string-trim '(#\Space #\Newline #\Return)
-                                        (uiop:read-file-string cid-path)))
-                        (error ()
-                          (error 'sandbox-error :id id
-                                 :message "cannot read CID for vsock exec"))))
-                 (result (firecracker-exec cid cmd workdir timeout)))
-            ;; Update exec count and write log
-            (let ((seq (incf (sandbox-exec-count sandbox))))
-              (setf (exec-result-seq result) seq)
-              (ignore-errors
-                (write-exec-log sandbox seq cmd workdir
-                                (exec-result-exit-code result)
-                                (exec-result-started result)
-                                (exec-result-finished result)
-                                (exec-result-duration-ms result)
-                                (exec-result-stdout result)
-                                (exec-result-stderr result)
-                                :sandbox-dir sandbox-dir)))
-            result)
-          ;; Chroot: exec via fork/execve
-          (exec-in-sandbox sandbox cmd
-                           :workdir workdir
-                           :timeout timeout
-                           :sandbox-dir sandbox-dir)))))
+      (case (config-backend config)
+        (:firecracker
+         ;; Firecracker: exec via vsock
+         (let* ((meta-dir (format nil "~A/.meta/log" sandbox-dir))
+                (cid-path (format nil "~A/cid" meta-dir))
+                (cid (handler-case
+                         (parse-integer
+                          (string-trim '(#\Space #\Newline #\Return)
+                                       (uiop:read-file-string cid-path)))
+                       (error ()
+                         (error 'sandbox-error :id id
+                                :message "cannot read CID for vsock exec"))))
+                (result (firecracker-exec cid cmd workdir timeout)))
+           ;; Update exec count and write log
+           (let ((seq (incf (sandbox-exec-count sandbox))))
+             (setf (exec-result-seq result) seq)
+             (ignore-errors
+               (write-exec-log sandbox seq cmd workdir
+                               (exec-result-exit-code result)
+                               (exec-result-started result)
+                               (exec-result-finished result)
+                               (exec-result-duration-ms result)
+                               (exec-result-stdout result)
+                               (exec-result-stderr result)
+                               :sandbox-dir sandbox-dir)))
+           result))
+        (:gvisor
+         ;; gVisor: exec via runsc exec
+         (let ((result (gvisor-exec config id cmd workdir timeout)))
+           ;; Update exec count and write log
+           (let ((seq (incf (sandbox-exec-count sandbox))))
+             (setf (exec-result-seq result) seq)
+             (ignore-errors
+               (write-exec-log sandbox seq cmd workdir
+                               (exec-result-exit-code result)
+                               (exec-result-started result)
+                               (exec-result-finished result)
+                               (exec-result-duration-ms result)
+                               (exec-result-stdout result)
+                               (exec-result-stderr result)
+                               :sandbox-dir sandbox-dir)))
+           result))
+        (otherwise
+         ;; Chroot: exec via fork/execve
+         (exec-in-sandbox sandbox cmd
+                          :workdir workdir
+                          :timeout timeout
+                          :sandbox-dir sandbox-dir))))))
 
 ;;; ── Sandbox info ────────────────────────────────────────────────────
 
@@ -450,21 +598,66 @@
                        :message (format nil "module not found: ~A" module-name))))
             (error 'sandbox-error :id id
                    :message (format nil "module not found: ~A" module-name))))
-      (if (eq (config-backend config) :firecracker)
-          ;; Firecracker: hot-add drive + vsock remount
-          (let* ((sandbox-dir (format nil "~A/sandboxes/~A"
-                                      (config-data-dir config) id))
-                 (meta-dir (format nil "~A/.meta/log" sandbox-dir))
-                 (cid-path (format nil "~A/cid" meta-dir))
-                 (cid (handler-case
-                          (parse-integer
-                           (string-trim '(#\Space #\Newline #\Return)
-                                        (uiop:read-file-string cid-path)))
-                        (error ()
-                          (error 'sandbox-error :id id
-                                 :message "cannot read CID for drive add")))))
-            (firecracker-add-drive id module-name mod-path cid meta-dir))
-          ;; Chroot: overlay remount
+      (case (config-backend config)
+        (:firecracker
+         ;; Firecracker: hot-add drive + vsock remount
+         (let* ((sandbox-dir (format nil "~A/sandboxes/~A"
+                                     (config-data-dir config) id))
+                (meta-dir (format nil "~A/.meta/log" sandbox-dir))
+                (cid-path (format nil "~A/cid" meta-dir))
+                (cid (handler-case
+                         (parse-integer
+                          (string-trim '(#\Space #\Newline #\Return)
+                                       (uiop:read-file-string cid-path)))
+                       (error ()
+                         (error 'sandbox-error :id id
+                                :message "cannot read CID for drive add")))))
+           (firecracker-add-drive id module-name mod-path cid meta-dir)))
+        (:gvisor
+         ;; gVisor: stop container, remount overlay with new layer, restart
+         (let* ((sandbox-dir (format nil "~A/sandboxes/~A"
+                                     (config-data-dir config) id))
+                (mp (format nil "~A/images/~A.squashfs" sandbox-dir module-name)))
+           (when (probe-file mp)
+             (error 'sandbox-error :id id
+                    :message (format nil "already active: ~A" module-name)))
+           ;; Stop the running container
+           (gvisor-stop config id)
+           ;; Mount new squashfs layer
+           (mount-squashfs mod-path mp)
+           ;; Remount overlay with new layer
+           (bt:with-lock-held ((manager-lock manager))
+             (let* ((mounts (sandbox-mounts sandbox))
+                    (old-overlay (sandbox-mounts-overlay mounts))
+                    (old-sqfs (sandbox-mounts-squashfs-mounts mounts))
+                    (new-sqfs (let ((arr (make-array (1+ (length old-sqfs)))))
+                                (loop for i below (length old-sqfs)
+                                      do (setf (aref arr i) (aref old-sqfs i)))
+                                (setf (aref arr (length old-sqfs))
+                                      (make-squashfs-mount :mount-point mp))
+                                arr))
+                    (lower-components (loop for m across new-sqfs
+                                            collect (squashfs-mount-mount-point m)))
+                    (upper-path (format nil "~A/upper" sandbox-dir))
+                    (merged-path (overlay-mount-merged-path old-overlay))
+                    (bundle-dir (format nil "~A/oci" sandbox-dir)))
+               ;; Unmount old overlay
+               (unmount-overlay old-overlay)
+               ;; Mount new overlay
+               (let ((new-overlay (mount-overlay lower-components
+                                                 (format nil "~A/data" upper-path)
+                                                 (format nil "~A/work" upper-path)
+                                                 merged-path)))
+                 (setf (sandbox-mounts-squashfs-mounts mounts) new-sqfs
+                       (sandbox-mounts-overlay mounts) new-overlay))
+               ;; Regenerate OCI config and restart container
+               (gvisor-write-oci-config bundle-dir merged-path
+                                         (when (sandbox-netns sandbox)
+                                           (netns-handle-name (sandbox-netns sandbox)))
+                                         2.0 1024)
+               (gvisor-create-and-start config id bundle-dir)))))
+        (otherwise
+         ;; Chroot: overlay remount
           (let* ((sandbox-dir (format nil "~A/sandboxes/~A"
                                       (config-data-dir config) id))
                  (mp (format nil "~A/images/~A.squashfs" sandbox-dir module-name)))
@@ -530,45 +723,46 @@
       ;; Create snapshot directory
       (ensure-directories-exist (format nil "~A/" snapdir))
 
-      (if (eq (config-backend config) :firecracker)
-          ;; Firecracker: ask guest to create snapshot via vsock
-          (let* ((meta-dir (format nil "~A/.meta/log" sandbox-dir))
-                 (cid-path (format nil "~A/cid" meta-dir))
-                 (cid (handler-case
-                          (parse-integer
-                           (string-trim '(#\Space #\Newline #\Return)
-                                        (uiop:read-file-string cid-path)))
-                        (error ()
-                          (error 'sandbox-error :id id
-                                 :message "cannot read CID for snapshot"))))
-                 (snap-cmd (format nil "__squash_snapshot ~A" snap-label))
-                 (result (firecracker-exec cid snap-cmd "/" 120)))
-            (unless (zerop (exec-result-exit-code result))
-              (error 'sandbox-error :id id
-                     :message (format nil "guest snapshot failed: ~A"
-                                      (exec-result-stderr result)))))
-          ;; Chroot: mksquashfs on host upper layer
-          (let ((upper-data (format nil "~A/upper/data" sandbox-dir)))
-            (multiple-value-bind (exit-code stdout stderr)
-                (run-command "mksquashfs" upper-data snapfile
-                             "-comp" "gzip" "-b" "256K"
-                             "-noappend" "-quiet")
-              (declare (ignore stdout))
-              (unless (zerop exit-code)
-                (error 'sandbox-error :id id
-                       :message (format nil "mksquashfs failed: ~A" stderr))))))
+      (case (config-backend config)
+        (:firecracker
+         ;; Firecracker: ask guest to create snapshot via vsock
+         (let* ((meta-dir (format nil "~A/.meta/log" sandbox-dir))
+                (cid-path (format nil "~A/cid" meta-dir))
+                (cid (handler-case
+                         (parse-integer
+                          (string-trim '(#\Space #\Newline #\Return)
+                                       (uiop:read-file-string cid-path)))
+                       (error ()
+                         (error 'sandbox-error :id id
+                                :message "cannot read CID for snapshot"))))
+                (snap-cmd (format nil "__squash_snapshot ~A" snap-label))
+                (result (firecracker-exec cid snap-cmd "/" 120)))
+           (unless (zerop (exec-result-exit-code result))
+             (error 'sandbox-error :id id
+                    :message (format nil "guest snapshot failed: ~A"
+                                     (exec-result-stderr result))))))
+        (otherwise
+         ;; Chroot + gVisor: mksquashfs on host upper layer
+         ;; (gVisor uses the same host-side overlayfs as chroot)
+         (let ((upper-data (format nil "~A/upper/data" sandbox-dir)))
+           (multiple-value-bind (exit-code stdout stderr)
+               (run-command "mksquashfs" upper-data snapfile
+                            "-comp" "gzip" "-b" "256K"
+                            "-noappend" "-quiet")
+             (declare (ignore stdout))
+             (unless (zerop exit-code)
+               (error 'sandbox-error :id id
+                      :message (format nil "mksquashfs failed: ~A" stderr)))))))
 
       ;; Get snapshot size
       (let ((size (handler-case
                       (with-open-file (s snapfile :element-type '(unsigned-byte 8))
                         (file-length s))
                     (error () 0))))
-        ;; Background push to S3 if configured
-        (when *s3-client*
-          (ignore-errors
-            (s3-push-bg *s3-client* snapfile
-                        (format nil "sandboxes/~A/snapshots/~A.squashfs"
-                                id snap-label))))
+        ;; Prefer sq-sync sidecar for S3 push; fallback to direct
+        (bus-notify-push (manager-config manager) snapfile
+                         (format nil "sandboxes/~A/snapshots/~A.squashfs"
+                                 id snap-label))
         (values snap-label size)))))
 
 ;;; ── Restore ──────────────────────────────────────────────────────────
@@ -604,75 +798,126 @@
             (error 'sandbox-error :id id
                    :message (format nil "snapshot not found: ~A" label))))
 
-      (if (eq (config-backend config) :firecracker)
-          ;; Firecracker: stop VM, restart with snapshot layer
-          (let* ((meta-dir (format nil "~A/.meta/log" sandbox-dir))
-                 (index (when (sandbox-netns sandbox)
-                          (netns-handle-index (sandbox-netns sandbox))))
-                 (cid (allocate-cid config)))
-            ;; Stop the current VM
-            (ignore-errors (firecracker-stop-vm id meta-dir))
-            ;; Read original layers from metadata
-            (let ((layers (handler-case
-                              (let* ((meta-path (format nil "~A/sandboxes/~A/.meta/meta.json"
-                                                        (config-data-dir config) id))
-                                     (meta (jojo:parse (uiop:read-file-string meta-path))))
-                                (getf meta :|layers|))
-                            (error () '("000-base-alpine")))))
-              ;; Build new squashfs paths: original layers + snapshot
-              (let ((squashfs-paths
-                      (append (loop for layer in layers
-                                    collect (format nil "~A/~A.squashfs"
-                                                   (modules-dir config) layer))
-                              (list snapfile))))
-                ;; Restart VM with snapshot included
-                (firecracker-start-vm id 2 1024 squashfs-paths cid meta-dir)
-                ;; Update CID file
-                (ignore-errors
-                  (write-string-to-file (format nil "~A/cid" meta-dir)
-                                        (format nil "~D" cid))))))
-
-          ;; Chroot: overlay remount with snapshot layer
-          (let ((mounts (sandbox-mounts sandbox)))
-            (unmount-overlay (sandbox-mounts-overlay mounts))
-            ;; Unmount previous snapshot if any
-            (when (sandbox-mounts-snapshot-mount mounts)
-              (ignore-errors
-                (unmount-squashfs (sandbox-mounts-snapshot-mount mounts))))
-            ;; Clear upper layer contents (preserve tmpfs mount)
-            (let ((upper-data (format nil "~A/upper/data" sandbox-dir))
-                  (upper-work (format nil "~A/upper/work" sandbox-dir)))
-              (ignore-errors (uiop:delete-directory-tree
-                              (pathname upper-data) :validate t))
-              (ignore-errors (uiop:delete-directory-tree
-                              (pathname upper-work) :validate t))
-              (ensure-directories-exist (format nil "~A/" upper-data))
-              (ensure-directories-exist (format nil "~A/" upper-work)))
-            ;; Mount snapshot as read-only layer
-            (let* ((snap-mp (format nil "~A/images/_snapshot" sandbox-dir))
-                   (snap-mount (mount-squashfs snapfile snap-mp)))
-              (setf (sandbox-mounts-snapshot-mount mounts) snap-mount))
-            ;; Rebuild lowerdir: snapshot first (highest priority), then modules
-            (let* ((lower-components
-                     (append
-                      (when (sandbox-mounts-snapshot-mount mounts)
-                        (list (squashfs-mount-mount-point
-                               (sandbox-mounts-snapshot-mount mounts))))
-                      (loop for m across (sandbox-mounts-squashfs-mounts mounts)
-                            collect (squashfs-mount-mount-point m))))
-                   (upper-path (format nil "~A/upper" sandbox-dir))
-                   (merged-path (overlay-mount-merged-path
-                                 (sandbox-mounts-overlay mounts)))
-                   (new-overlay (mount-overlay lower-components
-                                               (format nil "~A/data" upper-path)
-                                               (format nil "~A/work" upper-path)
-                                               merged-path)))
-              (setf (sandbox-mounts-overlay mounts) new-overlay))
-            ;; Re-seed DNS and re-inject secret placeholders after upper reset.
-            (ignore-errors
-              (seed-resolv-conf sandbox-dir (sandbox-netns sandbox)))
-            (ignore-errors
-              (funcall 'inject-secret-placeholders config sandbox-dir (sandbox-netns sandbox))))))))
+      (case (config-backend config)
+        (:firecracker
+         ;; Firecracker: stop VM, restart with snapshot layer
+         (let* ((meta-dir (format nil "~A/.meta/log" sandbox-dir))
+                (index (when (sandbox-netns sandbox)
+                         (netns-handle-index (sandbox-netns sandbox))))
+                (cid (allocate-cid config)))
+           ;; Stop the current VM
+           (ignore-errors (firecracker-stop-vm id meta-dir))
+           ;; Read original layers from metadata
+           (let ((layers (handler-case
+                             (let* ((meta-path (format nil "~A/sandboxes/~A/.meta/meta.json"
+                                                       (config-data-dir config) id))
+                                    (meta (jojo:parse (uiop:read-file-string meta-path))))
+                               (getf meta :|layers|))
+                           (error () '("000-base-alpine")))))
+             ;; Build new squashfs paths: original layers + snapshot
+             (let ((squashfs-paths
+                     (append (loop for layer in layers
+                                   collect (format nil "~A/~A.squashfs"
+                                                  (modules-dir config) layer))
+                             (list snapfile))))
+               ;; Restart VM with snapshot included
+               (firecracker-start-vm id 2 1024 squashfs-paths cid meta-dir)
+               ;; Update CID file
+               (ignore-errors
+                 (write-string-to-file (format nil "~A/cid" meta-dir)
+                                       (format nil "~D" cid)))))))
+        (:gvisor
+         ;; gVisor: stop container, remount overlay with snapshot, restart
+         (ignore-errors (gvisor-stop config id))
+         (let ((mounts (sandbox-mounts sandbox)))
+           (unmount-overlay (sandbox-mounts-overlay mounts))
+           ;; Unmount previous snapshot if any
+           (when (sandbox-mounts-snapshot-mount mounts)
+             (ignore-errors
+               (unmount-squashfs (sandbox-mounts-snapshot-mount mounts))))
+           ;; Clear upper layer contents (preserve tmpfs mount)
+           (let ((upper-data (format nil "~A/upper/data" sandbox-dir))
+                 (upper-work (format nil "~A/upper/work" sandbox-dir)))
+             (ignore-errors (uiop:delete-directory-tree
+                             (pathname upper-data) :validate t))
+             (ignore-errors (uiop:delete-directory-tree
+                             (pathname upper-work) :validate t))
+             (ensure-directories-exist (format nil "~A/" upper-data))
+             (ensure-directories-exist (format nil "~A/" upper-work)))
+           ;; Mount snapshot as read-only layer
+           (let* ((snap-mp (format nil "~A/images/_snapshot" sandbox-dir))
+                  (snap-mount (mount-squashfs snapfile snap-mp)))
+             (setf (sandbox-mounts-snapshot-mount mounts) snap-mount))
+           ;; Rebuild lowerdir: snapshot first, then modules
+           (let* ((lower-components
+                    (append
+                     (when (sandbox-mounts-snapshot-mount mounts)
+                       (list (squashfs-mount-mount-point
+                              (sandbox-mounts-snapshot-mount mounts))))
+                     (loop for m across (sandbox-mounts-squashfs-mounts mounts)
+                           collect (squashfs-mount-mount-point m))))
+                  (upper-path (format nil "~A/upper" sandbox-dir))
+                  (merged-path (overlay-mount-merged-path
+                                (sandbox-mounts-overlay mounts)))
+                  (bundle-dir (format nil "~A/oci" sandbox-dir))
+                  (new-overlay (mount-overlay lower-components
+                                              (format nil "~A/data" upper-path)
+                                              (format nil "~A/work" upper-path)
+                                              merged-path)))
+             (setf (sandbox-mounts-overlay mounts) new-overlay)
+             ;; Regenerate OCI config and restart container
+             (gvisor-write-oci-config bundle-dir merged-path
+                                       (when (sandbox-netns sandbox)
+                                         (netns-handle-name (sandbox-netns sandbox)))
+                                       2.0 1024)
+             (gvisor-create-and-start config id bundle-dir))
+           ;; Re-seed DNS and re-inject secret placeholders after upper reset.
+           (ignore-errors
+             (seed-resolv-conf sandbox-dir (sandbox-netns sandbox)))
+           (ignore-errors
+             (funcall 'inject-secret-placeholders config sandbox-dir (sandbox-netns sandbox)))))
+        (otherwise
+         ;; Chroot: overlay remount with snapshot layer
+         (let ((mounts (sandbox-mounts sandbox)))
+           (unmount-overlay (sandbox-mounts-overlay mounts))
+           ;; Unmount previous snapshot if any
+           (when (sandbox-mounts-snapshot-mount mounts)
+             (ignore-errors
+               (unmount-squashfs (sandbox-mounts-snapshot-mount mounts))))
+           ;; Clear upper layer contents (preserve tmpfs mount)
+           (let ((upper-data (format nil "~A/upper/data" sandbox-dir))
+                 (upper-work (format nil "~A/upper/work" sandbox-dir)))
+             (ignore-errors (uiop:delete-directory-tree
+                             (pathname upper-data) :validate t))
+             (ignore-errors (uiop:delete-directory-tree
+                             (pathname upper-work) :validate t))
+             (ensure-directories-exist (format nil "~A/" upper-data))
+             (ensure-directories-exist (format nil "~A/" upper-work)))
+           ;; Mount snapshot as read-only layer
+           (let* ((snap-mp (format nil "~A/images/_snapshot" sandbox-dir))
+                  (snap-mount (mount-squashfs snapfile snap-mp)))
+             (setf (sandbox-mounts-snapshot-mount mounts) snap-mount))
+           ;; Rebuild lowerdir: snapshot first (highest priority), then modules
+           (let* ((lower-components
+                    (append
+                     (when (sandbox-mounts-snapshot-mount mounts)
+                       (list (squashfs-mount-mount-point
+                              (sandbox-mounts-snapshot-mount mounts))))
+                     (loop for m across (sandbox-mounts-squashfs-mounts mounts)
+                           collect (squashfs-mount-mount-point m))))
+                  (upper-path (format nil "~A/upper" sandbox-dir))
+                  (merged-path (overlay-mount-merged-path
+                                (sandbox-mounts-overlay mounts)))
+                  (new-overlay (mount-overlay lower-components
+                                              (format nil "~A/data" upper-path)
+                                              (format nil "~A/work" upper-path)
+                                              merged-path)))
+             (setf (sandbox-mounts-overlay mounts) new-overlay))
+           ;; Re-seed DNS and re-inject secret placeholders after upper reset.
+           (ignore-errors
+             (seed-resolv-conf sandbox-dir (sandbox-netns sandbox)))
+           (ignore-errors
+             (funcall 'inject-secret-placeholders config sandbox-dir (sandbox-netns sandbox)))))))))
 
 ;;; ── Exec logs ────────────────────────────────────────────────────────
 

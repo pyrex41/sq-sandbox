@@ -28,15 +28,38 @@ if command -v bwrap >/dev/null 2>&1; then
         tmpdir=$(mktemp -d)
         trap 'rm -rf "$tmpdir"' EXIT
 
+        # Write resolv.conf pointing to slirp4netns DNS (10.0.2.3).
+        # The host container's resolv.conf uses 127.0.0.11 (Docker's embedded DNS)
+        # which is only reachable on the host loopback — not from inside the new
+        # network namespace created by --unshare-net.  slirp4netns provides its own
+        # DNS forwarder at 10.0.2.3 which IS reachable from the sandbox.
+        printf 'nameserver 10.0.2.3\n' > "$tmpdir/resolv.conf"
+
+        # Network-ready synchronization gate (fd 3 inside sandbox).
+        # The sandbox command is wrapped: "read _ <&3; exec sh -c '$cmd'".
+        # The parent writes to this fifo after slirp4netns configures eth0,
+        # which allows the sandbox to proceed.  This prevents a race where a
+        # short-lived command (e.g. "ip addr") finishes before slirp4netns can
+        # attach to the new network namespace.
+        #
+        # We open the fifo in O_RDWR mode (exec 9<>) in the parent to avoid
+        # blocking: with a plain read-only or write-only open, the open(2) call
+        # would block until the other end is also opened.
+        mkfifo "$tmpdir/net-sync"
+        exec 9<>"$tmpdir/net-sync"   # keep write end open on fd 9 (non-blocking)
+
         # Start bwrap with --info-fd writing to a regular file (non-blocking).
-        # bwrap forks the child, writes the child PID to info-fd, then waits for the child.
-        timeout "$timeout_s" bwrap \
+        # fd 3 (read end of net-sync) and fd 4 (info-fd output) are inherited by bwrap.
+        # The wrapper command reads from fd 3 (blocking until parent signals ready)
+        # then execs the real command.  SQEXEC_CMD carries the command safely via env
+        # so no quoting of $cmd is required in the shell heredoc.
+        SQEXEC_CMD="$cmd" timeout "$timeout_s" bwrap \
             --bind "$root" / \
             --dev /dev \
             --proc /proc \
             --tmpfs /tmp \
             --tmpfs /run \
-            --ro-bind /etc/resolv.conf /etc/resolv.conf \
+            --ro-bind "$tmpdir/resolv.conf" /etc/resolv.conf \
             --unshare-pid \
             --unshare-ipc \
             --unshare-uts \
@@ -44,17 +67,19 @@ if command -v bwrap >/dev/null 2>&1; then
             --die-with-parent \
             --info-fd 4 \
             --chdir "$workdir" \
-            /bin/sh -c "$cmd" \
+            /bin/sh -c 'read _ <&3; exec /bin/sh -c "$SQEXEC_CMD"' \
+            3<"$tmpdir/net-sync" \
             4>"$tmpdir/bwrap-info.json" &
         bwrap_pid=$!
 
         # Wait for bwrap to fork child and write info JSON (typically < 5ms).
-        sleep 0.05
+        sleep 0.1
 
-        # Parse child PID from bwrap info JSON: {"child-pid":12345,...}
+        # Parse child PID from bwrap info JSON (may be multi-line pretty-printed).
+        # Use grep to isolate the child-pid line before extracting digits.
         child_pid=""
         if [ -s "$tmpdir/bwrap-info.json" ]; then
-            child_pid=$(sed 's/.*"child-pid": *\([0-9]*\).*/\1/' "$tmpdir/bwrap-info.json")
+            child_pid=$(grep '"child-pid"' "$tmpdir/bwrap-info.json" | grep -o '[0-9]*')
         fi
 
         slirp_pid=""
@@ -80,6 +105,11 @@ if command -v bwrap >/dev/null 2>&1; then
         else
             echo "[sq-exec] slirp4netns: could not get bwrap child PID" >&2
         fi
+
+        # Network is ready (or failed).  Signal the sandbox to proceed by writing
+        # to the net-sync fifo and then closing our write end (fd 9).
+        printf 'go\n' >&9
+        exec 9>&-
 
         # Wait for sandbox command to complete
         wait $bwrap_pid

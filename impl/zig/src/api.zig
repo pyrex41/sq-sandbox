@@ -232,40 +232,62 @@ fn handleConnection(conn: net.Server.Connection, cfg: *const Config, allocator: 
 
 /// Process a single HTTP request: auth check, route, dispatch.
 fn handleRequest(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator, raw_stream: net.Stream) !void {
+    // PHASE 1: Access all header-derived data while connection buffer is still valid.
+    // readerExpectNone()/allocRemaining() may overwrite the connection receive buffer,
+    // invalidating any slices into it (request.head.target, header values, etc.).
     const route = matchRoute(request.head.method, request.head.target);
 
-    // Auth check — skip for health endpoint
     const needs_auth = switch (route) {
         .health => false,
         else => true,
     };
 
-    if (needs_auth) {
-        if (cfg.auth_token) |token| {
-            if (!checkAuth(request, token)) {
-                try sendJsonError(request, .unauthorized, "unauthorized", allocator);
-                return;
-            }
-        }
+    // Evaluate auth and content-type NOW, before consuming the body.
+    const auth_ok = if (needs_auth) blk: {
+        if (cfg.auth_token) |token| break :blk checkAuth(request, token);
+        break :blk true;
+    } else true;
+
+    // Pre-check content-type for handlers that call requireJsonContentType.
+    // After body consumption request.head.content_type may be invalid.
+    const has_json_ct = hasJsonContentType(request);
+
+    // Capture expect flag before body read (readerExpectContinue vs readerExpectNone).
+    const has_expect = request.head.expect != null;
+
+    // PHASE 2: Consume the request body exactly once.
+    // All header slices are now off-limits; use the pre-captured values above.
+    var body_buf: [65536]u8 = undefined;
+    const body_reader = if (has_expect)
+        try request.readerExpectContinue(&body_buf)
+    else
+        request.readerExpectNone(&body_buf);
+    const body = body_reader.allocRemaining(allocator, @enumFromInt(1024 * 1024)) catch &[_]u8{};
+    defer if (body.len > 0) allocator.free(body);
+
+    // PHASE 3: Respond. Body is consumed so respond() is always safe here.
+    if (!auth_ok) {
+        try sendJsonError(request, .unauthorized, "unauthorized", allocator);
+        return;
     }
 
     switch (route) {
-        .health => try handleHealth(request, cfg, allocator),
-        .list_sandboxes => try handleListSandboxes(request, cfg, allocator),
-        .create_sandbox => try handleCreateSandbox(request, cfg, allocator),
-        .get_sandbox => |id| try handleGetSandbox(request, cfg, id, allocator),
-        .delete_sandbox => |id| try handleDeleteSandbox(request, cfg, id, allocator),
-        .exec_sandbox => |id| try handleExec(request, cfg, id, allocator),
-        .exec_bg_sandbox => |id| try handleExecBg(request, cfg, id, allocator),
-        .exec_logs => |id| try handleExecLogs(request, cfg, id, allocator),
-        .snapshot_sandbox => |id| try handleSnapshot(request, cfg, id, allocator),
-        .restore_sandbox => |id| try handleRestore(request, cfg, id, allocator),
-        .activate_sandbox => |id| try handleActivate(request, cfg, id, allocator),
-        .wg_peers => |id| try handleWgPeers(request, cfg, id, allocator),
-        .list_modules => try handleListModules(request, cfg, allocator),
-        .job_status => |ids| try handleJobStatus(request, ids.job_id, allocator),
-        .job_logs => |ids| try handleJobLogs(request, ids.job_id, allocator, raw_stream),
-        .job_kill => |ids| try handleJobKill(request, ids.job_id, allocator),
+        .health => try handleHealth(request, body, cfg, allocator),
+        .list_sandboxes => try handleListSandboxes(request, body, cfg, allocator),
+        .create_sandbox => try handleCreateSandbox(request, body, has_json_ct, cfg, allocator),
+        .get_sandbox => |id| try handleGetSandbox(request, body, cfg, id, allocator),
+        .delete_sandbox => |id| try handleDeleteSandbox(request, body, cfg, id, allocator),
+        .exec_sandbox => |id| try handleExec(request, body, has_json_ct, cfg, id, allocator),
+        .exec_bg_sandbox => |id| try handleExecBg(request, body, has_json_ct, cfg, id, allocator),
+        .exec_logs => |id| try handleExecLogs(request, body, cfg, id, allocator),
+        .snapshot_sandbox => |id| try handleSnapshot(request, body, has_json_ct, cfg, id, allocator),
+        .restore_sandbox => |id| try handleRestore(request, body, has_json_ct, cfg, id, allocator),
+        .activate_sandbox => |id| try handleActivate(request, body, cfg, id, allocator),
+        .wg_peers => |id| try handleWgPeers(request, body, has_json_ct, cfg, id, allocator),
+        .list_modules => try handleListModules(request, body, cfg, allocator),
+        .job_status => |ids| try handleJobStatus(request, body, ids.job_id, allocator),
+        .job_logs => |ids| try handleJobLogs(request, body, ids.job_id, allocator, raw_stream),
+        .job_kill => |ids| try handleJobKill(request, body, ids.job_id, allocator),
         .not_found => try sendJsonError(request, .not_found, "not found", allocator),
     }
 }
@@ -291,7 +313,8 @@ fn checkAuth(request: *const http.Server.Request, expected_token: []const u8) bo
 
 // ── Endpoint Handlers ──────────────────────────────────────────────────
 
-fn handleHealth(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
+fn handleHealth(request: *http.Server.Request, body: []const u8, cfg: *const Config, allocator: std.mem.Allocator) !void {
+    _ = body;
 
     // Count sandboxes and modules from filesystem
     const sandbox_count = countDirEntries(cfg, "sandboxes");
@@ -313,7 +336,8 @@ fn handleHealth(request: *http.Server.Request, cfg: *const Config, allocator: st
     try sendJson(request, .ok, allocator, health);
 }
 
-fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
+fn handleListSandboxes(request: *http.Server.Request, body: []const u8, cfg: *const Config, allocator: std.mem.Allocator) !void {
+    _ = body;
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -343,19 +367,19 @@ fn handleListSandboxes(request: *http.Server.Request, cfg: *const Config, alloca
         } else |_| continue;
     }
 
-    const body = json_mod.stringify(allocator, list.items) catch {
+    const resp_body = json_mod.stringify(allocator, list.items) catch {
         try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
-    defer allocator.free(body);
+    defer allocator.free(resp_body);
 
-    try sendJsonBody(request, .ok, body);
+    try sendJsonBody(request, .ok, resp_body);
 }
 
-fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleCreateSandbox(request: *http.Server.Request, body: []const u8, has_json_ct: bool, cfg: *const Config, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(has_json_ct, request, allocator)) return;
 
-    const parsed = readJsonBody(json_mod.CreateRequest, request, allocator) catch |err| {
+    const parsed = readJsonBody(json_mod.CreateRequest, body, allocator) catch |err| {
         log.warn("create: readJsonBody failed: {} (content_length={?})", .{
             err,
             request.head.content_length,
@@ -504,7 +528,8 @@ fn handleCreateSandbox(request: *http.Server.Request, cfg: *const Config, alloca
     try sendJsonError(request, .bad_request, err_msg, allocator);
 }
 
-fn handleGetSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+fn handleGetSandbox(request: *http.Server.Request, body: []const u8, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    _ = body;
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -522,7 +547,8 @@ fn handleGetSandbox(request: *http.Server.Request, cfg: *const Config, id: []con
     try sendJson(request, .ok, allocator, info);
 }
 
-fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+fn handleDeleteSandbox(request: *http.Server.Request, body: []const u8, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    _ = body;
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -557,8 +583,8 @@ fn handleDeleteSandbox(request: *http.Server.Request, cfg: *const Config, id: []
     });
 }
 
-fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleExec(request: *http.Server.Request, body: []const u8, has_json_ct: bool, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(has_json_ct, request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
@@ -580,7 +606,7 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
     };
 
     // Parse request body
-    const parsed = readJsonBody(json_mod.ExecRequestJson, request, allocator) catch {
+    const parsed = readJsonBody(json_mod.ExecRequestJson, body, allocator) catch {
         try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
@@ -749,8 +775,8 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
 
 // ── Background Exec Handlers ────────────────────────────────────────
 
-fn handleExecBg(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleExecBg(request: *http.Server.Request, body: []const u8, has_json_ct: bool, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(has_json_ct, request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
@@ -775,7 +801,7 @@ fn handleExecBg(request: *http.Server.Request, cfg: *const Config, id: []const u
         return;
     }
 
-    const parsed = readJsonBody(json_mod.ExecRequestJson, request, allocator) catch {
+    const parsed = readJsonBody(json_mod.ExecRequestJson, body, allocator) catch {
         try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
@@ -816,15 +842,16 @@ fn handleExecBg(request: *http.Server.Request, cfg: *const Config, id: []const u
     };
 
     // Respond immediately with job ID
-    var body_buf: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "{{\"job_id\":{d},\"status\":\"running\"}}", .{job_id}) catch {
+    var resp_buf: [256]u8 = undefined;
+    const resp = std.fmt.bufPrint(&resp_buf, "{{\"job_id\":{d},\"status\":\"running\"}}", .{job_id}) catch {
         try sendJsonError(request, .internal_server_error, "format error", allocator);
         return;
     };
-    try sendJsonLiteral(request, .ok, body);
+    try sendJsonLiteral(request, .ok, resp);
 }
 
-fn handleJobStatus(request: *http.Server.Request, job_id_str: []const u8, allocator: std.mem.Allocator) !void {
+fn handleJobStatus(request: *http.Server.Request, body: []const u8, job_id_str: []const u8, allocator: std.mem.Allocator) !void {
+    _ = body;
     const registry = jobs_mod.getGlobal() orelse {
         try sendJsonError(request, .internal_server_error, "no job registry", allocator);
         return;
@@ -866,10 +893,12 @@ fn handleJobStatus(request: *http.Server.Request, job_id_str: []const u8, alloca
 
 fn handleJobLogs(
     request: *http.Server.Request,
+    body: []const u8,
     job_id_str: []const u8,
     allocator: std.mem.Allocator,
     raw_stream: net.Stream,
 ) !void {
+    _ = body;
     const registry = jobs_mod.getGlobal() orelse {
         try sendJsonError(request, .internal_server_error, "no job registry", allocator);
         return;
@@ -954,7 +983,8 @@ fn handleJobLogs(
     }
 }
 
-fn handleJobKill(request: *http.Server.Request, job_id_str: []const u8, allocator: std.mem.Allocator) !void {
+fn handleJobKill(request: *http.Server.Request, body: []const u8, job_id_str: []const u8, allocator: std.mem.Allocator) !void {
+    _ = body;
     const registry = jobs_mod.getGlobal() orelse {
         try sendJsonError(request, .internal_server_error, "no job registry", allocator);
         return;
@@ -986,7 +1016,8 @@ fn handleJobKill(request: *http.Server.Request, job_id_str: []const u8, allocato
     try sendJsonLiteral(request, .ok, "{\"status\":\"killed\"}");
 }
 
-fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+fn handleExecLogs(request: *http.Server.Request, body: []const u8, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    _ = body;
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -1018,17 +1049,17 @@ fn handleExecLogs(request: *http.Server.Request, cfg: *const Config, id: []const
     };
     defer exec_mod.freeExecLogs(allocator, logs);
 
-    const body = json_mod.stringify(allocator, logs) catch {
+    const resp_body = json_mod.stringify(allocator, logs) catch {
         try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
-    defer allocator.free(body);
+    defer allocator.free(resp_body);
 
-    try sendJsonBody(request, .ok, body);
+    try sendJsonBody(request, .ok, resp_body);
 }
 
-fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleSnapshot(request: *http.Server.Request, body: []const u8, has_json_ct: bool, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(has_json_ct, request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
@@ -1050,7 +1081,7 @@ fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const
     };
 
     // Parse request body
-    const parsed = readJsonBody(json_mod.SnapshotRequest, request, allocator) catch {
+    const parsed = readJsonBody(json_mod.SnapshotRequest, body, allocator) catch {
         // No body or invalid JSON — generate default label from timestamp
         const now = std.time.timestamp();
         var label_buf: [32]u8 = undefined;
@@ -1080,8 +1111,8 @@ fn handleSnapshot(request: *http.Server.Request, cfg: *const Config, id: []const
     return doSnapshot(request, cfg, allocator, sandbox_path, id, label);
 }
 
-fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleRestore(request: *http.Server.Request, body: []const u8, has_json_ct: bool, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(has_json_ct, request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
@@ -1103,7 +1134,7 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
     };
 
     // Parse request body
-    const parsed = readJsonBody(json_mod.RestoreRequest, request, allocator) catch {
+    const parsed = readJsonBody(json_mod.RestoreRequest, body, allocator) catch {
         try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
@@ -1317,8 +1348,8 @@ fn handleRestore(request: *http.Server.Request, cfg: *const Config, id: []const 
     try sendJson(request, .ok, allocator, info);
 }
 
-fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleActivate(request: *http.Server.Request, body: []const u8, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    // activate takes no body — do not require Content-Type
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
@@ -1340,7 +1371,7 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     };
 
     // Parse request body
-    const parsed = readJsonBody(json_mod.ActivateRequest, request, allocator) catch {
+    const parsed = readJsonBody(json_mod.ActivateRequest, body, allocator) catch {
         try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
@@ -1442,8 +1473,8 @@ fn handleActivate(request: *http.Server.Request, cfg: *const Config, id: []const
     try sendJson(request, .ok, allocator, info);
 }
 
-fn handleWgPeers(request: *http.Server.Request, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
-    if (!requireJsonContentType(request, allocator)) return;
+fn handleWgPeers(request: *http.Server.Request, body: []const u8, has_json_ct: bool, cfg: *const Config, id: []const u8, allocator: std.mem.Allocator) !void {
+    if (!requireJsonContentType(has_json_ct, request, allocator)) return;
 
     var sb_dir_buf: [256]u8 = undefined;
     const sb_dir_path = cfg.sandboxesDir(&sb_dir_buf) catch {
@@ -1555,18 +1586,10 @@ fn handleWgPeers(request: *http.Server.Request, cfg: *const Config, id: []const 
         }
     }
 
-    // Read request body for peers array
-    // The body is a JSON array of peer objects — shell out to sq-wg add-peer for each
-    const body_bytes = request.reader().readAllAlloc(allocator, 1024 * 1024) catch {
-        try sendJsonError(request, .bad_request, "failed to read body", allocator);
-        return;
-    };
-    defer allocator.free(body_bytes);
-
     // Parse as JSON array — count peers and add each via sq-wg
     // Simple approach: parse with std.json
     var peers_added: usize = 0;
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_bytes, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         try sendJsonError(request, .bad_request, "invalid JSON body", allocator);
         return;
     };
@@ -1618,7 +1641,8 @@ fn handleWgPeers(request: *http.Server.Request, cfg: *const Config, id: []const 
     try sendJsonLiteral(request, .ok, resp_body);
 }
 
-fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocator: std.mem.Allocator) !void {
+fn handleListModules(request: *http.Server.Request, body: []const u8, cfg: *const Config, allocator: std.mem.Allocator) !void {
+    _ = body;
     var mod_dir_buf: [256]u8 = undefined;
     const mod_dir_path = cfg.modulesDir(&mod_dir_buf) catch {
         try sendJsonError(request, .internal_server_error, "path error", allocator);
@@ -1694,13 +1718,13 @@ fn handleListModules(request: *http.Server.Request, cfg: *const Config, allocato
         }
     }
 
-    const body = json_mod.stringify(allocator, list.items) catch {
+    const resp_body = json_mod.stringify(allocator, list.items) catch {
         try sendJsonError(request, .internal_server_error, "serialization error", allocator);
         return;
     };
-    defer allocator.free(body);
+    defer allocator.free(resp_body);
 
-    try sendJsonBody(request, .ok, body);
+    try sendJsonBody(request, .ok, resp_body);
 }
 
 // ── Firecracker Snapshot Helper ────────────────────────────────────────
@@ -1974,12 +1998,11 @@ fn notifySnapshotPush(cfg: *const Config, allocator: std.mem.Allocator, snap_pat
 // ── Content-Type Enforcement ───────────────────────────────────────────
 
 /// Check Content-Type and send 415 error if missing. Returns true if valid.
-fn requireJsonContentType(request: *http.Server.Request, allocator: std.mem.Allocator) bool {
-    if (request.head.method == .POST) {
-        if (!hasJsonContentType(request)) {
-            sendJsonError(request, .unsupported_media_type, "Content-Type must be application/json", allocator) catch {};
-            return false;
-        }
+/// has_json_ct must be pre-computed from request headers before body consumption.
+fn requireJsonContentType(has_json_ct: bool, request: *http.Server.Request, allocator: std.mem.Allocator) bool {
+    if (!has_json_ct) {
+        sendJsonError(request, .unsupported_media_type, "Content-Type must be application/json", allocator) catch {};
+        return false;
     }
     return true;
 }
@@ -2041,18 +2064,7 @@ fn sendJsonLiteral(request: *http.Server.Request, status: http.Status, literal: 
 
 /// Read the request body as a JSON-parsed struct.
 /// Returns a Parsed(T) whose lifetime is tied to the allocator.
-pub fn readJsonBody(comptime T: type, request: *http.Server.Request, allocator: std.mem.Allocator) !std.json.Parsed(T) {
-    var body_buf: [65536]u8 = undefined;
-    const body_reader = if (request.head.expect != null)
-        try request.readerExpectContinue(&body_buf)
-    else
-        request.readerExpectNone(&body_buf);
-
-    const body = body_reader.allocRemaining(allocator, @enumFromInt(1024 * 1024)) catch {
-        return error.BodyReadFailed;
-    };
-    defer allocator.free(body);
-
+pub fn readJsonBody(comptime T: type, body: []const u8, allocator: std.mem.Allocator) !std.json.Parsed(T) {
     return json_mod.parse(T, allocator, body);
 }
 

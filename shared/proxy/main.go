@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -412,6 +413,13 @@ func (p *ProxyHandler) tlsMITM(clientConn net.Conn, host, hostPort string) {
 		// Limit response body before relaying
 		resp.Body = io.NopCloser(io.LimitReader(resp.Body, maxResponseBody))
 
+		// Normalize response to HTTP/1.1 so the client (e.g. git/curl) can
+		// handle 401-retry correctly. The upstream may use HTTP/2; writing that
+		// proto back through a plain TLS tunnel confuses curl's auth-retry logic.
+		resp.Proto = "HTTP/1.1"
+		resp.ProtoMajor = 1
+		resp.ProtoMinor = 1
+
 		err = resp.Write(tlsConn)
 		resp.Body.Close()
 
@@ -468,25 +476,51 @@ func (p *ProxyHandler) replaceHeaders(r *http.Request, host string) {
 		}
 		for i, v := range values {
 			for secretName, secret := range p.secrets.Secrets {
-				if !strings.Contains(v, secret.Placeholder) {
-					continue
-				}
-				allowed := false
-				for _, h := range secret.AllowedHosts {
-					if h == host {
-						allowed = true
-						break
-					}
-				}
-				if allowed {
-					values[i] = strings.ReplaceAll(v, secret.Placeholder, secret.Value)
+				if newVal, ok := replaceInHeader(v, secret.Placeholder, secret.Value, host, secret.AllowedHosts); ok {
+					values[i] = newVal
 					log.Printf("replaced %s in %s for %s", secretName, name, host)
-				} else {
-					log.Printf("blocked %s — host %s not in allowed_hosts", secretName, host)
 				}
 			}
 		}
 	}
+}
+
+// replaceInHeader replaces placeholder with value in a header value,
+// enforcing the allowed_hosts list. Handles both plain values (Bearer tokens,
+// API keys) and HTTP Basic auth (base64-encoded "user:password" credentials).
+// Returns (newValue, true) on success, ("", false) if no match or host blocked.
+func replaceInHeader(v, placeholder, value, host string, allowedHosts []string) (string, bool) {
+	// Check plain-text match first (Bearer, X-Api-Key, etc.)
+	plainMatch := strings.Contains(v, placeholder)
+
+	// For Basic auth, decode the base64 credentials and check there too
+	var basicDecoded string
+	if !plainMatch {
+		if encoded, ok := strings.CutPrefix(v, "Basic "); ok {
+			if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded)); err == nil {
+				if strings.Contains(string(decoded), placeholder) {
+					basicDecoded = string(decoded)
+				}
+			}
+		}
+	}
+
+	if !plainMatch && basicDecoded == "" {
+		return "", false
+	}
+
+	// Enforce allowed_hosts
+	for _, h := range allowedHosts {
+		if h == host {
+			if basicDecoded != "" {
+				newDecoded := strings.ReplaceAll(basicDecoded, placeholder, value)
+				return "Basic " + base64.StdEncoding.EncodeToString([]byte(newDecoded)), true
+			}
+			return strings.ReplaceAll(v, placeholder, value), true
+		}
+	}
+	log.Printf("blocked secret — host %s not in allowed_hosts", host)
+	return "", false
 }
 
 // ── Main ─────────────────────────────────────────────────────────────

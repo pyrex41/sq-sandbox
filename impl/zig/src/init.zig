@@ -78,7 +78,7 @@ fn ensureDirectories(cfg: *const config.Config) void {
 }
 
 fn makeDirIfMissing(path: []const u8) void {
-    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+    std.fs.cwd().makeDir(path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             log.warn("failed to create directory {s}: {}", .{ path, err });
@@ -96,7 +96,7 @@ fn ensureBaseImage(cfg: *const config.Config, allocator: std.mem.Allocator) void
     };
 
     // Check if base image already exists
-    std.fs.accessAbsolute(base_path, .{}) catch {
+    std.fs.cwd().access(base_path, .{}) catch {
         log.info("base image not found at {s}, attempting to obtain", .{base_path});
 
         // Try native S3 pull first (if configured)
@@ -141,7 +141,7 @@ fn remountSurvivingSandboxes(cfg: *const config.Config, allocator: std.mem.Alloc
     var sandboxes_buf: [256]u8 = undefined;
     const sandboxes_dir = cfg.sandboxesDir(&sandboxes_buf) catch return;
 
-    var dir = std.fs.openDirAbsolute(sandboxes_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.fs.cwd().openDir(sandboxes_dir, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) return; // no sandboxes dir yet
         log.warn("failed to open sandboxes dir: {}", .{err});
         return;
@@ -226,7 +226,7 @@ fn remountOneSandbox(
         makeDirIfMissing(mount_point);
 
         // Check if the squashfs file exists; if not, try S3 pull
-        std.fs.accessAbsolute(mod_path, .{}) catch {
+        std.fs.cwd().access(mod_path, .{}) catch {
             if (s3_client) |s3| {
                 var s3_key_buf: [256]u8 = undefined;
                 const s3_key = std.fmt.bufPrint(&s3_key_buf, "modules/{s}.squashfs", .{trimmed}) catch {
@@ -336,7 +336,7 @@ fn cleanOrphanedMounts(cfg: *const config.Config) void {
     var sandboxes_buf: [256]u8 = undefined;
     const sandboxes_dir = cfg.sandboxesDir(&sandboxes_buf) catch return;
 
-    var dir = std.fs.openDirAbsolute(sandboxes_dir, .{ .iterate = true }) catch return;
+    var dir = std.fs.cwd().openDir(sandboxes_dir, .{ .iterate = true }) catch return;
     defer dir.close();
 
     var count: usize = 0;
@@ -366,7 +366,7 @@ fn unmountSandboxMounts(sandboxes_dir: []const u8, id: []const u8) bool {
     // 2. Unmount squashfs layers (images/*)
     var images_buf: [512]u8 = undefined;
     const images_dir = std.fmt.bufPrint(&images_buf, "{s}/{s}/images", .{ sandboxes_dir, id }) catch return any;
-    if (std.fs.openDirAbsolute(images_dir, .{ .iterate = true })) |idir_val| {
+    if (std.fs.cwd().openDir(images_dir, .{ .iterate = true })) |idir_val| {
         var idir = idir_val;
         defer idir.close();
         var iiter = idir.iterate();
@@ -389,7 +389,7 @@ fn unmountSandboxMounts(sandboxes_dir: []const u8, id: []const u8) bool {
 /// Try to lazy-unmount a path. Returns true if attempted (regardless of success).
 fn tryUnmount(path: []const u8) bool {
     // Check if the path exists as a directory first
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.fs.cwd().access(path, .{}) catch return false;
 
     // Shell out: umount -l <path> (lazy unmount, like MNT_DETACH)
     runCommandLogged(&.{ "umount", "-l", path }) catch {
@@ -466,7 +466,7 @@ fn cleanOrphanedNetns() void {
 
 /// Remove orphaned cgroup directories under /sys/fs/cgroup/squash-*.
 fn cleanOrphanedCgroups() void {
-    var dir = std.fs.openDirAbsolute("/sys/fs/cgroup", .{ .iterate = true }) catch return;
+    var dir = std.fs.cwd().openDir("/sys/fs/cgroup", .{ .iterate = true }) catch return;
     defer dir.close();
 
     var count: usize = 0;
@@ -552,7 +552,7 @@ fn readFileContents(path: []const u8) ![]const u8 {
 }
 
 fn isDir(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    var dir = std.fs.cwd().openDir(path, .{}) catch return false;
     dir.close();
     return true;
 }
@@ -565,7 +565,7 @@ test "ensureDirectories creates dirs" {
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "/tmp/sq-init-test-{d}", .{std.time.milliTimestamp()}) catch unreachable;
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
-    std.fs.makeDirAbsolute(tmp_path) catch {};
+    std.fs.cwd().makeDir(tmp_path) catch {};
 
     const cfg = config.Config{ .data_dir = tmp_path };
     ensureDirectories(&cfg);
@@ -573,13 +573,13 @@ test "ensureDirectories creates dirs" {
     // Verify modules dir exists
     var mod_buf: [256]u8 = undefined;
     const mod_dir = try cfg.modulesDir(&mod_buf);
-    var mod_d = try std.fs.openDirAbsolute(mod_dir, .{});
+    var mod_d = try std.fs.cwd().openDir(mod_dir, .{});
     mod_d.close();
 
     // Verify sandboxes dir exists
     var sb_buf: [256]u8 = undefined;
     const sb_dir = try cfg.sandboxesDir(&sb_buf);
-    var sb_d = try std.fs.openDirAbsolute(sb_dir, .{});
+    var sb_d = try std.fs.cwd().openDir(sb_dir, .{});
     sb_d.close();
 }
 
@@ -588,7 +588,7 @@ test "ensureDirectories is idempotent" {
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "/tmp/sq-init-test2-{d}", .{std.time.milliTimestamp()}) catch unreachable;
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
-    std.fs.makeDirAbsolute(tmp_path) catch {};
+    std.fs.cwd().makeDir(tmp_path) catch {};
 
     const cfg = config.Config{ .data_dir = tmp_path };
     ensureDirectories(&cfg);
@@ -625,7 +625,7 @@ test "cleanOrphanedMounts handles empty sandboxes dir" {
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "/tmp/sq-cleanup-test-{d}", .{std.time.milliTimestamp()}) catch unreachable;
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
-    std.fs.makeDirAbsolute(tmp_path) catch {};
+    std.fs.cwd().makeDir(tmp_path) catch {};
 
     const cfg = config.Config{ .data_dir = tmp_path };
     ensureDirectories(&cfg);
@@ -639,7 +639,7 @@ test "cleanOrphanedMounts handles sandbox dirs without mounts" {
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "/tmp/sq-cleanup-test2-{d}", .{std.time.milliTimestamp()}) catch unreachable;
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
-    std.fs.makeDirAbsolute(tmp_path) catch {};
+    std.fs.cwd().makeDir(tmp_path) catch {};
 
     const cfg = config.Config{ .data_dir = tmp_path };
     ensureDirectories(&cfg);
@@ -647,19 +647,19 @@ test "cleanOrphanedMounts handles sandbox dirs without mounts" {
     // Create a fake sandbox directory structure (not actually mounted)
     var sb_buf: [512]u8 = undefined;
     const sb_dir = std.fmt.bufPrint(&sb_buf, "{s}/sandboxes/test-sb", .{tmp_path}) catch unreachable;
-    std.fs.makeDirAbsolute(sb_dir) catch {};
+    std.fs.cwd().makeDir(sb_dir) catch {};
 
     var merged_buf: [512]u8 = undefined;
     const merged = std.fmt.bufPrint(&merged_buf, "{s}/merged", .{sb_dir}) catch unreachable;
-    std.fs.makeDirAbsolute(merged) catch {};
+    std.fs.cwd().makeDir(merged) catch {};
 
     var upper_buf2: [512]u8 = undefined;
     const upper = std.fmt.bufPrint(&upper_buf2, "{s}/upper", .{sb_dir}) catch unreachable;
-    std.fs.makeDirAbsolute(upper) catch {};
+    std.fs.cwd().makeDir(upper) catch {};
 
     var images_buf: [512]u8 = undefined;
     const images = std.fmt.bufPrint(&images_buf, "{s}/images", .{sb_dir}) catch unreachable;
-    std.fs.makeDirAbsolute(images) catch {};
+    std.fs.cwd().makeDir(images) catch {};
 
     // Should not crash — unmount attempts will fail silently
     cleanOrphanedMounts(&cfg);
@@ -671,7 +671,7 @@ test "unmountSandboxMounts returns false for non-mounted dirs" {
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
     // Create the sandbox dir with merged/ subdirectory
-    std.fs.makeDirAbsolute(tmp_path) catch {};
+    std.fs.cwd().makeDir(tmp_path) catch {};
     var merged_buf: [512]u8 = undefined;
     const merged = std.fmt.bufPrint(&merged_buf, "{s}/test-sb/merged", .{tmp_path}) catch unreachable;
     std.fs.cwd().makePath(merged) catch {};
@@ -708,7 +708,7 @@ test "full recovery sequence is idempotent" {
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "/tmp/sq-recovery-test-{d}", .{std.time.milliTimestamp()}) catch unreachable;
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
-    std.fs.makeDirAbsolute(tmp_path) catch {};
+    std.fs.cwd().makeDir(tmp_path) catch {};
 
     const cfg = config.Config{ .data_dir = tmp_path };
 

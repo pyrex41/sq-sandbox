@@ -4,9 +4,9 @@
 # ── Stage 1: Build Zig daemon ──────────────────────────────────────
 FROM alpine:3.21 AS zig-build
 
-RUN apk add --no-cache curl xz
-RUN curl -L https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz | tar xJ -C /opt
-ENV PATH="/opt/zig-x86_64-linux-0.15.2:$PATH"
+RUN apk add --no-cache curl xz jq
+RUN curl -L https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz | tar xJ -C /opt
+ENV PATH="/opt/zig-x86_64-linux-0.15.1:$PATH"
 
 WORKDIR /build
 COPY impl/zig/ .

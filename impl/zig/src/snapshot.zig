@@ -76,7 +76,7 @@ pub fn createSnapshot(
     const snap_dir = try std.fmt.allocPrint(allocator, "{s}/snapshots", .{sandbox_dir});
     defer allocator.free(snap_dir);
 
-    std.fs.makeDirAbsolute(snap_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(snap_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -85,7 +85,7 @@ pub fn createSnapshot(
     errdefer allocator.free(snap_path);
 
     // Check if snapshot already exists
-    if (std.fs.accessAbsolute(snap_path, .{})) |_| {
+    if (std.fs.cwd().access(snap_path, .{})) |_| {
         // File exists — cannot overwrite
         allocator.free(snap_path);
         return SnapshotError.SnapshotAlreadyExists;
@@ -210,7 +210,7 @@ pub fn restoreSnapshot(
     overlay_mount: *mounts.OverlayMount,
 ) (SnapshotError || mounts.MountError || std.mem.Allocator.Error || std.fs.Dir.MakeError)!mounts.SquashfsMount {
     // Verify snapshot file exists
-    std.fs.accessAbsolute(params.snapshot_path, .{}) catch {
+    std.fs.cwd().access(params.snapshot_path, .{}) catch {
         return SnapshotError.SnapshotNotFound;
     };
 
@@ -241,10 +241,10 @@ pub fn restoreSnapshot(
     };
     clearDirectory(std.mem.span(params.upper_work)) catch {
         // Recreate work dir (overlayfs requires it to exist and be empty)
-        std.fs.makeDirAbsolute(std.mem.span(params.upper_work)) catch {};
+        std.fs.cwd().makeDir(std.mem.span(params.upper_work)) catch {};
     };
     // Recreate work directory (overlayfs requires it empty but present)
-    std.fs.makeDirAbsolute(std.mem.span(params.upper_work)) catch {};
+    std.fs.cwd().makeDir(std.mem.span(params.upper_work)) catch {};
 
     // 4. Loop-mount snapshot as highest-priority lower
     // Build null-terminated path for the squashfs mount
@@ -348,12 +348,12 @@ pub fn activateSnapshot(
     if (!validate.validModule(module_name)) return SnapshotError.InvalidLabel;
 
     // Verify source snapshot exists
-    std.fs.accessAbsolute(snapshot_path, .{}) catch {
+    std.fs.cwd().access(snapshot_path, .{}) catch {
         return SnapshotError.SnapshotNotFound;
     };
 
     // Ensure modules directory exists
-    std.fs.makeDirAbsolute(modules_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(modules_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -362,7 +362,7 @@ pub fn activateSnapshot(
     defer allocator.free(dest_path);
 
     // Check if module already exists
-    if (std.fs.accessAbsolute(dest_path, .{})) |_| {
+    if (std.fs.cwd().access(dest_path, .{})) |_| {
         return SnapshotError.ModuleAlreadyExists;
     } else |err| switch (err) {
         error.FileNotFound => {}, // good
@@ -409,7 +409,7 @@ pub fn reinjectSecretPlaceholders(
 
     // Create the directory tree in upper
     makeParentDirs(profile_dir) catch {};
-    std.fs.makeDirAbsolute(profile_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(profile_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -447,7 +447,7 @@ pub fn pullSnapshotFromS3(
     local_path: []const u8,
 ) SnapshotError!bool {
     // Check if already local
-    if (std.fs.accessAbsolute(local_path, .{})) |_| {
+    if (std.fs.cwd().access(local_path, .{})) |_| {
         log.info("snapshot already local: {s}", .{local_path});
         return false;
     } else |_| {}
@@ -461,7 +461,7 @@ pub fn pullSnapshotFromS3(
     // Ensure parent directory exists
     if (std.mem.lastIndexOfScalar(u8, local_path, '/')) |last_slash| {
         const parent = local_path[0..last_slash];
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        std.fs.cwd().makeDir(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => {
                 log.err("pullSnapshotFromS3: failed to create dir {s}", .{parent});
@@ -562,7 +562,7 @@ pub fn restoreSnapshotWithS3(
     label: []const u8,
 ) (SnapshotError || mounts.MountError || std.mem.Allocator.Error || std.fs.Dir.MakeError)!mounts.SquashfsMount {
     // Try S3 pull if snapshot not available locally
-    std.fs.accessAbsolute(params.snapshot_path, .{}) catch {
+    std.fs.cwd().access(params.snapshot_path, .{}) catch {
         if (s3_client) |client| {
             _ = pullSnapshotFromS3(client, allocator, sandbox_id, label, params.snapshot_path) catch {
                 return SnapshotError.SnapshotNotFound;
@@ -579,7 +579,7 @@ pub fn restoreSnapshotWithS3(
 
 /// Remove all entries inside a directory without removing the directory itself.
 fn clearDirectory(path: []const u8) !void {
-    var dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
     defer dir.close();
 
     var iter = dir.iterate();
@@ -628,7 +628,7 @@ fn makeParentDirs(path: []const u8) !void {
     while (i < path.len) {
         if (path[i] == '/') {
             const prefix = path[0..i];
-            std.fs.makeDirAbsolute(prefix) catch |err| switch (err) {
+            std.fs.cwd().makeDir(prefix) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
@@ -711,7 +711,7 @@ test "clearDirectory empties a directory" {
     try clearDirectory(abs_path);
 
     // Verify directory is empty
-    var dir = try std.fs.openDirAbsolute(abs_path, .{ .iterate = true });
+    var dir = try std.fs.cwd().openDir(abs_path, .{ .iterate = true });
     defer dir.close();
     var iter = dir.iterate();
     const entry = try iter.next();
@@ -761,7 +761,7 @@ test "makeParentDirs creates nested directories" {
     // Verify a/b/c exists (d is not created since it's the leaf)
     var check_buf: [std.fs.max_path_bytes]u8 = undefined;
     const check_path = std.fmt.bufPrint(&check_buf, "{s}/a/b/c", .{base_path}) catch unreachable;
-    var dir = std.fs.openDirAbsolute(check_path, .{}) catch |err| {
+    var dir = std.fs.cwd().openDir(check_path, .{}) catch |err| {
         std.debug.print("expected directory to exist: {}\n", .{err});
         return err;
     };
@@ -904,7 +904,7 @@ test "activateSnapshot copies file atomically" {
     // Create a fake snapshot file
     var snap_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snap_dir = std.fmt.bufPrint(&snap_dir_buf, "{s}/snapshots", .{base_path}) catch unreachable;
-    std.fs.makeDirAbsolute(snap_dir) catch {};
+    std.fs.cwd().makeDir(snap_dir) catch {};
 
     var snap_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snap_path = std.fmt.bufPrint(&snap_path_buf, "{s}/snapshots/cp1.squashfs", .{base_path}) catch unreachable;
@@ -915,7 +915,7 @@ test "activateSnapshot copies file atomically" {
     // Create modules directory
     var mod_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const mod_dir = std.fmt.bufPrint(&mod_dir_buf, "{s}/modules", .{base_path}) catch unreachable;
-    std.fs.makeDirAbsolute(mod_dir) catch {};
+    std.fs.cwd().makeDir(mod_dir) catch {};
 
     // Activate
     try activateSnapshot(std.testing.allocator, snap_path, mod_dir, "200-my-module");
@@ -948,7 +948,7 @@ test "activateSnapshot rejects duplicate module" {
     // Create modules dir with existing module
     var mod_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const mod_dir = std.fmt.bufPrint(&mod_dir_buf, "{s}/modules", .{base_path}) catch unreachable;
-    std.fs.makeDirAbsolute(mod_dir) catch {};
+    std.fs.cwd().makeDir(mod_dir) catch {};
 
     var existing_buf: [std.fs.max_path_bytes]u8 = undefined;
     const existing = std.fmt.bufPrint(&existing_buf, "{s}/modules/existing.squashfs", .{base_path}) catch unreachable;
@@ -1088,7 +1088,7 @@ test "clearDirectory handles nested structures" {
     try clearDirectory(abs_path);
 
     // Verify completely empty
-    var dir = try std.fs.openDirAbsolute(abs_path, .{ .iterate = true });
+    var dir = try std.fs.cwd().openDir(abs_path, .{ .iterate = true });
     defer dir.close();
     var iter = dir.iterate();
     try std.testing.expect(try iter.next() == null);
@@ -1104,7 +1104,7 @@ test "clearDirectory on already empty dir is no-op" {
     // Should succeed without error on empty dir
     try clearDirectory(abs_path);
 
-    var dir = try std.fs.openDirAbsolute(abs_path, .{ .iterate = true });
+    var dir = try std.fs.cwd().openDir(abs_path, .{ .iterate = true });
     defer dir.close();
     var iter = dir.iterate();
     try std.testing.expect(try iter.next() == null);

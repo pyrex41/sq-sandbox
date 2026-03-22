@@ -54,7 +54,7 @@ pub const Config = struct {
     pub fn secretsExist(self: *const Config) bool {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = self.secretsPath(&buf) catch return false;
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std.fs.cwd().access(path, .{}) catch return false;
         return true;
     }
 

@@ -159,7 +159,7 @@ pub const SandboxManager = struct {
         var sandboxes_buf: [std.fs.max_path_bytes]u8 = undefined;
         const sandboxes_dir = std.fmt.bufPrint(&sandboxes_buf, "{s}/sandboxes", .{data_dir}) catch return;
 
-        var dir = std.fs.openDirAbsolute(sandboxes_dir, .{ .iterate = true }) catch return;
+        var dir = std.fs.cwd().openDir(sandboxes_dir, .{ .iterate = true }) catch return;
         defer dir.close();
 
         var recovered: usize = 0;

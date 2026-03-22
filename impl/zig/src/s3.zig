@@ -655,7 +655,7 @@ fn listLocalSquashfs(allocator: std.mem.Allocator, modules_dir: []const u8) ![][
         list.deinit(allocator);
     }
 
-    var dir = std.fs.openDirAbsolute(modules_dir, .{ .iterate = true }) catch return list.toOwnedSlice(allocator);
+    var dir = std.fs.cwd().openDir(modules_dir, .{ .iterate = true }) catch return list.toOwnedSlice(allocator);
     defer dir.close();
 
     var iter = dir.iterate();
@@ -734,7 +734,7 @@ fn parseListKeys(allocator: std.mem.Allocator, xml: []const u8, prefix_to_strip:
 
 /// Check if a file exists at the given path.
 fn fileExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch {
+    std.fs.cwd().access(path, .{}) catch {
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
     };
@@ -748,7 +748,7 @@ fn ensureParentDir(path: []const u8) void {
     if (last_slash == 0) return; // root
     const parent = path[0..last_slash];
 
-    std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    std.fs.cwd().makeDir(parent) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             // Try creating parent dirs recursively
@@ -991,7 +991,7 @@ test "ensureParentDir creates parent" {
     // Verify parent was created
     var check_buf: [256]u8 = undefined;
     const parent = std.fmt.bufPrint(&check_buf, "{s}/sub", .{test_dir}) catch unreachable;
-    std.fs.accessAbsolute(parent, .{}) catch {
+    std.fs.cwd().access(parent, .{}) catch {
         // On some systems the absolute path creation may not work with nested dirs.
         // The cwd.makePath fallback handles this.
         return;
@@ -1004,7 +1004,7 @@ test "atomic pull writes temp then renames" {
     std.fs.deleteTreeAbsolute(test_dir) catch {};
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    std.fs.makeDirAbsolute(test_dir) catch {};
+    std.fs.cwd().makeDir(test_dir) catch {};
 
     var dest_buf: [256]u8 = undefined;
     const dest = std.fmt.bufPrint(&dest_buf, "{s}/test.dat", .{test_dir}) catch unreachable;
@@ -1026,7 +1026,7 @@ test "atomic pull writes temp then renames" {
     try testing.expectEqualStrings(data, content);
 
     // Verify tmp file no longer exists
-    std.fs.accessAbsolute(tmp, .{}) catch {
+    std.fs.cwd().access(tmp, .{}) catch {
         // Good — tmp file was renamed away
         return;
     };
@@ -1051,5 +1051,5 @@ test "flock acquire and release" {
     releaseLock(file, lock_path);
 
     // Lock file should be cleaned up
-    std.fs.accessAbsolute(lock_path, .{}) catch return; // good, deleted
+    std.fs.cwd().access(lock_path, .{}) catch return; // good, deleted
 }

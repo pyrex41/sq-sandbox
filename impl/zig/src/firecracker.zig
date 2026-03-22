@@ -409,10 +409,10 @@ test "CID file round-trip" {
     std.fs.deleteTreeAbsolute(test_dir) catch {};
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    std.fs.makeDirAbsolute(test_dir) catch {};
+    std.fs.cwd().makeDir(test_dir) catch {};
     var meta_buf: [256]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{test_dir}) catch unreachable;
-    std.fs.makeDirAbsolute(meta_path) catch {};
+    std.fs.cwd().makeDir(meta_path) catch {};
 
     writeCid(test_dir, 142);
     const cid = try readCid(test_dir);
@@ -424,10 +424,10 @@ test "net index file round-trip" {
     std.fs.deleteTreeAbsolute(test_dir) catch {};
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    std.fs.makeDirAbsolute(test_dir) catch {};
+    std.fs.cwd().makeDir(test_dir) catch {};
     var meta_buf: [256]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{test_dir}) catch unreachable;
-    std.fs.makeDirAbsolute(meta_path) catch {};
+    std.fs.cwd().makeDir(meta_path) catch {};
 
     writeNetIndex(test_dir, 7);
     const idx = try readNetIndex(test_dir);

@@ -344,7 +344,7 @@ fn handleListSandboxes(request: *http.Server.Request, body: []const u8, cfg: *co
         return;
     };
 
-    var dir = std.fs.openDirAbsolute(sb_dir_path, .{ .iterate = true }) catch {
+    var dir = std.fs.cwd().openDir(sb_dir_path, .{ .iterate = true }) catch {
         // No sandboxes directory — return empty array
         try sendJsonLiteral(request, .ok, "[]");
         return;
@@ -425,7 +425,7 @@ fn handleCreateSandbox(request: *http.Server.Request, body: []const u8, has_json
         // Check module exists on disk; if not, try S3 pull (matches Rust)
         var check_buf: [std.fs.max_path_bytes]u8 = undefined;
         const mod_path = std.fmt.bufPrint(&check_buf, "{s}/{s}.squashfs", .{ mod_dir_path, layer }) catch continue;
-        std.fs.accessAbsolute(mod_path, .{}) catch {
+        std.fs.cwd().access(mod_path, .{}) catch {
             if (cfg.s3Enabled()) {
                 if (s3_mod.S3Client.fromEnv()) |s3_client| {
                     var s3_key_buf: [256]u8 = undefined;
@@ -481,7 +481,7 @@ fn handleCreateSandbox(request: *http.Server.Request, body: []const u8, has_json
     };
 
     // Check if already exists
-    std.fs.accessAbsolute(sandbox_path, .{}) catch |err| {
+    std.fs.cwd().access(sandbox_path, .{}) catch |err| {
         if (err != error.FileNotFound) {
             try sendJsonError(request, .internal_server_error, "filesystem error", allocator);
             return;
@@ -562,7 +562,7 @@ fn handleDeleteSandbox(request: *http.Server.Request, body: []const u8, cfg: *co
     };
 
     // Check exists
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -598,7 +598,7 @@ fn handleExec(request: *http.Server.Request, body: []const u8, has_json_ct: bool
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -789,7 +789,7 @@ fn handleExecBg(request: *http.Server.Request, body: []const u8, has_json_ct: bo
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -1030,7 +1030,7 @@ fn handleExecLogs(request: *http.Server.Request, body: []const u8, cfg: *const C
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -1073,7 +1073,7 @@ fn handleSnapshot(request: *http.Server.Request, body: []const u8, has_json_ct: 
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -1126,7 +1126,7 @@ fn handleRestore(request: *http.Server.Request, body: []const u8, has_json_ct: b
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -1157,7 +1157,7 @@ fn handleRestore(request: *http.Server.Request, body: []const u8, has_json_ct: b
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(snap_path, .{}) catch {
+    std.fs.cwd().access(snap_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{label}) catch "snapshot not found";
         try sendJsonError(request, .bad_request, err_msg, allocator);
@@ -1253,7 +1253,7 @@ fn handleRestore(request: *http.Server.Request, body: []const u8, has_json_ct: b
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.makeDirAbsolute(snapshot_mp_path) catch {};
+    std.fs.cwd().makeDir(snapshot_mp_path) catch {};
 
     var merged_buf: [std.fs.max_path_bytes]u8 = undefined;
     var upper_data_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1363,7 +1363,7 @@ fn handleActivate(request: *http.Server.Request, body: []const u8, cfg: *const C
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -1399,7 +1399,7 @@ fn handleActivate(request: *http.Server.Request, body: []const u8, cfg: *const C
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(mod_path, .{}) catch {
+    std.fs.cwd().access(mod_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "module not found: {s}", .{module}) catch "module not found";
         try sendJsonError(request, .bad_request, err_msg, allocator);
@@ -1488,7 +1488,7 @@ fn handleWgPeers(request: *http.Server.Request, body: []const u8, has_json_ct: b
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.accessAbsolute(sandbox_path, .{}) catch {
+    std.fs.cwd().access(sandbox_path, .{}) catch {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "not found: {s}", .{id}) catch "not found";
         try sendJsonError(request, .not_found, err_msg, allocator);
@@ -1517,7 +1517,7 @@ fn handleWgPeers(request: *http.Server.Request, body: []const u8, has_json_ct: b
     var pubkey_len: usize = 0;
 
     const wg_port_exists = blk: {
-        std.fs.accessAbsolute(port_path, .{}) catch break :blk false;
+        std.fs.cwd().access(port_path, .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -1649,7 +1649,7 @@ fn handleListModules(request: *http.Server.Request, body: []const u8, cfg: *cons
         return;
     };
 
-    var dir = std.fs.openDirAbsolute(mod_dir_path, .{ .iterate = true }) catch {
+    var dir = std.fs.cwd().openDir(mod_dir_path, .{ .iterate = true }) catch {
         // No modules directory — return empty array
         try sendJsonLiteral(request, .ok, "[]");
         return;
@@ -1743,7 +1743,7 @@ fn doFirecrackerSnapshot(
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    if (std.fs.accessAbsolute(snap_path, .{})) |_| {
+    if (std.fs.cwd().access(snap_path, .{})) |_| {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "exists: {s}", .{label}) catch "snapshot exists";
         try sendJsonError(request, .bad_request, err_msg, allocator);
@@ -1756,7 +1756,7 @@ fn doFirecrackerSnapshot(
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.makeDirAbsolute(snap_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(snap_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             try sendJsonError(request, .internal_server_error, "failed to create snapshot dir", allocator);
@@ -1829,7 +1829,7 @@ fn doSnapshot(
         return;
     };
 
-    if (std.fs.accessAbsolute(snap_path, .{})) |_| {
+    if (std.fs.cwd().access(snap_path, .{})) |_| {
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "exists: {s}", .{label}) catch "snapshot exists";
         try sendJsonError(request, .bad_request, err_msg, allocator);
@@ -1841,7 +1841,7 @@ fn doSnapshot(
         try sendJsonError(request, .internal_server_error, "path error", allocator);
         return;
     };
-    std.fs.makeDirAbsolute(snap_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(snap_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             try sendJsonError(request, .internal_server_error, "failed to create snapshot dir", allocator);
@@ -1967,7 +1967,7 @@ fn notifySnapshotPush(cfg: *const Config, allocator: std.mem.Allocator, snap_pat
     // Check if sq-sync bus socket exists
     var bus_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (cfg.busSockPath(&bus_path_buf)) |bus_path| {
-        if (std.fs.accessAbsolute(bus_path, .{})) |_| {
+        if (std.fs.cwd().access(bus_path, .{})) |_| {
             // Build the notify JSON and shell out to sq-sync --notify
             var notify_buf: [1024]u8 = undefined;
             var s3_key_buf2: [512]u8 = undefined;
@@ -2083,7 +2083,7 @@ fn readSandboxInfo(allocator: std.mem.Allocator, sandboxes_dir: []const u8, id: 
     const sandbox_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ sandboxes_dir, id });
 
     // Check sandbox directory exists
-    std.fs.accessAbsolute(sandbox_path, .{}) catch return error.FileNotFound;
+    std.fs.cwd().access(sandbox_path, .{}) catch return error.FileNotFound;
 
     // Read metadata files
     const owner = readMetaFile(allocator, sandbox_path, "owner") catch try allocator.dupe(u8, "anon");
@@ -2217,7 +2217,7 @@ fn isSandboxMounted(allocator: std.mem.Allocator, sandbox_path: []const u8) bool
 
     var merged_buf: [std.fs.max_path_bytes]u8 = undefined;
     const merged_path = std.fmt.bufPrint(&merged_buf, "{s}/merged", .{sandbox_path}) catch return false;
-    if (std.fs.accessAbsolute(merged_path, .{})) |_| {
+    if (std.fs.cwd().access(merged_path, .{})) |_| {
         return true;
     } else |_| {
         return false;
@@ -2249,12 +2249,12 @@ fn provisionSandboxResources(
 
     var upper_buf: [std.fs.max_path_bytes]u8 = undefined;
     const upper_path = try std.fmt.bufPrint(&upper_buf, "{s}/upper", .{sandbox_path});
-    std.fs.makeDirAbsolute(upper_path) catch |err| switch (err) {
+    std.fs.cwd().makeDir(upper_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
-    std.fs.makeDirAbsolute(try std.fmt.bufPrint(&upper_buf, "{s}/upper/data", .{sandbox_path})) catch {};
-    std.fs.makeDirAbsolute(try std.fmt.bufPrint(&upper_buf, "{s}/upper/work", .{sandbox_path})) catch {};
+    std.fs.cwd().makeDir(try std.fmt.bufPrint(&upper_buf, "{s}/upper/data", .{sandbox_path})) catch {};
+    std.fs.cwd().makeDir(try std.fmt.bufPrint(&upper_buf, "{s}/upper/work", .{sandbox_path})) catch {};
 
     try remountOverlayForSandbox(allocator, sandbox_path);
 
@@ -2326,7 +2326,7 @@ fn runCommandSilent(allocator: std.mem.Allocator, argv: []const []const u8) void
 fn mountModuleLayer(sandbox_path: []const u8, module_path: []const u8, module_name: []const u8) !void {
     var mount_buf: [std.fs.max_path_bytes]u8 = undefined;
     const mount_path = try std.fmt.bufPrint(&mount_buf, "{s}/images/{s}.squashfs", .{ sandbox_path, module_name });
-    std.fs.makeDirAbsolute(mount_path) catch |err| switch (err) {
+    std.fs.cwd().makeDir(mount_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2358,10 +2358,10 @@ fn remountOverlayForSandbox(allocator: std.mem.Allocator, sandbox_path: []const 
         if (label.len > 0) {
             var snap_file_buf: [std.fs.max_path_bytes]u8 = undefined;
             const snap_file = try std.fmt.bufPrint(&snap_file_buf, "{s}/.meta/snapshots/{s}.squashfs", .{ sandbox_path, label });
-            if (std.fs.accessAbsolute(snap_file, .{})) |_| {
+            if (std.fs.cwd().access(snap_file, .{})) |_| {
                 var snap_mp_buf: [std.fs.max_path_bytes]u8 = undefined;
                 const snap_mp = try std.fmt.bufPrint(&snap_mp_buf, "{s}/images/_snapshot", .{sandbox_path});
-                std.fs.makeDirAbsolute(snap_mp) catch {};
+                std.fs.cwd().makeDir(snap_mp) catch {};
 
                 var snap_file_z_buf: [std.fs.max_path_bytes]u8 = undefined;
                 var snap_mp_z_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2465,7 +2465,7 @@ fn writeFirecrackerExecLog(
     stderr_data: []const u8,
 ) void {
     // Ensure log directory exists
-    std.fs.makeDirAbsolute(log_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(log_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return,
     };
@@ -2564,7 +2564,7 @@ fn readSnapshots(allocator: std.mem.Allocator, sandbox_path: []const u8) ![]cons
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const snap_dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.meta/snapshots", .{sandbox_path});
 
-    var dir = std.fs.openDirAbsolute(snap_dir_path, .{ .iterate = true }) catch return &[_]json_mod.SnapshotInfo{};
+    var dir = std.fs.cwd().openDir(snap_dir_path, .{ .iterate = true }) catch return &[_]json_mod.SnapshotInfo{};
     defer dir.close();
 
     var list: std.ArrayList(json_mod.SnapshotInfo) = .empty;
@@ -2613,36 +2613,36 @@ fn createSandboxOnDisk(
     layers: []const []const u8,
 ) !void {
     // Create directory tree
-    try std.fs.makeDirAbsolute(sandbox_path);
+    try std.fs.cwd().makeDir(sandbox_path);
     errdefer std.fs.deleteTreeAbsolute(sandbox_path) catch {};
 
     var meta_buf: [std.fs.max_path_bytes]u8 = undefined;
     const meta_path = try std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{sandbox_path});
-    try std.fs.makeDirAbsolute(meta_path);
+    try std.fs.cwd().makeDir(meta_path);
 
     var log_buf: [std.fs.max_path_bytes]u8 = undefined;
     const log_path = try std.fmt.bufPrint(&log_buf, "{s}/.meta/log", .{sandbox_path});
-    std.fs.makeDirAbsolute(log_path) catch {};
+    std.fs.cwd().makeDir(log_path) catch {};
 
     var images_buf: [std.fs.max_path_bytes]u8 = undefined;
     const images_path = try std.fmt.bufPrint(&images_buf, "{s}/images", .{sandbox_path});
-    std.fs.makeDirAbsolute(images_path) catch {};
+    std.fs.cwd().makeDir(images_path) catch {};
 
     var merged_buf: [std.fs.max_path_bytes]u8 = undefined;
     const merged_path = try std.fmt.bufPrint(&merged_buf, "{s}/merged", .{sandbox_path});
-    std.fs.makeDirAbsolute(merged_path) catch {};
+    std.fs.cwd().makeDir(merged_path) catch {};
 
     var upper_buf: [std.fs.max_path_bytes]u8 = undefined;
     const upper_path = try std.fmt.bufPrint(&upper_buf, "{s}/upper", .{sandbox_path});
-    std.fs.makeDirAbsolute(upper_path) catch {};
+    std.fs.cwd().makeDir(upper_path) catch {};
 
     var upper_data_buf: [std.fs.max_path_bytes]u8 = undefined;
     const upper_data_path = try std.fmt.bufPrint(&upper_data_buf, "{s}/upper/data", .{sandbox_path});
-    std.fs.makeDirAbsolute(upper_data_path) catch {};
+    std.fs.cwd().makeDir(upper_data_path) catch {};
 
     var upper_work_buf: [std.fs.max_path_bytes]u8 = undefined;
     const upper_work_path = try std.fmt.bufPrint(&upper_work_buf, "{s}/upper/work", .{sandbox_path});
-    std.fs.makeDirAbsolute(upper_work_path) catch {};
+    std.fs.cwd().makeDir(upper_work_path) catch {};
 
     // Write metadata files
     writeMetaFile(sandbox_path, "owner", req.effectiveOwner());
@@ -2704,7 +2704,7 @@ fn countDirEntries(cfg: *const Config, subdir: []const u8) u32 {
     var buf: [256]u8 = undefined;
     const dir_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ cfg.data_dir, subdir }) catch return 0;
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return 0;
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return 0;
     defer dir.close();
 
     var count: u32 = 0;
@@ -2724,7 +2724,7 @@ fn checkBaseReady(cfg: *const Config) bool {
     var buf: [256]u8 = undefined;
     const dir_path = cfg.modulesDir(&buf) catch return false;
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return false;
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return false;
     defer dir.close();
 
     var iter = dir.iterate();
@@ -2739,7 +2739,7 @@ fn checkBaseReady(cfg: *const Config) bool {
 /// Count exec log entries in a directory.
 fn countLogEntries(log_dir: []const u8) u32 {
     if (log_dir.len == 0) return 0;
-    var dir = std.fs.openDirAbsolute(log_dir, .{ .iterate = true }) catch return 0;
+    var dir = std.fs.cwd().openDir(log_dir, .{ .iterate = true }) catch return 0;
     defer dir.close();
 
     var count: u32 = 0;
@@ -2752,7 +2752,7 @@ fn countLogEntries(log_dir: []const u8) u32 {
 
 /// Get the next sequence number from existing log files.
 fn getNextSeq(log_dir: []const u8) u32 {
-    var dir = std.fs.openDirAbsolute(log_dir, .{ .iterate = true }) catch return 1;
+    var dir = std.fs.cwd().openDir(log_dir, .{ .iterate = true }) catch return 1;
     defer dir.close();
 
     var max_seq: u32 = 0;
@@ -2771,7 +2771,7 @@ fn getNextSeq(log_dir: []const u8) u32 {
 /// Get approximate size of a directory's contents.
 fn getDirSize(dir_path: []const u8) u64 {
     if (dir_path.len == 0) return 0;
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return 0;
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return 0;
     defer dir.close();
 
     var total: u64 = 0;
@@ -2992,7 +2992,7 @@ test "createSandboxOnDisk and readSandboxInfo round-trip" {
     std.fs.deleteTreeAbsolute(parent_dir) catch {};
     defer std.fs.deleteTreeAbsolute(parent_dir) catch {};
 
-    try std.fs.makeDirAbsolute(parent_dir);
+    try std.fs.cwd().makeDir(parent_dir);
 
     // Create sandbox in the proper location
     const sb_path_buf = try std.fmt.allocPrint(allocator, "{s}/my-sb", .{parent_dir});
@@ -3028,11 +3028,11 @@ test "writeMetaFile and readMetaFile round-trip" {
     std.fs.deleteTreeAbsolute(test_dir) catch {};
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    try std.fs.makeDirAbsolute(test_dir);
+    try std.fs.cwd().makeDir(test_dir);
 
     var meta_buf: [std.fs.max_path_bytes]u8 = undefined;
     const meta_dir = try std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{test_dir});
-    try std.fs.makeDirAbsolute(meta_dir);
+    try std.fs.cwd().makeDir(meta_dir);
 
     writeMetaFile(test_dir, "test_key", "test_value");
 
@@ -3060,10 +3060,10 @@ test "readLayers parses newline-separated content" {
     std.fs.deleteTreeAbsolute(test_dir) catch {};
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    try std.fs.makeDirAbsolute(test_dir);
+    try std.fs.cwd().makeDir(test_dir);
     var meta_buf: [std.fs.max_path_bytes]u8 = undefined;
     const meta_dir = try std.fmt.bufPrint(&meta_buf, "{s}/.meta", .{test_dir});
-    try std.fs.makeDirAbsolute(meta_dir);
+    try std.fs.cwd().makeDir(meta_dir);
 
     writeMetaFile(test_dir, "layers", "000-base-alpine\n100-python312\n200-node");
 

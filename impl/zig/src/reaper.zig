@@ -88,7 +88,7 @@ pub fn scanFilesystem(data_dir: []const u8) void {
     var sandboxes_buf: [256]u8 = undefined;
     const sandboxes_dir = std.fmt.bufPrint(&sandboxes_buf, "{s}/sandboxes", .{data_dir}) catch return;
 
-    var dir = std.fs.openDirAbsolute(sandboxes_dir, .{ .iterate = true }) catch return;
+    var dir = std.fs.cwd().openDir(sandboxes_dir, .{ .iterate = true }) catch return;
     defer dir.close();
 
     const now = std.time.timestamp();

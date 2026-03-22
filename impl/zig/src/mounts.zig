@@ -23,7 +23,7 @@ pub const SquashfsMount = struct {
         mount_point: []const u8,
     ) (MountError || std.fs.Dir.MakeError)!SquashfsMount {
         // Create mount point directory
-        std.fs.makeDirAbsolute(mount_point) catch |err| switch (err) {
+        std.fs.cwd().makeDir(mount_point) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -142,7 +142,7 @@ pub const OverlayMount = struct {
         if (lower_components.len == 0) return MountError.MountFailed;
 
         // Create merged mount point directory
-        std.fs.makeDirAbsolute(merged) catch |err| switch (err) {
+        std.fs.cwd().makeDir(merged) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };

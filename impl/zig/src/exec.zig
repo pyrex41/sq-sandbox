@@ -229,7 +229,7 @@ fn writeExecLog(
     const json_bytes = stream.getWritten();
 
     // Ensure log directory exists
-    std.fs.makeDirAbsolute(log_dir) catch |err| switch (err) {
+    std.fs.cwd().makeDir(log_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             log.warn("failed to create log dir {s}: {}", .{ log_dir, err });
@@ -302,7 +302,7 @@ fn writeJsonString(writer: anytype, key: []const u8, value: []const u8) !void {
 /// Returns entries sorted by sequence number. Caller owns returned slice and
 /// must free with freeExecLogs.
 pub fn readExecLogs(allocator: std.mem.Allocator, log_dir: []const u8) ![]json_mod.ExecResult {
-    var dir = std.fs.openDirAbsolute(log_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.fs.cwd().openDir(log_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &[_]json_mod.ExecResult{},
         else => return err,
     };

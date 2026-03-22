@@ -36,9 +36,9 @@ fn installSignalHandlers() void {
 }
 
 pub fn main() !void {
-    // Use GeneralPurposeAllocator for the daemon lifetime. It catches
-    // double-free and use-after-free in debug builds, while being
-    // production-ready in release mode.
+    // Use DebugAllocator (renamed from GeneralPurposeAllocator in 0.16) for
+    // the daemon lifetime. It catches double-free and use-after-free in debug
+    // builds, while being production-ready in release mode.
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -111,8 +111,10 @@ fn startProxy(_: *const config.Config) void {
     // Try bundled path first, then PATH lookup
     const bin_names = [_][]const u8{ "sq-secret-proxy-https", "sq-proxy" };
     for (bin_names) |name| {
+        var restart_cmd_buf: [256]u8 = undefined;
+        const restart_cmd = std.fmt.bufPrint(&restart_cmd_buf, "while true; do {s}; echo '[sq-proxy] restarting in 2s...'; sleep 2; done", .{name}) catch continue;
         var child = std.process.Child.init(
-            &.{ name },
+            &.{ "/bin/sh", "-c", restart_cmd },
             std.heap.page_allocator,
         );
         // Set SQUASH_DATA so the Go binary finds secrets.json and proxy-ca/
@@ -157,7 +159,7 @@ fn startSyncSidecar(cfg: *const config.Config) void {
     const bus_path = cfg.busSockPath(&bus_buf) catch return;
 
     // Already running?
-    std.fs.accessAbsolute(bus_path, .{}) catch {
+    std.fs.cwd().access(bus_path, .{}) catch {
         // Socket doesn't exist — try to start the sidecar
         var child = std.process.Child.init(
             &.{ "sq-sync", "--daemon" },

@@ -118,7 +118,7 @@ pub const JobRegistry = struct {
         const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.meta/jobs/{d}", .{ sandbox_path, id }) catch return error.PathTooLong;
 
         for ([_][]const u8{ meta_path, jobs_path, dir_path }) |path| {
-            std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+            std.fs.cwd().makeDir(path) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
                     log.warn("failed to create dir {s}: {}", .{ path, err });
@@ -219,7 +219,7 @@ pub fn getGlobal() ?*JobRegistry {
 // ── Tests ───────────────────────────────────────────────────────────
 
 fn ensureTestDir(path: []const u8) void {
-    std.fs.makeDirAbsolute(path) catch {};
+    std.fs.cwd().makeDir(path) catch {};
 }
 
 test "JobRegistry create and get" {

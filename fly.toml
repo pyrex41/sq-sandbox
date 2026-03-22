@@ -1,0 +1,33 @@
+app = 'sq-sandbox'
+primary_region = 'iad'
+
+[build]
+  dockerfile = 'Dockerfile.zig'
+
+[env]
+  SQUASH_DATA = '/data'
+  SQUASH_PORT = '8080'
+  SQUASH_BACKEND = 'chroot'
+  SQUASH_MAX_SANDBOXES = '20'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[http_service.checks]]
+  interval = '30s'
+  timeout = '5s'
+  grace_period = '15s'
+  method = 'GET'
+  path = '/cgi-bin/health'
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = 1024
+
+[mounts]
+  source = 'sq_data'
+  destination = '/data'

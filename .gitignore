@@ -22,3 +22,5 @@ repomix-output.xml
 # Editor/tool state
 .opencode/
 .scud/
+*.squashfs
+*.sqfs

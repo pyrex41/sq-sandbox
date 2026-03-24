@@ -43,6 +43,7 @@ Create_Request_JSON :: struct {
 	memory_mb:      u64      `json:"memory_mb"`,
 	max_lifetime_s: u64      `json:"max_lifetime_s"`,
 	allow_net:      []string `json:"allow_net"`,
+	policy:         string   `json:"policy"`,
 }
 
 Exec_Request_JSON :: struct {
@@ -159,6 +160,7 @@ _handle_create_sandbox :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		memory_mb      = body.memory_mb if body.memory_mb > 0 else 1024,
 		max_lifetime_s = body.max_lifetime_s,
 		allow_net      = body.allow_net if len(body.allow_net) > 0 else nil,
+		policy         = body.policy,
 	}
 
 	ms, cerr := manager_create_sandbox(_api_manager, body.id, opts)

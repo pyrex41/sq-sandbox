@@ -1,6 +1,7 @@
 package squashd
 
 import "core:c"
+import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -89,6 +90,60 @@ Exec_Error :: enum {
 }
 
 // ---------------------------------------------------------------------------
+// Policy — parsed from .meta/policy JSON for sq-exec arguments
+// ---------------------------------------------------------------------------
+
+Policy_JSON :: struct {
+	readonly:        bool     `json:"readonly"`,
+	seccomp_profile: string   `json:"seccomp_profile"`,
+	shims:           []string `json:"shims"`,
+	writable_paths:  []string `json:"writable_paths"`,
+}
+
+// Read and parse .meta/policy, returning extra argv fragments for sq-exec.
+// Returns a slice of cstring args (allocated from temp_allocator).
+// If no policy file exists or parsing fails, returns an empty slice.
+_build_policy_args :: proc(sandbox_dir: string) -> []cstring {
+	policy_path := fmt.tprintf("%s/.meta/policy", sandbox_dir)
+	data, ok := os.read_entire_file(policy_path, context.temp_allocator)
+	if !ok || len(data) == 0 {
+		return nil
+	}
+
+	policy: Policy_JSON
+	if json.unmarshal(data, &policy, allocator = context.temp_allocator) != nil {
+		return nil
+	}
+
+	args := make([dynamic]cstring, 0, 16, context.temp_allocator)
+
+	if policy.readonly {
+		append(&args, _to_cstr("--readonly"))
+	}
+
+	if len(policy.seccomp_profile) > 0 {
+		append(&args, _to_cstr("--seccomp-profile"))
+		append(&args, _to_cstr(policy.seccomp_profile))
+	}
+
+	for shim in policy.shims {
+		if len(shim) > 0 {
+			append(&args, _to_cstr("--shim"))
+			append(&args, _to_cstr(shim))
+		}
+	}
+
+	for wp in policy.writable_paths {
+		if len(wp) > 0 {
+			append(&args, _to_cstr("--writable-path"))
+			append(&args, _to_cstr(wp))
+		}
+	}
+
+	return args[:]
+}
+
+// ---------------------------------------------------------------------------
 // exec_in_sandbox — fork + exec sq-exec with I/O capture
 //
 // Child: redirects stdout/stderr to pipes, execs sq-exec which handles
@@ -143,20 +198,25 @@ exec_in_sandbox :: proc(
 		c_close(stdout_fds[1])
 		c_close(stderr_fds[1])
 
-		// Build argv for sq-exec <merged-root> <cmd> [workdir] [timeout]
+		// Build argv for sq-exec <merged-root> <cmd> [workdir] [timeout] [policy-args...]
 		merged := ready.mounts.overlay.merged_path
 		workdir := req.workdir if len(req.workdir) > 0 else "/"
 		timeout_str := fmt.tprintf("%d", req.timeout)
 
-		argv := [6]cstring{
-			"sq-exec",
-			_to_cstr(merged),
-			_to_cstr(req.cmd),
-			_to_cstr(workdir),
-			_to_cstr(timeout_str),
-			nil,
+		policy_args := _build_policy_args(sandbox.dir)
+
+		argv_dyn := make([dynamic]cstring, 0, 6 + len(policy_args), context.temp_allocator)
+		append(&argv_dyn, _to_cstr("sq-exec"))
+		append(&argv_dyn, _to_cstr(merged))
+		append(&argv_dyn, _to_cstr(req.cmd))
+		append(&argv_dyn, _to_cstr(workdir))
+		append(&argv_dyn, _to_cstr(timeout_str))
+		for pa in policy_args {
+			append(&argv_dyn, pa)
 		}
-		c_execvp("sq-exec", &argv[0])
+		append(&argv_dyn, nil) // null-terminate
+
+		c_execvp("sq-exec", raw_data(argv_dyn[:]))
 		c_exit(127) // execvp failed
 	}
 

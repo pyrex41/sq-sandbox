@@ -59,6 +59,11 @@ write_meta :: proc(
 		_write_meta_file(meta_dir, "netns_index", fmt.tprintf("%d", netns_index)) or_return
 	}
 
+	// Policy (raw JSON string, optional)
+	if len(opts.policy) > 0 {
+		_write_meta_file(meta_dir, "policy", opts.policy) or_return
+	}
+
 	// Allow net (JSON array or empty)
 	if nets, ok := opts.allow_net.?; ok {
 		// Build JSON array: ["host1","host2"]

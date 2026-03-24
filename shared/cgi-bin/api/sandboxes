@@ -25,11 +25,12 @@ if [ -z "$id" ]; then
             mem=$(echo "$body" | jq -r '.memory_mb // "1024"')
             maxlife=$(echo "$body" | jq -r '.max_lifetime_s // "0"')
             allow_net=$(echo "$body" | jq -c '.allow_net // empty')
+            policy=$(echo "$body" | jq -c '.policy // empty')
 
             [ -z "$sb_id" ] && { json_err 400 "id required"; exit 0; }
             case "$sb_id" in *[!a-zA-Z0-9_-]*) json_err 400 "id: alphanumeric/dash/underscore only"; exit 0;; esac
 
-            err=$(create_sandbox "$sb_id" "$owner" "$layers" "$task" "$cpu" "$mem" "$maxlife" "$allow_net" 2>&1) || {
+            err=$(create_sandbox "$sb_id" "$owner" "$layers" "$task" "$cpu" "$mem" "$maxlife" "$allow_net" "$policy" 2>&1) || {
                 json_err 400 "$err"; exit 0
             }
             json_response 201 "$(sandbox_info "$sb_id")"

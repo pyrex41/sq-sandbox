@@ -1,0 +1,63 @@
+{
+    "_comment": "Strict seccomp profile for sq-sandbox. Combines read-only restrictions with network syscall blocking. Use when sandboxes should have no destructive filesystem operations AND no raw network access.",
+    "defaultAction": "SCMP_ACT_ALLOW",
+    "syscalls": [
+        {
+            "names": [
+                "unlink",
+                "unlinkat",
+                "rmdir",
+                "rename",
+                "renameat",
+                "renameat2",
+                "truncate",
+                "ftruncate",
+                "mount",
+                "umount2",
+                "reboot",
+                "kexec_load",
+                "kexec_file_load",
+                "init_module",
+                "finit_module",
+                "delete_module",
+                "bpf",
+                "process_vm_readv",
+                "process_vm_writev",
+                "userfaultfd"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "comment": "Destructive filesystem ops + dangerous system calls blocked"
+        },
+        {
+            "names": [
+                "kill",
+                "tkill",
+                "tgkill"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "comment": "Signal delivery blocked"
+        },
+        {
+            "names": [
+                "socket",
+                "socketcall",
+                "connect",
+                "bind",
+                "listen",
+                "accept",
+                "accept4",
+                "sendto",
+                "sendmsg",
+                "sendmmsg",
+                "recvfrom",
+                "recvmsg",
+                "recvmmsg"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "comment": "Network syscalls blocked — no raw socket access"
+        }
+    ]
+}

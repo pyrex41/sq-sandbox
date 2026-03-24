@@ -63,6 +63,38 @@ impl IntoResponse for ApiError {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox policy (ronly-inspired restrictions)
+// ---------------------------------------------------------------------------
+
+/// Security policy applied to a sandbox, inspired by denoland/ronly.
+///
+/// Controls what operations are allowed inside the sandbox at the kernel level:
+/// - `readonly`: Mount the sandbox root as read-only (only /tmp is writable)
+/// - `seccomp_profile`: Apply a seccomp-bpf filter blocking destructive syscalls
+/// - `shims`: Tool shims that intercept commands (docker, kubectl, systemctl)
+///   and allow only read-only subcommands
+/// - `writable_paths`: Paths that remain writable even in readonly mode
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxPolicy {
+    /// Mount root as read-only. Only /tmp is writable (ronly-style).
+    #[serde(default)]
+    pub readonly: bool,
+    /// Seccomp profile: "none" (default), "readonly", "strict", or "default".
+    #[serde(default = "default_seccomp_profile")]
+    pub seccomp_profile: String,
+    /// Tool shims to install: ["docker", "kubectl", "systemctl"].
+    #[serde(default)]
+    pub shims: Vec<String>,
+    /// Additional writable paths when readonly=true (e.g., ["/workspace"]).
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
+}
+
+fn default_seccomp_profile() -> String {
+    "none".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Create sandbox request
 // ---------------------------------------------------------------------------
 
@@ -86,6 +118,9 @@ pub struct CreateSandboxRequest {
     pub max_lifetime_s: u64,
     #[serde(default)]
     pub allow_net: Option<Vec<String>>,
+    /// Security policy for this sandbox. Omit for unrestricted access.
+    #[serde(default)]
+    pub policy: Option<SandboxPolicy>,
 }
 
 fn default_owner() -> String {
@@ -147,6 +182,8 @@ pub struct SandboxInfo {
     pub max_lifetime_s: u64,
     /// null when no restrictions (allow all), otherwise a list of allowed hosts.
     pub allow_net: Option<Vec<String>>,
+    /// Security policy applied to this sandbox. null when unrestricted.
+    pub policy: Option<SandboxPolicy>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -354,5 +391,60 @@ mod tests {
         let json = r#"{"id": "x", "layers": []}"#;
         let req: CreateSandboxRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.layers, vec!["000-base-alpine"]);
+    }
+
+    #[test]
+    fn test_create_request_with_policy() {
+        let json = r#"{
+            "id": "readonly-sandbox",
+            "policy": {
+                "readonly": true,
+                "seccomp_profile": "readonly",
+                "shims": ["docker", "kubectl"],
+                "writable_paths": ["/workspace"]
+            }
+        }"#;
+        let req: CreateSandboxRequest = serde_json::from_str(json).unwrap();
+        assert!(req.policy.is_some());
+        let policy = req.policy.unwrap();
+        assert!(policy.readonly);
+        assert_eq!(policy.seccomp_profile, "readonly");
+        assert_eq!(policy.shims, vec!["docker", "kubectl"]);
+        assert_eq!(policy.writable_paths, vec!["/workspace"]);
+    }
+
+    #[test]
+    fn test_create_request_policy_defaults() {
+        let json = r#"{"id": "x", "policy": {}}"#;
+        let req: CreateSandboxRequest = serde_json::from_str(json).unwrap();
+        let policy = req.policy.unwrap();
+        assert!(!policy.readonly);
+        assert_eq!(policy.seccomp_profile, "none");
+        assert!(policy.shims.is_empty());
+        assert!(policy.writable_paths.is_empty());
+    }
+
+    #[test]
+    fn test_create_request_no_policy() {
+        let json = r#"{"id": "x"}"#;
+        let req: CreateSandboxRequest = serde_json::from_str(json).unwrap();
+        assert!(req.policy.is_none());
+    }
+
+    #[test]
+    fn test_sandbox_policy_serialization() {
+        let policy = SandboxPolicy {
+            readonly: true,
+            seccomp_profile: "strict".into(),
+            shims: vec!["docker".into()],
+            writable_paths: vec!["/tmp".into()],
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains("\"readonly\":true"));
+        assert!(json.contains("\"seccomp_profile\":\"strict\""));
+
+        let parsed: SandboxPolicy = serde_json::from_str(&json).unwrap();
+        assert!(parsed.readonly);
+        assert_eq!(parsed.seccomp_profile, "strict");
     }
 }

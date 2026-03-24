@@ -18,6 +18,8 @@ pub struct ExecContext {
     pub merged_path: PathBuf,
     /// Path to the sandbox directory (for .meta/log/).
     pub sandbox_dir: PathBuf,
+    /// Security policy (ronly-inspired restrictions).
+    pub policy: Option<crate::api::models::SandboxPolicy>,
 }
 
 /// Execute a command inside a sandbox via sq-exec.
@@ -41,12 +43,27 @@ pub fn exec_in_sandbox(ctx: &ExecContext, req: &ExecRequest) -> io::Result<ExecR
 
     let started = Utc::now();
 
+    // Determine policy-driven sq-exec arguments
+    let net_flag = "0"; // network flag from allow_net is handled at a higher level
+    let (seccomp, readonly, shims) = match &ctx.policy {
+        Some(policy) => (
+            policy.seccomp_profile.as_str(),
+            if policy.readonly { "1" } else { "0" },
+            policy.shims.join(","),
+        ),
+        None => ("none", "0", String::new()),
+    };
+
     // Spawn sq-exec
     let mut child = Command::new("sq-exec")
         .arg(&ctx.merged_path)
         .arg(&req.cmd)
         .arg(&req.workdir)
         .arg(req.timeout.to_string())
+        .arg(net_flag)
+        .arg(seccomp)
+        .arg(readonly)
+        .arg(&shims)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

@@ -1,0 +1,22 @@
+#!/bin/sh
+# ronly-style shim for kubectl: allow read-only operations, block writes.
+# Installed into sandbox PATH when policy.shims includes "kubectl".
+set -eu
+
+REAL_KUBECTL=$(command -v kubectl.real 2>/dev/null || echo /usr/bin/kubectl)
+
+case "${1:-}" in
+    # Read-only subcommands — pass through
+    get|describe|logs|top|explain|api-resources|api-versions|version|cluster-info|config)
+        exec "$REAL_KUBECTL" "$@"
+        ;;
+    # Blocked (write) subcommands
+    apply|create|delete|edit|patch|replace|rollout|scale|set|annotate|label|taint|cordon|uncordon|drain|expose|run|attach|exec|cp|port-forward)
+        echo "ronly: kubectl $1 is blocked (read-only session)" >&2
+        exit 1
+        ;;
+    *)
+        echo "ronly: kubectl ${1:-} is not allowed (read-only session)" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,23 @@
+#!/bin/sh
+# ronly-style shim for docker: allow read-only operations, block writes.
+# Installed into sandbox PATH when policy.shims includes "docker".
+set -eu
+
+REAL_DOCKER=$(command -v docker.real 2>/dev/null || echo /usr/bin/docker)
+
+case "${1:-}" in
+    # Read-only subcommands — pass through
+    ps|logs|inspect|stats|top|images|info|version|events|diff|history|port|network)
+        exec "$REAL_DOCKER" "$@"
+        ;;
+    # Blocked (write) subcommands
+    rm|rmi|create|run|exec|start|stop|restart|kill|pause|unpause|pull|push|build|commit|tag|save|load|import|export|update|rename|attach|cp|deploy|plugin|secret|service|stack|swarm|trust|volume)
+        echo "ronly: docker $1 is blocked (read-only session)" >&2
+        exit 1
+        ;;
+    # Unknown — fail closed
+    *)
+        echo "ronly: docker ${1:-} is not allowed (read-only session)" >&2
+        exit 1
+        ;;
+esac

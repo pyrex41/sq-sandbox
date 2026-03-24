@@ -152,6 +152,7 @@ pub async fn create_sandbox(
             memory_mb: body.memory_mb,
             max_lifetime_s: body.max_lifetime_s,
             allow_net: body.allow_net.unwrap_or_default(),
+            policy: body.policy,
         },
     )
     .await
@@ -539,6 +540,7 @@ fn build_sandbox_info(sb: &Sandbox) -> SandboxInfo {
         memory_mb: sb.metadata.memory_mb,
         max_lifetime_s: sb.metadata.max_lifetime_s,
         allow_net: sb.metadata.allow_net.clone(),
+        policy: sb.metadata.policy.clone(),
     }
 }
 
@@ -694,6 +696,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
 
         let result = create_sandbox(State(state), Json(body)).await;
@@ -717,6 +720,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
 
         let result = create_sandbox(State(state), Json(body)).await;
@@ -744,6 +748,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
 
         let (status, Json(info)) =
@@ -783,6 +788,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
 
         create_sandbox(State(state.clone()), Json(body.clone()))
@@ -812,6 +818,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         create_sandbox(State(state.clone()), Json(body)).await.unwrap();
 
@@ -904,6 +911,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         create_sandbox(State(state.clone()), Json(body)).await.unwrap();
 
@@ -936,6 +944,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         create_sandbox(State(state.clone()), Json(body)).await.unwrap();
 
@@ -1006,6 +1015,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         create_sandbox(State(state.clone()), Json(body)).await.unwrap();
 
@@ -1040,6 +1050,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         create_sandbox(State(state.clone()), Json(body)).await.unwrap();
 
@@ -1073,6 +1084,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         create_sandbox(State(state.clone()), Json(body)).await.unwrap();
 
@@ -1100,6 +1112,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: Some(vec!["api.anthropic.com".into(), "pypi.org".into()]),
+            policy: None,
         };
 
         let (_, Json(info)) = create_sandbox(State(state), Json(body)).await.unwrap();
@@ -1152,6 +1165,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: None,
+            policy: None,
         };
         let result = create_sandbox(State(state), Json(body)).await;
         assert!(result.is_err());

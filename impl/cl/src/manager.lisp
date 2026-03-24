@@ -42,7 +42,7 @@
 
 (defun manager-create-sandbox (manager id &key owner layers task cpu
                                               memory-mb max-lifetime-s
-                                              allow-net)
+                                              allow-net policy)
   "Create a new sandbox and register it with the manager.
    Thread-safe: acquires the manager lock to check limits and register.
    Signals sandbox-error on invalid ID, duplicate, or capacity exceeded.
@@ -79,7 +79,8 @@
                                             :cpu cpu
                                             :memory-mb memory-mb
                                             :max-lifetime-s max-lifetime-s
-                                            :allow-net allow-net)
+                                            :allow-net allow-net
+                                            :policy policy)
                    (retry-create ()
                      :report "Retry sandbox creation from the beginning"
                      ;; Remove placeholder before recursive call
@@ -91,7 +92,8 @@
                                              :task task :cpu cpu
                                              :memory-mb memory-mb
                                              :max-lifetime-s max-lifetime-s
-                                             :allow-net allow-net))
+                                             :allow-net allow-net
+                                             :policy policy))
                    (skip-sandbox ()
                      :report "Skip this sandbox creation"
                      nil)))
@@ -111,7 +113,7 @@
 
 (defun %create-sandbox-inner (manager id &key owner layers task cpu
                                              memory-mb max-lifetime-s
-                                             allow-net)
+                                             allow-net policy)
   "Inner sandbox creation — dispatches to chroot, firecracker, or gvisor backend.
    Called with the manager slot already reserved."
   (let ((config (manager-config manager)))
@@ -121,25 +123,28 @@
                                     :owner owner :layers layers :task task
                                     :cpu cpu :memory-mb memory-mb
                                     :max-lifetime-s max-lifetime-s
-                                    :allow-net allow-net))
+                                    :allow-net allow-net
+                                    :policy policy))
       (:gvisor
        (%create-sandbox-gvisor manager id
                                :owner owner :layers layers :task task
                                :cpu cpu :memory-mb memory-mb
                                :max-lifetime-s max-lifetime-s
-                               :allow-net allow-net))
+                               :allow-net allow-net
+                               :policy policy))
       (otherwise
        (%create-sandbox-chroot manager id
                                :owner owner :layers layers :task task
                                :cpu cpu :memory-mb memory-mb
                                :max-lifetime-s max-lifetime-s
-                               :allow-net allow-net)))))
+                               :allow-net allow-net
+                               :policy policy)))))
 
 ;;; ── Chroot creation ──────────────────────────────────────────────────
 
 (defun %create-sandbox-chroot (manager id &key owner layers task cpu
                                               memory-mb max-lifetime-s
-                                              allow-net)
+                                              allow-net policy)
   "Chroot backend: mounts, cgroup, netns, metadata."
   (let* ((config (manager-config manager))
          (layers (or layers '("000-base-alpine")))
@@ -201,7 +206,8 @@
                                        :cpu (or cpu 2.0)
                                        :memory-mb (or memory-mb 1024)
                                        :max-lifetime-s (or max-lifetime-s 0)
-                                       :allow-net allow-net))
+                                       :allow-net allow-net
+                                       :policy policy))
 
                  ;; Build and return the sandbox struct
                  (let ((sandbox
@@ -226,7 +232,7 @@
 
 (defun %create-sandbox-firecracker (manager id &key owner layers task cpu
                                                     memory-mb max-lifetime-s
-                                                    allow-net)
+                                                    allow-net policy)
   "Firecracker backend: tap network + VM start."
   (let* ((config (manager-config manager))
          (layers (or layers '("000-base-alpine")))
@@ -271,7 +277,8 @@
                                      :cpu (or cpu 2.0)
                                      :memory-mb (or memory-mb 1024)
                                      :max-lifetime-s (or max-lifetime-s 0)
-                                     :allow-net allow-net))
+                                     :allow-net allow-net
+                                     :policy policy))
 
                ;; 5. Write firecracker-specific metadata
                (ignore-errors
@@ -305,7 +312,7 @@
 
 (defun %create-sandbox-gvisor (manager id &key owner layers task cpu
                                               memory-mb max-lifetime-s
-                                              allow-net)
+                                              allow-net policy)
   "gVisor backend: same overlayfs stack as chroot, but uses runsc for isolation.
    Creates overlay mounts, netns, generates OCI config, then starts runsc container."
   (let* ((config (manager-config manager))
@@ -394,7 +401,8 @@
                                            :cpu (or cpu 2.0)
                                            :memory-mb (or memory-mb 1024)
                                            :max-lifetime-s (or max-lifetime-s 0)
-                                           :allow-net allow-net))
+                                           :allow-net allow-net
+                                           :policy policy))
 
                      ;; Build and return the sandbox struct
                      ;; (mounts populated like chroot; cgroup nil — runsc manages its own)
@@ -523,10 +531,12 @@
            result))
         (otherwise
          ;; Chroot: exec via fork/execve
-         (exec-in-sandbox sandbox cmd
-                          :workdir workdir
-                          :timeout timeout
-                          :sandbox-dir sandbox-dir))))))
+         (let ((policy (read-sandbox-policy config id)))
+           (exec-in-sandbox sandbox cmd
+                            :workdir workdir
+                            :timeout timeout
+                            :sandbox-dir sandbox-dir
+                            :policy policy)))))))
 
 ;;; ── Sandbox info ────────────────────────────────────────────────────
 

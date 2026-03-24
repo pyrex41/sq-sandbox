@@ -290,7 +290,7 @@ _inject_secret_placeholders() {
 
 _chroot_create_sandbox() {
     local id="$1" owner="$2" layer_csv="$3" task="${4:-}"
-    local cpu="${5:-2}" memory_mb="${6:-1024}" max_lifetime_s="${7:-0}" allow_net="${8:-}"
+    local cpu="${5:-2}" memory_mb="${6:-1024}" max_lifetime_s="${7:-0}" allow_net="${8:-}" policy="${9:-}"
     local s=$(sdir "$id")
 
     exists "$id" && { echo "already exists" >&2; return 1; }
@@ -330,6 +330,7 @@ _chroot_create_sandbox() {
     echo "$memory_mb"      > "$s/.meta/memory_mb"
     echo "$max_lifetime_s" > "$s/.meta/max_lifetime_s"
     [ -n "$allow_net" ] && echo "$allow_net" > "$s/.meta/allow_net"
+    [ -n "$policy" ] && echo "$policy" > "$s/.meta/policy"
 
     # Set up cgroups for resource limits
     _cgroup_setup "$id" "$cpu" "$memory_mb" >/dev/null 2>&1 || true
@@ -396,8 +397,19 @@ _chroot_exec_in_sandbox() {
         net_flag="1"
     fi
 
+    # Read policy settings for sq-exec
+    local seccomp_profile="none" readonly_flag="0" shims_list=""
+    local policy_raw
+    policy_raw=$(cat "$s/.meta/policy" 2>/dev/null || echo "")
+    if [ -n "$policy_raw" ]; then
+        seccomp_profile=$(echo "$policy_raw" | jq -r '.seccomp_profile // "none"')
+        readonly_flag=$(echo "$policy_raw" | jq -r 'if .readonly == true then "1" else "0" end')
+        shims_list=$(echo "$policy_raw" | jq -r 'if .shims then (.shims | join(",")) else "" end')
+    fi
+
     # Execute via bubblewrap (unprivileged) or unshare+chroot (fallback)
     sq-exec "$s/merged" "$cmd" "$workdir" "$timeout_s" "$net_flag" \
+        "$seccomp_profile" "$readonly_flag" "$shims_list" \
         >"$out" 2>"$err" || rc=$?
 
     local t1=$(date -Iseconds)
@@ -631,7 +643,7 @@ _firecracker_teardown_network() {
 
 _firecracker_create_sandbox() {
     local id="$1" owner="$2" layer_csv="$3" task="${4:-}"
-    local cpu="${5:-2}" memory_mb="${6:-1024}" max_lifetime_s="${7:-0}" allow_net="${8:-}"
+    local cpu="${5:-2}" memory_mb="${6:-1024}" max_lifetime_s="${7:-0}" allow_net="${8:-}" policy="${9:-}"
     local s=$(sdir "$id")
 
     exists "$id" && { echo "already exists" >&2; return 1; }
@@ -658,6 +670,7 @@ _firecracker_create_sandbox() {
     echo "$memory_mb"      > "$s/.meta/memory_mb"
     echo "$max_lifetime_s" > "$s/.meta/max_lifetime_s"
     [ -n "$allow_net" ] && echo "$allow_net" > "$s/.meta/allow_net"
+    [ -n "$policy" ] && echo "$policy" > "$s/.meta/policy"
 
     # Set up tap device for networking
     _firecracker_setup_network "$id"
@@ -1075,6 +1088,9 @@ sandbox_info() {
     # Validate allow_net is valid JSON, otherwise wrap as string
     echo "$allow_net" | jq empty 2>/dev/null || allow_net="null"
 
+    local policy=$(cat "$s/.meta/policy" 2>/dev/null || echo "null")
+    echo "$policy" | jq empty 2>/dev/null || policy="null"
+
     jq -n \
         --arg id "$id" \
         --arg owner "$(cat "$s/.meta/owner" 2>/dev/null)" \
@@ -1091,10 +1107,12 @@ sandbox_info() {
         --argjson memory_mb "$memory_mb" \
         --argjson max_lifetime_s "$max_lifetime_s" \
         --argjson allow_net "$allow_net" \
+        --argjson policy "$policy" \
         '{id:$id,owner:$owner,task:$task,layers:$layers,created:$created,
           last_active:$last_active,mounted:$mounted,exec_count:$exec_count,
           upper_bytes:$upper_bytes,snapshots:$snapshots,active_snapshot:$active_snapshot,
-          cpu:$cpu,memory_mb:$memory_mb,max_lifetime_s:$max_lifetime_s,allow_net:$allow_net}'
+          cpu:$cpu,memory_mb:$memory_mb,max_lifetime_s:$max_lifetime_s,allow_net:$allow_net,
+          policy:$policy}'
 }
 
 list_sandboxes() {

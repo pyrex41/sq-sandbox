@@ -7,6 +7,7 @@
 #   - Capped reads with drain — won't fill disk or block child
 
 (import json)
+(import meta)
 
 (def max-output 65536)
 (def timeout-exit-code 124)
@@ -43,8 +44,21 @@
   (put sandbox :exec-count seq)
   (put sandbox :last-active started)
 
+  # Read policy from sandbox metadata
+  (def policy (when sdir (meta/read-policy sdir)))
+
   # Build command array for sq-exec
-  (def args ["sq-exec" merged cmd workdir (string timeout-s)])
+  (def args @["sq-exec" merged cmd workdir (string timeout-s)])
+
+  # Append policy flags if present
+  (when policy
+    (def seccomp (get policy "seccomp_profile"))
+    (when seccomp (array/push args seccomp))
+    (def readonly (get policy "readonly"))
+    (array/push args (if readonly "1" "0"))
+    (def shims (get policy "shims"))
+    (when shims
+      (array/push args (string/join shims ","))))
 
   (var proc nil)
   (var timed-out false)

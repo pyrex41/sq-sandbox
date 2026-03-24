@@ -108,9 +108,11 @@
 ;;; ── Main entry point ───────────────────────────────────────────────
 
 (defun exec-in-sandbox (sandbox cmd &key (workdir "/") (timeout 300)
-                                        sandbox-dir)
+                                        sandbox-dir policy)
   "Execute CMD in SANDBOX via sq-exec helper.
    Spawns sq-exec with the overlay merged dir, captures stdout/stderr.
+   When POLICY is non-NIL, passes seccomp_profile, readonly, and shims
+   as extra arguments to sq-exec.
    Returns an exec-result struct.
    Increments exec-count for sequence tracking."
   (declare (type simple-string cmd workdir)
@@ -119,9 +121,19 @@
   (let* ((started (get-unix-time))
          (start-ticks (get-internal-real-time))
          (merged (sandbox-merged-path sandbox))
+         (base-args (list "sq-exec" merged cmd workdir
+                          (princ-to-string timeout)))
+         (exec-args (if policy
+                        (append base-args
+                                (list (or (getf policy :|seccomp_profile|) "")
+                                      (if (getf policy :|readonly|) "1" "0")
+                                      (let ((shims (getf policy :|shims|)))
+                                        (if shims
+                                            (format nil "~{~A~^,~}" shims)
+                                            ""))))
+                        base-args))
          (proc (uiop:launch-program
-                (list "sq-exec" merged cmd workdir
-                      (princ-to-string timeout))
+                exec-args
                 :output :stream :error-output :stream))
          (stdout-stream (uiop:process-info-output proc))
          (stderr-stream (uiop:process-info-error-output proc)))

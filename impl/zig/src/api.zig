@@ -692,6 +692,48 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
         !std.mem.eql(u8, raw, "[]") and raw.len > 2
     else false;
 
+    // Read policy from .meta/policy for security restrictions
+    const policy_raw = readMetaFile(allocator, sandbox_path, "policy") catch null;
+    defer if (policy_raw) |s| allocator.free(s);
+
+    var seccomp_profile: ?[]const u8 = null;
+    var policy_readonly: ?bool = null;
+    var policy_shims: ?[]const []const u8 = null;
+    defer if (policy_shims) |shims| {
+        for (shims) |sh| allocator.free(sh);
+        allocator.free(shims);
+    };
+
+    if (policy_raw) |raw| {
+        const policy_parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
+        defer if (policy_parsed) |p| p.deinit();
+        if (policy_parsed) |p| {
+            if (p.value == .object) {
+                if (p.value.object.get("seccomp_profile")) |v| {
+                    if (v == .string) seccomp_profile = v.string;
+                }
+                if (p.value.object.get("readonly")) |v| {
+                    if (v == .bool) policy_readonly = v.bool;
+                }
+                if (p.value.object.get("shims")) |v| {
+                    if (v == .array) {
+                        var shim_list = std.ArrayList([]const u8).init(allocator);
+                        for (v.array.items) |item| {
+                            if (item == .string) {
+                                shim_list.append(allocator.dupe(u8, item.string) catch continue) catch continue;
+                            }
+                        }
+                        policy_shims = shim_list.toOwnedSlice() catch null;
+                    }
+                }
+            }
+        }
+    }
+
+    // Dupe seccomp_profile since policy_parsed will be freed
+    const seccomp_profile_owned = if (seccomp_profile) |sp| allocator.dupe(u8, sp) catch null else null;
+    defer if (seccomp_profile_owned) |s| allocator.free(s);
+
     // Execute in sandbox — use the real exec module
     var exec_ctx = exec_mod.SandboxContext{
         .merged_path = merged_z,
@@ -699,6 +741,9 @@ fn handleExec(request: *http.Server.Request, cfg: *const Config, id: []const u8,
         .cgroup_path = cgroup_path,
         .log_dir = log_dir,
         .net_enabled = net_enabled,
+        .seccomp_profile = seccomp_profile_owned,
+        .readonly = policy_readonly,
+        .shims = policy_shims,
     };
 
     // Create a sequence counter initialized to current seq
@@ -799,9 +844,53 @@ fn handleExecBg(request: *http.Server.Request, cfg: *const Config, id: []const u
         !std.mem.eql(u8, raw, "[]") and raw.len > 2
     else false;
 
+    // Read policy from .meta/policy for security restrictions (background exec)
+    const bg_policy_raw = readMetaFile(allocator, sandbox_path, "policy") catch null;
+    defer if (bg_policy_raw) |s| allocator.free(s);
+
+    var bg_seccomp_profile: ?[]const u8 = null;
+    var bg_policy_readonly: ?bool = null;
+    var bg_policy_shims: ?[]const []const u8 = null;
+    defer if (bg_policy_shims) |shims| {
+        for (shims) |sh| allocator.free(sh);
+        allocator.free(shims);
+    };
+
+    if (bg_policy_raw) |raw| {
+        const bg_policy_parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
+        defer if (bg_policy_parsed) |p| p.deinit();
+        if (bg_policy_parsed) |p| {
+            if (p.value == .object) {
+                if (p.value.object.get("seccomp_profile")) |v| {
+                    if (v == .string) bg_seccomp_profile = v.string;
+                }
+                if (p.value.object.get("readonly")) |v| {
+                    if (v == .bool) bg_policy_readonly = v.bool;
+                }
+                if (p.value.object.get("shims")) |v| {
+                    if (v == .array) {
+                        var shim_list = std.ArrayList([]const u8).init(allocator);
+                        for (v.array.items) |item| {
+                            if (item == .string) {
+                                shim_list.append(allocator.dupe(u8, item.string) catch continue) catch continue;
+                            }
+                        }
+                        bg_policy_shims = shim_list.toOwnedSlice() catch null;
+                    }
+                }
+            }
+        }
+    }
+
+    const bg_seccomp_owned = if (bg_seccomp_profile) |sp| allocator.dupe(u8, sp) catch null else null;
+    defer if (bg_seccomp_owned) |s| allocator.free(s);
+
     const ctx = exec_mod.SandboxContext{
         .merged_path = merged_path,
         .net_enabled = bg_net_enabled,
+        .seccomp_profile = bg_seccomp_owned,
+        .readonly = bg_policy_readonly,
+        .shims = bg_policy_shims,
     };
 
     const bg_req = exec_mod.ExecRequest{
@@ -2684,6 +2773,15 @@ fn createSandboxOnDisk(
         }
     } else {
         writeMetaFile(sandbox_path, "allow_net", "[]");
+    }
+
+    // Write policy as raw JSON if present
+    if (req.policy) |policy_val| {
+        const policy_json = std.json.stringifyAlloc(allocator, policy_val, .{}) catch null;
+        if (policy_json) |s| {
+            defer allocator.free(s);
+            writeMetaFile(sandbox_path, "policy", s);
+        }
     }
 }
 

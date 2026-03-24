@@ -228,13 +228,25 @@ Returns NIL if no valid index is present."
                                :ignore-error-status t)))))))
 
 (defun read-sandbox-meta (sandbox-dir)
-  "Read .meta/sandbox.json from SANDBOX-DIR. Returns a plist or NIL."
+  "Read .meta/sandbox.json from SANDBOX-DIR. Returns a plist or NIL.
+   Also reads .meta/policy if present, adding :policy to the result."
   (let ((meta-path (format nil "~A/.meta/sandbox.json" sandbox-dir)))
     (when (probe-file meta-path)
       (handler-case
           (let ((content (uiop:read-file-string meta-path)))
             (when (and content (plusp (length content)))
-              (parse-sandbox-meta-json content)))
+              (let ((meta (parse-sandbox-meta-json content)))
+                (when meta
+                  ;; Read policy file if present
+                  (let ((policy-path (format nil "~A/.meta/policy" sandbox-dir)))
+                    (when (probe-file policy-path)
+                      (handler-case
+                          (let ((policy-content (uiop:read-file-string policy-path)))
+                            (when (and policy-content (plusp (length policy-content)))
+                              (setf (getf meta :policy)
+                                    (jojo:parse policy-content))))
+                        (error () nil)))))
+                meta)))
         (error (e)
           (log:warn "init: failed to read metadata ~A: ~A" meta-path e)
           nil)))))

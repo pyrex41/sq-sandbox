@@ -1,0 +1,22 @@
+#!/bin/sh
+# ronly-style shim for systemctl: allow status queries, block mutations.
+# Installed into sandbox PATH when policy.shims includes "systemctl".
+set -eu
+
+REAL_SYSTEMCTL=$(command -v systemctl.real 2>/dev/null || echo /usr/bin/systemctl)
+
+case "${1:-}" in
+    # Read-only subcommands — pass through
+    status|list-units|list-unit-files|list-sockets|list-timers|list-jobs|list-dependencies|show|is-active|is-enabled|is-failed|cat|help)
+        exec "$REAL_SYSTEMCTL" "$@"
+        ;;
+    # Blocked (write) subcommands
+    start|stop|restart|reload|enable|disable|mask|unmask|isolate|kill|reset-failed|daemon-reload|daemon-reexec|set-property|edit|revert|link|preset|set-default|cancel|halt|poweroff|reboot|kexec|suspend|hibernate)
+        echo "ronly: systemctl $1 is blocked (read-only session)" >&2
+        exit 1
+        ;;
+    *)
+        echo "ronly: systemctl ${1:-} is not allowed (read-only session)" >&2
+        exit 1
+        ;;
+esac

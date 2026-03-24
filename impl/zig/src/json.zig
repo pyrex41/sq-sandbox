@@ -21,6 +21,7 @@ pub const CreateRequest = struct {
     memory_mb: ?u64 = null,
     max_lifetime_s: ?u64 = null,
     allow_net: ?[]const []const u8 = null,
+    policy: ?std.json.Value = null,
 
     /// Resolve the layers field into a string slice.
     /// Accepts: "a,b,c" (comma-separated) or ["a","b","c"] (JSON array).

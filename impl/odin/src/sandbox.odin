@@ -47,6 +47,7 @@ Create_Options :: struct {
 	memory_mb:      u64,
 	max_lifetime_s: u64,
 	allow_net:      Maybe([]string),
+	policy:         string,
 }
 
 // ---------------------------------------------------------------------------

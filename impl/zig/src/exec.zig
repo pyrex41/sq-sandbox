@@ -71,6 +71,12 @@ pub const SandboxContext = struct {
     /// Enable slirp4netns outbound networking (--unshare-net + slirp4netns).
     /// False = fully offline (--unshare-net with no networking).
     net_enabled: bool = false,
+    /// Seccomp profile name from policy (e.g. "readonly"). Null = unrestricted.
+    seccomp_profile: ?[]const u8 = null,
+    /// Read-only mode from policy. Null = unrestricted.
+    readonly: ?bool = null,
+    /// Shim binaries from policy (e.g. ["docker", "kubectl"]). Null = none.
+    shims: ?[]const []const u8 = null,
 };
 
 pub const ExecError = error{
@@ -97,8 +103,48 @@ pub fn execInSandbox(
         return ExecError.ForkFailed;
 
     const net_str = if (ctx.net_enabled) "1" else "0";
+
+    // Build argv dynamically to include optional policy args
+    var argv_buf: [64][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "sq-exec";
+    argc += 1;
+    argv_buf[argc] = ctx.merged_path;
+    argc += 1;
+    argv_buf[argc] = req.cmd;
+    argc += 1;
+    argv_buf[argc] = req.workdir;
+    argc += 1;
+    argv_buf[argc] = timeout_str;
+    argc += 1;
+    argv_buf[argc] = net_str;
+    argc += 1;
+
+    // Append policy-related args
+    if (ctx.seccomp_profile) |profile| {
+        argv_buf[argc] = "--seccomp-profile";
+        argc += 1;
+        argv_buf[argc] = profile;
+        argc += 1;
+    }
+    if (ctx.readonly) |ro| {
+        if (ro) {
+            argv_buf[argc] = "--readonly";
+            argc += 1;
+        }
+    }
+    if (ctx.shims) |shims| {
+        for (shims) |shim| {
+            if (argc + 2 > argv_buf.len) break;
+            argv_buf[argc] = "--shim";
+            argc += 1;
+            argv_buf[argc] = shim;
+            argc += 1;
+        }
+    }
+
     var child = std.process.Child.init(
-        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str, net_str },
+        argv_buf[0..argc],
         allocator,
     );
     child.stdout_behavior = .Pipe;
@@ -392,8 +438,47 @@ pub fn execInSandboxBg(
         return BgExecError.ForkFailed;
 
     const net_str = if (ctx.net_enabled) "1" else "0";
+
+    // Build argv dynamically to include optional policy args
+    var argv_buf: [64][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "sq-exec";
+    argc += 1;
+    argv_buf[argc] = ctx.merged_path;
+    argc += 1;
+    argv_buf[argc] = req.cmd;
+    argc += 1;
+    argv_buf[argc] = req.workdir;
+    argc += 1;
+    argv_buf[argc] = timeout_str;
+    argc += 1;
+    argv_buf[argc] = net_str;
+    argc += 1;
+
+    if (ctx.seccomp_profile) |profile| {
+        argv_buf[argc] = "--seccomp-profile";
+        argc += 1;
+        argv_buf[argc] = profile;
+        argc += 1;
+    }
+    if (ctx.readonly) |ro| {
+        if (ro) {
+            argv_buf[argc] = "--readonly";
+            argc += 1;
+        }
+    }
+    if (ctx.shims) |shims| {
+        for (shims) |shim| {
+            if (argc + 2 > argv_buf.len) break;
+            argv_buf[argc] = "--shim";
+            argc += 1;
+            argv_buf[argc] = shim;
+            argc += 1;
+        }
+    }
+
     var child = std.process.Child.init(
-        &.{ "sq-exec", ctx.merged_path, req.cmd, req.workdir, timeout_str, net_str },
+        argv_buf[0..argc],
         std.heap.page_allocator,
     );
     child.stdout_behavior = .Pipe;

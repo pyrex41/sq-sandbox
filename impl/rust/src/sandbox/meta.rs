@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::api::models::SandboxPolicy;
+
 // ── Metadata struct ─────────────────────────────────────────────────
 
 /// All metadata for a sandbox, corresponding to the flat files in .meta/.
@@ -29,6 +31,8 @@ pub struct SandboxMetadata {
     pub active_snapshot: Option<String>,
     /// Network namespace index (1-254), if networking is configured.
     pub netns_index: Option<u8>,
+    /// Security policy (ronly-inspired). None = unrestricted.
+    pub policy: Option<SandboxPolicy>,
 }
 
 /// A single snapshot entry from snapshots.jsonl.
@@ -69,6 +73,12 @@ pub fn write_metadata(meta_dir: &Path, meta: &SandboxMetadata) -> io::Result<()>
 
     if let Some(index) = meta.netns_index {
         fs::write(meta_dir.join("netns_index"), index.to_string())?;
+    }
+
+    if let Some(ref policy) = meta.policy {
+        let json = serde_json::to_string(policy)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(meta_dir.join("policy"), json)?;
     }
 
     Ok(())
@@ -158,6 +168,16 @@ pub fn read_metadata(meta_dir: &Path) -> io::Result<SandboxMetadata> {
         .and_then(|raw| raw.parse::<u8>().ok())
         .filter(|idx| (1..=254).contains(idx));
 
+    let policy = read_optional(meta_dir, "policy")
+        .and_then(|raw| {
+            serde_json::from_str::<SandboxPolicy>(&raw)
+                .map_err(|e| {
+                    warn!(error = %e, "failed to parse policy JSON, treating as unrestricted");
+                    e
+                })
+                .ok()
+        });
+
     Ok(SandboxMetadata {
         owner,
         task,
@@ -170,6 +190,7 @@ pub fn read_metadata(meta_dir: &Path) -> io::Result<SandboxMetadata> {
         allow_net,
         active_snapshot,
         netns_index,
+        policy,
     })
 }
 
@@ -247,6 +268,12 @@ mod tests {
             allow_net: Some(vec!["api.anthropic.com".into(), "pypi.org".into()]),
             active_snapshot: Some("checkpoint-1".into()),
             netns_index: Some(5),
+            policy: Some(SandboxPolicy {
+                readonly: true,
+                seccomp_profile: "readonly".into(),
+                shims: vec!["docker".into(), "kubectl".into()],
+                writable_paths: vec!["/workspace".into()],
+            }),
         }
     }
 
@@ -270,6 +297,12 @@ mod tests {
         );
         assert_eq!(read_back.active_snapshot, Some("checkpoint-1".into()));
         assert_eq!(read_back.netns_index, Some(5));
+        assert!(read_back.policy.is_some());
+        let policy = read_back.policy.unwrap();
+        assert!(policy.readonly);
+        assert_eq!(policy.seccomp_profile, "readonly");
+        assert_eq!(policy.shims, vec!["docker", "kubectl"]);
+        assert_eq!(policy.writable_paths, vec!["/workspace"]);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -289,6 +322,7 @@ mod tests {
             allow_net: None,
             active_snapshot: None,
             netns_index: None,
+            policy: None,
         };
 
         write_metadata(&dir, &meta).unwrap();
@@ -297,6 +331,7 @@ mod tests {
         assert_eq!(read_back.allow_net, None);
         assert_eq!(read_back.active_snapshot, None);
         assert_eq!(read_back.netns_index, None);
+        assert_eq!(read_back.policy.is_none(), true);
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -159,6 +159,7 @@
   (def bad (filter |(not (validate/valid-module? $)) layers))
   (when (> (length bad) 0)
     (break (error-response (string/format "invalid layer: %s" (get bad 0)) 400)))
+  (def policy (get data "policy"))
   (def opts @{
     :owner (get data "owner" "anon")
     :task (get data "task" "")
@@ -167,6 +168,7 @@
     :memory-mb (get data "memory_mb" 1024)
     :max-lifetime-s (get data "max_lifetime_s" 0)
     :allow-net (get data "allow_net")
+    :policy policy
   })
   (def sandbox (manager/manager-create manager id opts))
   (json-response (manager/sandbox-to-info sandbox) 201))

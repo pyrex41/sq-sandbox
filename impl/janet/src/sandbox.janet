@@ -90,6 +90,9 @@
         :created (os/time)
       })
 
+      # Write policy if present
+      (meta/write-policy sdir (get opts :policy))
+
       # Return sandbox table
       @{
         :id id
@@ -106,6 +109,7 @@
         :owner (get opts :owner "anon")
         :task (get opts :task "")
         :max-lifetime-s (get opts :max-lifetime-s 0)
+        :policy (get opts :policy)
       })
 
     ([e]

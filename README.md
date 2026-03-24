@@ -120,12 +120,42 @@ GET    /cgi-bin/api/modules                 available modules
     "cpu": 1.0,
     "memory_mb": 512,
     "max_lifetime_s": 1800,
-    "allow_net": ["api.anthropic.com", "pypi.org"]
+    "allow_net": ["api.anthropic.com", "pypi.org"],
+    "policy": {
+        "readonly": true,
+        "seccomp_profile": "readonly",
+        "shims": ["docker", "kubectl"],
+        "writable_paths": ["/workspace"]
+    }
 }
 ```
 
 Only `id` and `layers` are required. Defaults: `cpu=2`, `memory_mb=1024`,
-`max_lifetime_s=0` (unlimited), `allow_net=[]` (all egress allowed).
+`max_lifetime_s=0` (unlimited), `allow_net=[]` (all egress allowed),
+`policy=null` (unrestricted).
+
+### Sandbox Policy (ronly-inspired)
+
+The `policy` field controls kernel-level restrictions inside the sandbox,
+inspired by [denoland/ronly](https://github.com/denoland/ronly). All fields
+are optional; omit `policy` entirely for unrestricted access.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `readonly` | bool | `false` | Mount root as read-only. Only `/tmp` is writable. |
+| `seccomp_profile` | string | `"none"` | Seccomp-BPF filter: `none`, `readonly`, `strict`, or `default`. |
+| `shims` | string[] | `[]` | Tool shims: `docker`, `kubectl`, `systemctl`. |
+| `writable_paths` | string[] | `[]` | Additional writable paths when `readonly=true`. |
+
+**Seccomp profiles:**
+- `none` — no seccomp filtering (default)
+- `readonly` — blocks destructive syscalls: `unlink`, `rmdir`, `rename`, `truncate`, `mount`, `kill`, `tkill`, `tgkill`, `reboot`
+- `strict` — readonly + blocks network syscalls (`socket`, `connect`, `bind`, etc.)
+- `default` — Docker-level profile (blocks `kexec`, `bpf`, `perf_event_open`)
+
+**Tool shims** intercept CLI commands and allow only read-only subcommands
+(e.g., `docker ps` is allowed, `docker rm` is blocked). Shims are installed
+into `/usr/local/sbin/ronly-shims/` and prepended to `PATH`.
 
 ### Exec
 

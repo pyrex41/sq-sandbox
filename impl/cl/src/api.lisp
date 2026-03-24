@@ -164,7 +164,8 @@
                             :cpu (getf body :|cpu|)
                             :memory-mb (getf body :|memory_mb|)
                             :max-lifetime-s (getf body :|max_lifetime_s|)
-                            :allow-net (getf body :|allow_net|))))
+                            :allow-net (getf body :|allow_net|)
+                            :policy (getf body :|policy|))))
                     (json-response 201 (sandbox-to-info sandbox)))
                 (sandbox-error (e)
                   (json-response 400

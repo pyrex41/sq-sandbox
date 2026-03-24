@@ -28,6 +28,7 @@ pub struct CreateParams {
     pub memory_mb: u64,
     pub max_lifetime_s: u64,
     pub allow_net: Vec<String>,
+    pub policy: Option<crate::api::models::SandboxPolicy>,
 }
 
 #[cfg(target_os = "linux")]
@@ -143,6 +144,7 @@ mod linux {
             allow_net: allow_net.clone(),
             active_snapshot: None,
             netns_index: None,
+            policy: params.policy.clone(),
         };
 
         meta::write_metadata(&meta_dir, &metadata)
@@ -462,6 +464,7 @@ mod linux {
                     sandbox_dir,
                     netns_fd,
                     cgroup_path,
+                    policy: sandbox.metadata.policy.clone(),
                 };
 
                 let req = exec::ExecRequest { cmd, workdir, timeout };
@@ -1310,6 +1313,7 @@ mod tests {
             memory_mb: 1024,
             max_lifetime_s: 0,
             allow_net: vec![],
+            policy: None,
         };
         assert_eq!(params.id, "test-1");
         assert_eq!(params.cpu, 2.0);
@@ -1457,6 +1461,7 @@ mod tests {
             memory_mb: 512,
             max_lifetime_s: 0,
             allow_net: vec![],
+            policy: None,
         };
         let result = create_sandbox(&mgr, &config, params).await;
         assert!(result.is_err());
@@ -1481,6 +1486,7 @@ mod tests {
             memory_mb: 512,
             max_lifetime_s: 0,
             allow_net: vec![],
+            policy: None,
         };
         let result = create_sandbox(&mgr, &config, params).await;
         assert!(result.is_err());
@@ -1530,6 +1536,7 @@ mod tests {
             memory_mb: 512,
             max_lifetime_s: 0,
             allow_net: vec![],
+            policy: None,
         };
 
         let result = create_sandbox(&mgr, &config, params).await;
@@ -1557,6 +1564,7 @@ mod tests {
             memory_mb: 512,
             max_lifetime_s: 0,
             allow_net: vec![],
+            policy: None,
         };
 
         let result = create_sandbox(&mgr, &config, params).await;

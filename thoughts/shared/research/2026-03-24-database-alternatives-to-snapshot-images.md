@@ -623,20 +623,27 @@ After surveying the full design space, four architectures emerge as serious cont
 
 **What you must build**: Everything. Hashing, tree structure, serialization format, snapshot logic, diff algorithm, forking, indexing, GC. libmdbx just stores and retrieves bytes. Maximum flexibility, minimum leverage.
 
+**Known issue — hash-key freelist fragmentation**: Reth (Ethereum client) documented multi-second stalls when searching for contiguous free pages with random hash keys ([#5228](https://github.com/paradigmxyz/reth/issues/5228)). LIFO GC significantly reduces this but doesn't fully solve it. For CAS workloads, mitigation is to batch and sort hash keys before bulk insertion via `MDB_APPEND`.
+
+**Distribution**: Since December 2025, libmdbx ships as amalgamated `mdbx.c` + `mdbx.h` only (like SQLite). Internal tests and dev docs are no longer publicly distributed.
+
 **CL interop**: Universal C FFI. CFFI bindings are straightforward — libmdbx's API is small and well-documented.
 
 ### 3. Okra (Zig on LMDB) — The Practical Middle Ground
 
 **What it is**: Prolly tree with Merkle root, built on LMDB. Content-addressed deterministic B-tree: same entries = same root hash regardless of insertion order.
 
+**Architecture**: Node promotion via content-defined chunking — `u32(node.hash[0..4]) < (2^32 / Q)` where Q=32 (target fanout). Leaves hashed as `SHA256(key_len || key || value_len || value)`. Internally uses Blake3 16-byte digests. Stored as regular LMDB key/value pairs with `[level: u8][firstLeafKey: bytes]` keys. Empirically ~2.25 LMDB node changes per random leaf update in a 65k-entry tree.
+
 **What you get beyond libmdbx**:
 - Deterministic Merkle root hash (same data = same hash, always)
 - Tree reconciliation for P2P sync (compare root hashes, walk divergent subtrees)
-- CRDT-compatible `merge` operation for state-based CRDTs
-- Leaf hashes: SHA256(key||value); internal: SHA256(concat children hashes)
-- Written in Zig → exports C ABI natively → callable from CL via CFFI
+- CRDT-compatible `merge` operation — supports grow-only union and custom merge functions
+- Performance: 489K reads/s (single), 9.9K writes/s (vs LMDB's 397K reads/s, 13.9K writes/s) — similar reads, ~29% slower writes due to Merkle node updates
 
-**What you must still build**: Serialization (values are opaque bytes), datom model, fork semantics (branch refs), query layer. Okra gives you the Merkle index; you supply the meaning.
+**Critical caveat — no C ABI today**: Okra currently builds only a CLI executable and test binaries. No `callconv(.C)` exports, no shared library, no `.h` header. CL/C integration would require adding ~50 lines of Zig export wrappers + a `addSharedLibrary` build step. Feasible but not free.
+
+**What you must still build**: C ABI wrapper, serialization (values are opaque bytes), datom model, fork semantics (branch refs), query layer. Okra gives you the Merkle index; you supply the meaning.
 
 **The semantic gap**: Okra sees `key → bytes`, not `entity → attribute → value`. Your datoms get serialized to bytes going in and deserialized coming out. Every read/write crosses a serialization boundary. The Prolly tree diffs byte ranges, not semantic structures.
 
@@ -655,6 +662,8 @@ After surveying the full design space, four architectures emerge as serious cont
 
 **Hashing overhead**: For 10,000 files → ~50,000 hash operations (files + dir nodes + metadata). At ~500ns per BLAKE3 hash on small inputs → ~25ms. Negligible vs file I/O. For bulk (100K files), batch and sort hashes before commit (what Okra does internally).
 
+**Lurk as existence proof**: Lurk's `ZStore` uses `BTreeMap<ZExprPtr, Option<ZExpr>>` — content-addressed DAG with tagged Poseidon hashes as pointers. Key insight from Lurk: **deferred hashing** — evaluation uses cheap in-memory pointers (~7x faster), Poseidon hashes only computed on persistence/proof. A filesystem CAS S-exp store would use BLAKE3 instead of Poseidon (no ZK constraint budget to minimize) and libmdbx instead of BTreeMap for durability.
+
 **Backed by**: libmdbx or Redb for durability. The S-exp layer is ~500 lines of CL above the KV store.
 
 ### Head-to-Head Comparison
@@ -671,7 +680,7 @@ After surveying the full design space, four architectures emerge as serious cont
 | **Serialization** | OCaml types (Repr lib) | Your problem | Your problem (bytes) | None — IS the format |
 | **Query model** | Tree API + watches | Range scan on sorted keys | Range scan + Merkle skip | Datalog (if built) / tree walk |
 | **Autopoiesis compat** | Good (tree model maps) | Low (raw bytes) | Medium (Merkle + CFFI) | **Native** (datoms = S-exps) |
-| **CL interop** | irmin-server (IPC) | CFFI (direct) | CFFI (Zig C ABI) | Native CL |
+| **CL interop** | irmin-server (IPC) | CFFI (direct) | CFFI (needs C ABI wrapper) | Native CL |
 | **FUSE ecosystem** | None (novel work) | None (build) | None (build) | None (build) |
 | **Build effort** | ~1 week (bindings + server) | ~3 weeks (everything) | ~1 week (CFFI + serialization) | ~2-3 months (full store) |
 | **Language** | OCaml | C | Zig (C ABI) | CL (or Zig/C backing) |

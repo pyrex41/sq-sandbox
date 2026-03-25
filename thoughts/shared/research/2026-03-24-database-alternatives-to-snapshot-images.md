@@ -822,6 +822,127 @@ Incremental materialization (built into Phase 1's restore) solves the same probl
 
 Irmin gives the most functionality for the least build effort. The OCaml dependency is accepted. The S-expression layer (Phase 3) bridges the gap to autopoiesis-native storage — Irmin's custom content types support S-expressions directly via `Irmin.Type` combinators.
 
+## Deployment Architecture
+
+### Why NVMe is Ideal for Irmin
+
+irmin-pack is **append-only sequential writes** — the best possible workload for NVMe. No random writes, no write amplification from B-tree page splits. Reads are offset-based seeks into the pack file (~10μs on NVMe). The index is tiny with minimal indexing strategy (~59 MB for 400M objects at Tezos scale) and stays resident in memory.
+
+### Storage Growth Model
+
+```
+Per sandbox, per snapshot:
+  - Tree metadata: ~100 bytes/file × 10K files = ~1 MB (tiny)
+  - New/changed blobs: only files that changed since last snapshot
+  - Shared blobs: deduped automatically (same hash = stored once)
+
+With 100 sandboxes, 10 snapshots each, ~50MB average upper layer:
+  - Naive (squashfs today): 100 × 10 × 50MB = 50 GB
+  - With Irmin dedup:       ~5 GB (sandboxes from same base share ~95% of blobs)
+```
+
+Dedup ratio improves with scale — more sandboxes from similar bases share more blobs. The effective per-sandbox storage cost shrinks as the fleet grows.
+
+### Deployment Phases
+
+**Phase 1 — Single node, local NVMe (day 1)**
+
+```
+┌──────────────────────────────┐
+│  NVMe: /var/lib/sq-sandbox/  │
+│  └── irmin-pack/             │
+│      ├── pack.0.suffix       │  ← append-only, chunked
+│      ├── pack.1.suffix       │
+│      ├── dict                │  ← path string dedup
+│      ├── index               │  ← hash → offset (tiny)
+│      └── control             │  ← atomic metadata
+│  Size: 5-20 GB with GC       │
+└──────────────────────────────┘
+```
+
+Works for hundreds of sandboxes, thousands of snapshots. Chunked suffix GC keeps size bounded — configure a retention window (e.g., 7 days), old chunks deleted without data copying.
+
+**Phase 2 — NVMe + S3 offload (when local gets heavy)**
+
+```
+┌──────────────────────────────┐
+│  NVMe (upper volume):        │
+│  └── recent snapshots        │  ← bounded by GC retention
+│      5-20 GB                 │
+├──────────────────────────────┤
+│  S3 (lower volume / archive):│
+│  └── s3://bucket/cas/{hash}  │  ← all blobs by content hash
+│      └── snapshots/{id}.json │  ← lightweight metadata
+│  Unbounded, $0.023/GB/month  │
+└──────────────────────────────┘
+```
+
+Irmin's **upper/lower volume architecture** (built for Tezos archive nodes) handles this natively:
+- **Upper volume** (NVMe): recent snapshots, GC'd to stay bounded. All active sandbox reads hit this.
+- **Lower volumes** (S3 or cheap HDD): archived snapshots, read-only. Historical restores pull missing blobs on demand.
+
+The transition is transparent — application code doesn't change. Configure where old chunks go.
+
+**Phase 3 — Multi-node (when one machine isn't enough)**
+
+```
+┌─────────┐  ┌─────────┐  ┌─────────┐
+│ Node A  │  │ Node B  │  │ Node C  │
+│ NVMe    │  │ NVMe    │  │ NVMe    │
+│ Irmin   │  │ Irmin   │  │ Irmin   │
+└────┬────┘  └────┬────┘  └────┬────┘
+     │            │            │
+     └────────────┼────────────┘
+                  │
+         S3 (shared blob store)
+```
+
+Sync between nodes via Merkle tree reconciliation: compare root hashes, walk divergent subtrees, transfer only missing objects. Fork across nodes = push snapshot metadata + missing blobs to target node's S3-backed store.
+
+### Capacity Planning
+
+| Scenario | Local NVMe (with GC) | S3 archive | S3 cost/month |
+|---|---|---|---|
+| 100 sandboxes, 7-day retention | ~10 GB | ~50 GB | ~$1.15 |
+| 1K sandboxes, 7-day retention | ~50 GB | ~200 GB | ~$4.60 |
+| 10K sandboxes, 7-day retention | ~200 GB | ~1 TB | ~$23 |
+| 10K sandboxes, 30-day retention | ~500 GB | ~3 TB | ~$69 |
+
+### When Does NVMe Get Unwieldy?
+
+The trigger isn't total data — it's **hot working set size**. As long as active sandboxes' blobs fit in NVMe, performance is fine. The GC retention window controls this directly:
+
+| Retention | Local NVMe (1K sandboxes) | Status |
+|---|---|---|
+| 7 days | ~50 GB | Comfortable on any NVMe |
+| 30 days | ~200 GB | Fine on 1-2 TB NVMe |
+| 90 days | ~500 GB | Add S3 lower volume |
+| Unlimited | Grows forever | Must use upper/lower split |
+
+The answer: **you probably never outgrow a single 2 TB NVMe** for the hot working set. Archive to S3 for history. Irmin's upper/lower volume architecture makes this a configuration change, not an architecture change.
+
+### S3 Sync Details
+
+Content-addressed sync is natural with Irmin:
+
+```
+Push (snapshot → S3):
+  1. Walk snapshot's tree, collect all referenced blob hashes
+  2. Check which hashes exist in S3 (HEAD requests or manifest)
+  3. Upload only new blobs: s3://bucket/cas/{hash[0:2]}/{hash}.zst
+  4. Upload snapshot metadata: s3://bucket/meta/{sandbox}/{snapshot_id}.json
+  Cost: O(new_blobs), not O(total_blobs)
+
+Pull (S3 → local for restore):
+  1. Fetch snapshot metadata (tiny)
+  2. Diff target tree vs current local tree
+  3. Download only blobs not in local pack file
+  4. Incremental materialize to upper/
+  Cost: O(missing_blobs), not O(total_blobs)
+```
+
+Two sandboxes forked from the same base share ~95% of blobs. Pushing the second sandbox's snapshot to S3 only uploads the ~5% that diverged.
+
 ## References
 
 ### Core

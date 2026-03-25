@@ -723,6 +723,28 @@
       ;; Create snapshot directory
       (ensure-directories-exist (format nil "~A/" snapdir))
 
+      ;; Irmin backend: delegate to sq-store sidecar
+      (when (string-equal (or (uiop:getenv "SQUASH_SNAPSHOT_BACKEND") "squashfs") "irmin")
+        (let* ((store-sock (or (uiop:getenv "SQUASH_STORE_SOCK")
+                               (format nil "~A/.sq-store.sock" (config-data-dir config))))
+               (upper-data (format nil "~A/upper/data" sandbox-dir))
+               (msg (format nil "{\"op\":\"snapshot\",\"sandbox_id\":\"~A\",\"label\":\"~A\",\"upper_data\":\"~A\"}"
+                            id snap-label upper-data))
+               (resp-raw (handler-case
+                             (uiop:run-program
+                              (list "socat" "-" (format nil "UNIX-CONNECT:~A" store-sock))
+                              :input (make-string-input-stream (format nil "~A~%" msg))
+                              :output :string)
+                           (error (e)
+                             (error 'sandbox-error :id id
+                                    :message (format nil "sq-store unreachable: ~A" e)))))
+               (resp (jojo:parse resp-raw)))
+          (unless (getf resp :|ok|)
+            (error 'sandbox-error :id id
+                   :message (format nil "sq-store: ~A" (or (getf resp :|error|) "unknown"))))
+          (return-from manager-snapshot
+            (values snap-label (or (getf resp :|size|) 0)))))
+
       (case (config-backend config)
         (:firecracker
          ;; Firecracker: ask guest to create snapshot via vsock

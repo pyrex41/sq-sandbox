@@ -1,0 +1,4 @@
+(library
+ (name sq_store)
+ (public_name sq-store.lib)
+ (libraries irmin-pack irmin-pack.unix yojson lwt lwt.unix digestif logs fmt unix))

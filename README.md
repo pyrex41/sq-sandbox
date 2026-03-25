@@ -276,6 +276,43 @@ etc. — anything that supports privileged containers.
 | `SQUASH_MAX_SANDBOXES`  | `100`                      | Max concurrent sandboxes             |
 | `SQUASH_PROXY_HTTPS`  | `""` (disabled)               | HTTPS MITM proxy (set `1`)           |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
+| `SQUASH_SNAPSHOT_BACKEND` | `squashfs`                | Snapshot backend: `squashfs` or `irmin` |
+| `SQUASH_STORE_SOCK`   | `$SQUASH_DATA/.sq-store.sock` | sq-store sidecar socket path         |
+| `SQUASH_STORE_DIR`    | `$SQUASH_DATA/.sq-store/`     | Irmin pack data directory            |
+
+### Irmin Snapshot Backend
+
+When `SQUASH_SNAPSHOT_BACKEND=irmin`, snapshots use a content-addressed store
+(Irmin-pack) instead of squashfs. This provides:
+
+- **Incremental snapshots** — only changed files are stored (O(changed) vs O(total))
+- **Cross-sandbox deduplication** — identical files stored once globally
+- **O(1) fork** — cloning a sandbox's snapshot history is instant
+- **Queryable diff** — compare any two snapshots to see changed files
+- **Blob-level S3 sync** — push only new content, not entire snapshots
+
+The `sq-store` sidecar runs as a separate process (OCaml binary using
+irmin-pack). Build it from `store/` with `make build`.
+
+```sh
+# Start the sidecar
+sq-store --daemon
+
+# Create sandbox with irmin snapshots
+export SQUASH_SNAPSHOT_BACKEND=irmin
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/dev/snapshot \
+  -d '{"label":"checkpoint-1"}'
+
+# Fork a sandbox (O(1), irmin-only)
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/dev/fork \
+  -d '{"target_id":"dev-fork"}'
+
+# Diff two snapshots (irmin-only)
+curl 'localhost:8080/cgi-bin/api/sandboxes/dev/diff?from=cp1&to=cp2'
+```
+
+Legacy squashfs snapshots remain accessible. Mixed-mode is supported:
+snapshots created with either backend can coexist for the same sandbox.
 
 ## Known limitations
 

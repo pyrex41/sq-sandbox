@@ -1,0 +1,232 @@
+#!/bin/sh
+# sq-store — sidecar for content-addressed snapshot storage.
+#
+# Wraps the OCaml sq-store binary, providing lifecycle management
+# (daemon mode, PID tracking, status checks) matching the sq-sync pattern.
+#
+# When SQUASH_SNAPSHOT_BACKEND=irmin, the sandbox implementations send
+# snapshot/restore/fork/diff/history requests to this sidecar instead of
+# calling mksquashfs directly.
+#
+# Protocol (newline-delimited JSON on Unix domain socket, request-response):
+#   -> {"op":"snapshot","sandbox_id":"sb-1","label":"cp1","upper_data":"/data/sandboxes/sb-1/upper/data"}
+#   <- {"ok":true,"label":"cp1","size":12345,"commit":"abc...","stats":{...}}
+#
+#   -> {"op":"restore","sandbox_id":"sb-1","label":"cp1","upper_data":"/data/sandboxes/sb-1/upper/data"}
+#   <- {"ok":true,"label":"cp1","files_written":17,"files_deleted":3}
+#
+#   -> {"op":"fork","source_id":"sb-1","source_label":"cp1","target_id":"sb-2"}
+#   <- {"ok":true}
+#
+#   -> {"op":"diff","sandbox_id":"sb-1","from":"cp1","to":"cp2"}
+#   <- {"ok":true,"added":[...],"modified":[...],"deleted":[...]}
+#
+#   -> {"op":"history","sandbox_id":"sb-1"}
+#   <- {"ok":true,"snapshots":[...]}
+#
+#   -> {"op":"shutdown"}
+#   <- {"ok":true}
+#
+# Usage:
+#   sq-store                         # foreground mode
+#   sq-store --daemon                # background mode (writes PID file)
+#   sq-store --status                # check if running
+#   sq-store --stop                  # send shutdown message
+#   sq-store --request <json>        # send request, print response
+set -eu
+
+DATA="${SQUASH_DATA:-/data}"
+STORE_SOCK="${SQUASH_STORE_SOCK:-$DATA/.sq-store.sock}"
+STORE_DIR="${SQUASH_STORE_DIR:-$DATA/.sq-store}"
+PIDFILE="$DATA/.sq-store.pid"
+
+# Name of the OCaml binary (found on PATH or in known locations)
+SQ_STORE_BIN="${SQ_STORE_BIN:-sq-store-bin}"
+
+log() { echo "[sq-store] $(date +%H:%M:%S) $*" >&2; }
+
+# ── Find the OCaml binary ─────────────────────────────────────────
+
+_find_binary() {
+    # Check PATH first
+    if command -v "$SQ_STORE_BIN" >/dev/null 2>&1; then
+        echo "$SQ_STORE_BIN"
+        return
+    fi
+    # Check common locations
+    local script_dir
+    script_dir="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+    for candidate in \
+        "$script_dir/sq-store-bin" \
+        "$script_dir/../../store/_build/default/bin/main.exe" \
+        "$script_dir/../../store/sq-store-bin" \
+        "/usr/local/bin/sq-store-bin"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo ""
+}
+
+# ── Client mode: send request, print response ────────────────────
+
+request() {
+    local msg="$1"
+    if [ ! -S "$STORE_SOCK" ]; then
+        echo '{"ok":false,"error":"sq-store not running (socket not found)"}' >&2
+        return 1
+    fi
+    # Send request, read response (bidirectional via socat)
+    printf '%s\n' "$msg" | socat - UNIX-CONNECT:"$STORE_SOCK" 2>/dev/null
+}
+
+# ── Status ────────────────────────────────────────────────────────
+
+status() {
+    if [ -S "$STORE_SOCK" ]; then
+        echo "sq-store: running (socket: $STORE_SOCK)"
+        if [ -f "$PIDFILE" ]; then
+            local pid
+            pid=$(cat "$PIDFILE")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "  PID: $pid"
+            else
+                echo "  PID: $pid (stale)"
+            fi
+        fi
+        return 0
+    else
+        echo "sq-store: not running"
+        return 1
+    fi
+}
+
+# ── Stop ──────────────────────────────────────────────────────────
+
+stop() {
+    if [ -S "$STORE_SOCK" ]; then
+        log "sending shutdown"
+        request '{"op":"shutdown"}' >/dev/null 2>&1 || true
+        sleep 0.5
+    fi
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "killing PID $pid"
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+    fi
+    rm -f "$STORE_SOCK"
+    log "stopped"
+}
+
+# ── Daemon mode ───────────────────────────────────────────────────
+
+start_daemon() {
+    local binary
+    binary=$(_find_binary)
+    if [ -z "$binary" ]; then
+        log "ERROR: sq-store-bin not found on PATH or in known locations"
+        log "Build it with: cd store && make build"
+        exit 1
+    fi
+
+    # Check if already running
+    if [ -S "$STORE_SOCK" ]; then
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            log "already running (PID $(cat "$PIDFILE"))"
+            return 0
+        fi
+        # Stale socket
+        rm -f "$STORE_SOCK"
+    fi
+
+    mkdir -p "$STORE_DIR"
+
+    log "starting: $binary"
+    log "  socket: $STORE_SOCK"
+    log "  store:  $STORE_DIR"
+
+    # Export env vars for the OCaml binary
+    export SQUASH_DATA="$DATA"
+    export SQUASH_STORE_SOCK="$STORE_SOCK"
+    export SQUASH_STORE_DIR="$STORE_DIR"
+
+    "$binary" &
+    local pid=$!
+    echo "$pid" > "$PIDFILE"
+    log "started (PID $pid)"
+
+    # Wait briefly and check it didn't crash immediately
+    sleep 0.5
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log "ERROR: sq-store-bin exited immediately"
+        rm -f "$PIDFILE"
+        return 1
+    fi
+}
+
+# ── Foreground mode ───────────────────────────────────────────────
+
+start_foreground() {
+    local binary
+    binary=$(_find_binary)
+    if [ -z "$binary" ]; then
+        log "ERROR: sq-store-bin not found on PATH or in known locations"
+        log "Build it with: cd store && make build"
+        exit 1
+    fi
+
+    mkdir -p "$STORE_DIR"
+
+    log "starting (foreground): $binary"
+    log "  socket: $STORE_SOCK"
+    log "  store:  $STORE_DIR"
+
+    export SQUASH_DATA="$DATA"
+    export SQUASH_STORE_SOCK="$STORE_SOCK"
+    export SQUASH_STORE_DIR="$STORE_DIR"
+
+    exec "$binary"
+}
+
+# ── Main ──────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --daemon)   start_daemon ;;
+    --status)   status ;;
+    --stop)     stop ;;
+    --request)
+        [ -z "${2:-}" ] && { echo "Usage: sq-store --request '<json>'" >&2; exit 1; }
+        request "$2"
+        ;;
+    --help|-h)
+        echo "Usage: sq-store [--daemon|--status|--stop|--request <json>]"
+        echo ""
+        echo "Content-addressed snapshot store sidecar for sq-sandbox."
+        echo "Set SQUASH_SNAPSHOT_BACKEND=irmin to enable."
+        echo ""
+        echo "Options:"
+        echo "  --daemon          Start in background (writes PID file)"
+        echo "  --status          Check if running"
+        echo "  --stop            Send shutdown and kill"
+        echo "  --request <json>  Send a request and print the response"
+        echo "  (no args)         Start in foreground"
+        echo ""
+        echo "Environment:"
+        echo "  SQUASH_STORE_SOCK   Socket path (default: \$SQUASH_DATA/.sq-store.sock)"
+        echo "  SQUASH_STORE_DIR    Irmin data dir (default: \$SQUASH_DATA/.sq-store/)"
+        echo "  SQ_STORE_BIN        OCaml binary name (default: sq-store-bin)"
+        ;;
+    "")         start_foreground ;;
+    *)
+        echo "Unknown option: $1" >&2
+        echo "Run 'sq-store --help' for usage." >&2
+        exit 1
+        ;;
+esac

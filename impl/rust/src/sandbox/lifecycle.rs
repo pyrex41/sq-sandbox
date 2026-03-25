@@ -632,6 +632,45 @@ mod linux {
             None => Utc::now().format("snap-%Y%m%d-%H%M%S").to_string(),
         };
 
+        // Irmin backend: delegate to sq-store sidecar
+        if config.irmin_enabled() {
+            let store = crate::store_client::StoreClient::from_config(config);
+            let upper_data = sandbox_dir.join("upper").join("data");
+            let label_clone = label.clone();
+            let sb_id_clone = sb_id.clone();
+
+            let resp = tokio::task::spawn_blocking(move || {
+                store.snapshot(&sb_id_clone, &label_clone, &upper_data)
+            })
+            .await
+            .map_err(|e| {
+                let _ = sandbox.transition(SandboxState::Ready);
+                SandboxError::Snapshot(format!("spawn_blocking: {}", e))
+            })?
+            .map_err(|e| {
+                let _ = sandbox.transition(SandboxState::Ready);
+                SandboxError::Snapshot(format!("sq-store: {}", e))
+            })?;
+
+            let size = resp.size.unwrap_or(0);
+
+            // Write metadata (same format, with backend field)
+            let meta_dir = sandbox.meta_dir();
+            let _ = meta::append_snapshot_entry(&meta_dir, &label, size);
+            let _ = meta::write_active_snapshot(&meta_dir, Some(&label));
+
+            sandbox.metadata.active_snapshot = Some(label.clone());
+            sandbox.metadata.last_active = Utc::now();
+            sandbox.transition(SandboxState::Ready)?;
+
+            info!(
+                sandbox_id = %sb_id, label = %label, size,
+                commit = resp.commit.as_deref().unwrap_or("?"),
+                "snapshot complete (irmin)"
+            );
+            return Ok((label, size));
+        }
+
         let (snap_path, size) = match config.backend {
             Backend::Firecracker => {
                 let meta_dir = sandbox.meta_dir();
@@ -723,6 +762,69 @@ mod linux {
 
         let sb_id = sandbox.id.clone();
         let sandbox_dir = sandbox.dir.clone();
+
+        // Irmin backend: delegate restore to sq-store sidecar
+        if config.irmin_enabled() {
+            let store = crate::store_client::StoreClient::from_config(config);
+            let upper_data = sandbox_dir.join("upper").join("data");
+            let sb_id_clone = sb_id.clone();
+            let label_owned = label.to_string();
+
+            tokio::task::spawn_blocking(move || {
+                store.restore(&sb_id_clone, &label_owned, &upper_data)
+            })
+            .await
+            .map_err(|e| {
+                let _ = sandbox.transition(SandboxState::Ready);
+                SandboxError::Snapshot(format!("spawn_blocking: {}", e))
+            })?
+            .map_err(|e| {
+                let _ = sandbox.transition(SandboxState::Ready);
+                SandboxError::Snapshot(format!("sq-store restore: {}", e))
+            })?;
+
+            // Remount overlay (sidecar wrote files into upper/data)
+            if config.backend == Backend::Chroot {
+                if let Some(ref mut mounts) = sandbox.mounts {
+                    let _ = mounts.overlay.unmount();
+                    let upper_data = sandbox_dir.join("upper").join("data");
+                    let upper_work = sandbox_dir.join("upper").join("work");
+                    let merged_dir = sandbox_dir.join("merged");
+                    let images_dir = sandbox_dir.join("images");
+                    let mut lower_dirs = Vec::new();
+                    for layer in sandbox.metadata.layers.iter().rev() {
+                        lower_dirs.push(images_dir.join(format!("{}.squashfs", layer)));
+                    }
+                    use crate::sandbox::mounts::OverlayMount;
+                    let overlay =
+                        OverlayMount::mount(&merged_dir, lower_dirs, &upper_data, &upper_work)
+                            .map_err(|e| {
+                                SandboxError::Mount(format!(
+                                    "remount overlay after irmin restore: {}",
+                                    e
+                                ))
+                            })?;
+                    mounts.overlay = overlay;
+                }
+
+                let merged_dir = sandbox_dir.join("merged");
+                if config.proxy_https {
+                    inject_proxy_env(&merged_dir, config);
+                    inject_ca_certs(&merged_dir, config);
+                }
+                seed_dns_resolv_conf(&merged_dir);
+            }
+
+            sandbox.metadata.active_snapshot = Some(label.to_string());
+            sandbox.metadata.last_active = Utc::now();
+            let meta_dir = sandbox.meta_dir();
+            let _ = meta::write_active_snapshot(&meta_dir, Some(label));
+            let _ = meta::touch_last_active(&meta_dir);
+            sandbox.transition(SandboxState::Ready)?;
+
+            info!(sandbox_id = %sb_id, label, "sandbox restored (irmin)");
+            return Ok(());
+        }
 
         let snap_path = sandbox_dir.join(format!("snapshots/{}.squashfs", label));
         if !snap_path.is_file() {

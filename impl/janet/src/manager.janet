@@ -296,6 +296,31 @@
   (when (not (validate/valid-label? lbl))
     (error "label: alphanumeric/dash/underscore/dot only"))
   (def sdir (get sb :dir))
+
+  # Irmin backend: delegate to sq-store sidecar
+  (when (= (os/getenv "SQUASH_SNAPSHOT_BACKEND") "irmin")
+    (def store-sock (or (os/getenv "SQUASH_STORE_SOCK")
+                        (string (config/data-dir cfg) "/.sq-store.sock")))
+    (def upper-data (string sdir "/upper/data"))
+    (def msg (string/format
+               `{"op":"snapshot","sandbox_id":"%s","label":"%s","upper_data":"%s"}`
+               id lbl upper-data))
+    (def resp-raw (try
+                    (do
+                      (def p (os/spawn ["socat" "-" (string "UNIX-CONNECT:" store-sock)]
+                               :p {:in :pipe :out :pipe}))
+                      (file/write (get p :in) (string msg "\n"))
+                      (file/flush (get p :in))
+                      (file/close (get p :in))
+                      (def out (file/read (get p :out) :all))
+                      (os/proc-wait p)
+                      out)
+                    ([e] (error (string "sq-store unreachable: " e)))))
+    (def resp (json/decode resp-raw))
+    (when (not (get resp "ok"))
+      (error (string "sq-store: " (get resp "error" "unknown"))))
+    (break [(get resp "label" lbl) (get resp "size" 0)]))
+
   (def snapdir (string sdir "/snapshots"))
   (def snapfile (string snapdir "/" lbl ".squashfs"))
   (when (os/stat snapfile)

@@ -450,6 +450,31 @@ _chroot_snapshot_sandbox() {
     local id="$1" label="${2:-$(date +%Y%m%d-%H%M%S)}"
     valid_label "$label" || { echo "label: alphanumeric/dash/underscore/dot only" >&2; return 1; }
     local s=$(sdir "$id")
+
+    # Irmin backend: delegate to sq-store sidecar
+    if [ "${SQUASH_SNAPSHOT_BACKEND:-squashfs}" = "irmin" ]; then
+        local store_sock="${SQUASH_STORE_SOCK:-$DATA/.sq-store.sock}"
+        local request
+        request=$(jq -n --arg sandbox_id "$id" --arg label "$label" \
+            --arg upper_data "$s/upper/data" \
+            '{op:"snapshot",sandbox_id:$sandbox_id,label:$label,upper_data:$upper_data}')
+        local response
+        response=$(printf '%s\n' "$request" | socat - UNIX-CONNECT:"$store_sock" 2>/dev/null) || {
+            echo "sq-store unreachable" >&2; return 1; }
+        local ok
+        ok=$(echo "$response" | jq -r '.ok')
+        if [ "$ok" != "true" ]; then
+            echo "sq-store error: $(echo "$response" | jq -r '.error')" >&2; return 1
+        fi
+        local size
+        size=$(echo "$response" | jq -r '.size // 0')
+        jq -n --arg label "$label" --arg created "$(date -Iseconds)" \
+            --argjson size "$size" --arg backend "irmin" \
+            '{label:$label,created:$created,size:$size,backend:$backend}' >> "$s/.meta/snapshots.jsonl"
+        echo "$label"
+        return 0
+    fi
+
     local snapdir="$s/snapshots"
     local snapfile="$snapdir/$label.squashfs"
 
@@ -483,6 +508,39 @@ _chroot_restore_sandbox() {
     local id="$1" label="$2"
     valid_label "$label" || { echo "label: alphanumeric/dash/underscore/dot only" >&2; return 1; }
     local s=$(sdir "$id")
+
+    # Irmin backend: delegate to sq-store sidecar
+    if [ "${SQUASH_SNAPSHOT_BACKEND:-squashfs}" = "irmin" ]; then
+        local store_sock="${SQUASH_STORE_SOCK:-$DATA/.sq-store.sock}"
+        local request
+        request=$(jq -n --arg sandbox_id "$id" --arg label "$label" \
+            --arg upper_data "$s/upper/data" \
+            '{op:"restore",sandbox_id:$sandbox_id,label:$label,upper_data:$upper_data}')
+
+        # Tear down current overlay before restore
+        _umount_overlay "$id"
+
+        local response
+        response=$(printf '%s\n' "$request" | socat - UNIX-CONNECT:"$store_sock" 2>/dev/null) || {
+            echo "sq-store unreachable" >&2; return 1; }
+        local ok
+        ok=$(echo "$response" | jq -r '.ok')
+        if [ "$ok" != "true" ]; then
+            echo "sq-store error: $(echo "$response" | jq -r '.error')" >&2; return 1
+        fi
+
+        echo "$label" > "$s/.meta/active_snapshot"
+        _mount_overlay "$id"
+
+        # Re-seed DNS
+        if [ -f /etc/resolv.conf ]; then
+            mkdir -p "$s/upper/data/etc"
+            cp /etc/resolv.conf "$s/upper/data/etc/resolv.conf"
+        fi
+        _inject_secret_placeholders "$id"
+        return 0
+    fi
+
     local snapfile="$s/snapshots/$label.squashfs"
 
     if [ ! -f "$snapfile" ]; then

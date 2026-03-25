@@ -7,6 +7,15 @@ pub enum Backend {
     Firecracker,
 }
 
+/// Snapshot storage backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotBackend {
+    /// Traditional squashfs snapshots via mksquashfs (default).
+    Squashfs,
+    /// Content-addressed store via sq-store sidecar (Irmin-backed).
+    Irmin,
+}
+
 /// Upper layer storage backend for overlay writable layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpperBackend {
@@ -37,6 +46,7 @@ pub struct Config {
     pub proxy_https: bool,
     pub tailscale_authkey: Option<String>,
     pub tailscale_hostname: String,
+    pub snapshot_backend: SnapshotBackend,
 }
 
 impl Config {
@@ -109,6 +119,11 @@ impl Config {
         let tailscale_hostname = std::env::var("TAILSCALE_HOSTNAME")
             .unwrap_or_else(|_| "squash".to_string());
 
+        let snapshot_backend = match std::env::var("SQUASH_SNAPSHOT_BACKEND").as_deref() {
+            Ok("irmin") => SnapshotBackend::Irmin,
+            _ => SnapshotBackend::Squashfs,
+        };
+
         Self {
             backend,
             data_dir,
@@ -126,6 +141,7 @@ impl Config {
             proxy_https,
             tailscale_authkey,
             tailscale_hostname,
+            snapshot_backend,
         }
     }
 
@@ -173,6 +189,18 @@ impl Config {
     pub fn s3_enabled(&self) -> bool {
         self.s3_bucket.is_some()
     }
+
+    /// Path to the sq-store sidecar socket.
+    pub fn store_sock_path(&self) -> PathBuf {
+        std::env::var("SQUASH_STORE_SOCK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.data_dir.join(".sq-store.sock"))
+    }
+
+    /// Whether the snapshot backend is Irmin (content-addressed store).
+    pub fn irmin_enabled(&self) -> bool {
+        self.snapshot_backend == SnapshotBackend::Irmin
+    }
 }
 
 impl Default for Config {
@@ -194,6 +222,7 @@ impl Default for Config {
             proxy_https: false,
             tailscale_authkey: None,
             tailscale_hostname: "squash".to_string(),
+            snapshot_backend: SnapshotBackend::Squashfs,
         }
     }
 }

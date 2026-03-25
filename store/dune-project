@@ -1,0 +1,19 @@
+(lang dune 3.0)
+(name sq-store)
+(generate_opam_files true)
+
+(package
+ (name sq-store)
+ (synopsis "Content-addressed snapshot store for sq-sandbox")
+ (description
+  "A sidecar daemon that provides content-addressed snapshot storage using Irmin,
+   replacing squashfs snapshots with incremental, deduplicated, forkable snapshots.")
+ (depends
+  (ocaml (>= 4.14))
+  (irmin-pack (>= 3.9))
+  (yojson (>= 2.0))
+  (lwt (>= 5.6))
+  (lwt_unix (>= 5.6))
+  (digestif (>= 1.1))
+  (logs (>= 0.7))
+  (fmt (>= 0.9))))

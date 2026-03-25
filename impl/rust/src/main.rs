@@ -8,6 +8,7 @@ mod reaper;
 mod s3;
 mod sandbox;
 pub mod storage;
+pub mod store_client;
 mod validate;
 
 use std::sync::Arc;

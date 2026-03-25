@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-24
 **Trigger**: [Kyle Mistele (@0xblacklight) thread](https://x.com/0xblacklight/status/2036534699582255329) on rethinking sandbox filesystem storage
-**Status**: Research / exploration
+**Status**: Research complete — Irmin selected as storage engine
 **Updated**: 2026-03-25 — added Datom/DAG model, prior art survey (Prolly Trees, OSTree, LMDB CoW B-trees), four-way architecture comparison (Irmin vs libmdbx vs Okra vs CAS S-exp), revised 5-phase implementation plan
 
 ## The Insight
@@ -717,9 +717,7 @@ After surveying the full design space, four architectures emerge as serious cont
 
 **Choose CAS S-exp if**: Autopoiesis integration is the primary goal. The store speaks the same language as the runtime. No serialization boundary. But it requires 2-3 months of novel implementation.
 
-### The Composition That Wins
-
-These aren't mutually exclusive. The ideal architecture layers them:
+### Chosen Architecture
 
 ```
 ┌─────────────────────────────────────┐
@@ -729,107 +727,76 @@ These aren't mutually exclusive. The ideal architecture layers them:
 │  CAS S-exp layer (CL)              │  ← Phase 3: hash-cons + read/print
 │  hash(sexp) → sexp                  │
 ├─────────────────────────────────────┤
-│  Okra Prolly tree (Zig, C ABI)     │  ← Phase 2: Merkle index + diff
-│  deterministic tree, root hash      │
-├─────────────────────────────────────┤
-│  libmdbx (C)                       │  ← Phase 1: fast durable KV
-│  mmap'd B+-tree, zero-copy reads    │
-└─────────────────────────────────────┘
-```
-
-**Or**, replace the bottom two layers with Irmin (if OCaml is acceptable):
-
-```
-┌─────────────────────────────────────┐
-│  Autopoiesis (Common Lisp)          │
-│  datoms, FSet, S-expressions        │
-├─────────────────────────────────────┤
-│  CAS S-exp layer (CL)              │  ← Phase 2: hash-cons + read/print
-│  hash(sexp) → sexp                  │
-├─────────────────────────────────────┤
-│  Irmin (via libirmin.so + CFFI)    │  ← Phase 1: CAS + branches + diff
+│  Irmin (via libirmin.so + CFFI)    │  ← Phase 1-2: CAS + branches + diff
 │  pack file, Merkle tree, GC         │
 │  1,043 TPS, 23ms latency, 400M obj │
 └─────────────────────────────────────┘
 ```
 
-Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Merkle tree, branching, diffing, and GC out of the box. `libirmin` provides direct C bindings (no IPC needed). The trade-off is the OCaml runtime embedded in the shared library and the opam build toolchain.
+Irmin provides CAS, Merkle tree, branching, diffing, and GC out of the box — no need to build these primitives on top of a raw KV store. `libirmin` provides direct C bindings for CL integration via CFFI (no IPC needed). The alternatives (libmdbx + Okra, CAS S-exp store) are documented above as the design space for reference.
 
-## Revised Implementation Plan
+## Implementation Plan (Irmin)
 
-### Phase 1: Foundation — CAS Blob Store + Metadata (2-3 weeks)
+**Decision**: Irmin is the chosen storage engine. It provides CAS, Merkle tree, branching, diffing, and GC out of the box — battle-tested at Tezos scale (400M+ objects, 1,043 TPS). `libirmin` provides direct C bindings for CL integration via CFFI. The alternatives (libmdbx + Okra, CAS S-exp) remain documented above as the design space, but Irmin is the path forward.
 
-**Goal**: Replace squashfs snapshots with content-addressed storage. Keep overlayfs for execution.
+### Phase 1: Irmin CAS Snapshot Store (2 weeks)
 
-**Option A: libmdbx path** (if building from scratch)
-1. Embed libmdbx (amalgamated C source) into sq-sandbox build
-2. Three LMDB databases (sub-databases in one file):
-   - `blobs`: SHA-256 hash → zstd-compressed file content
-   - `tree`: `(snapshot_id, path)` → `(hash, mode, size, mtime, link_target)`
-   - `refs`: `branch_name` → `snapshot_id`
-3. Snapshot creation: walk `upper/data`, BLAKE3-hash each file, store new blobs, record tree
-4. Restore: read tree entries, materialize files to `upper/data`
-5. Replace `snapshots.jsonl` with snapshot metadata in LMDB
+**Goal**: Replace squashfs snapshots with Irmin content-addressed storage. Keep overlayfs for execution.
 
-**Option B: Irmin path** (if OCaml is acceptable)
 1. Install libirmin (`opam install libirmin`), link `libirmin.so` into sandbox runtime
 2. Map filesystem tree to Irmin tree: `path → (hash, mode, size, mtime)` as Irmin contents
 3. Snapshot = Irmin commit. Fork = Irmin branch. Diff = Irmin tree diff.
 4. Store file blobs as Irmin contents (automatic dedup via content-addressing)
 5. CL integration via CFFI bindings to `libirmin.so` (direct, in-process)
+6. Replace `snapshots.jsonl` with Irmin commit history
+7. Incremental restore: diff current materialized state vs target commit, copy only changed files
 
 **Deliverables**:
-- `sq-snap create` — hash + store files, create snapshot in DAG
+- `sq-snap create` — walk upper/data, commit tree to Irmin (dedup automatic)
 - `sq-snap restore <label>` — incrementally materialize snapshot to upper/ (only changed files)
-- `sq-snap list` — show snapshot DAG with labels
-- `sq-snap diff <a> <b>` — show changed files between two snapshots
-- S3 sync pushes/pulls individual blobs by hash (content-addressed, dedup across sandboxes)
+- `sq-snap list` — show commit DAG with labels and parent pointers
+- `sq-snap diff <a> <b>` — show changed files via Irmin tree diff
+- S3 sync pushes/pulls Irmin objects by hash (content-addressed, dedup across sandboxes)
 
-### Phase 2: Merkle Index + O(1) Fork (1-2 weeks on top of Phase 1)
+### Phase 2: O(1) Fork + Sync (1 week)
 
-**Goal**: Add Prolly tree indexing and branch-based forking.
+**Goal**: Exploit Irmin's native branch/merge semantics for sandbox cloning and sync.
 
-**If Phase 1 was Option A (libmdbx)**:
-1. Integrate Okra (Zig Prolly tree) via CFFI for the tree index
-2. Replace flat `(snapshot_id, path)` keys with Prolly tree nodes
-3. Get deterministic Merkle root hash for each snapshot (same files = same hash, always)
-4. Implement O(changes × log N) diff via Prolly tree walk
-5. O(1) fork: `INSERT INTO refs (name, snapshot_id)` pointing at source's current snapshot
-
-**If Phase 1 was Option B (Irmin)**:
-1. Already have Merkle tree and branch semantics — this phase is mostly wiring
-2. `POST /api/sandboxes/:id/fork` → create Irmin branch pointing at source's HEAD
-3. Expose Irmin diff as `sq-snap diff`
-4. Add P2P sync capability via Irmin's tree reconciliation
+1. O(1) fork: create Irmin branch pointing at source sandbox's HEAD commit
+2. `POST /api/sandboxes/:id/fork` — API endpoint for parallel agent exploration
+3. Expose Irmin tree reconciliation for P2P sync between sandbox instances
+4. `sq-snap verify` — recompute Merkle root, check pack file integrity
+5. Deterministic snapshot hashes (same content = same hash across machines)
 
 **Deliverables**:
-- `sq-snap fork <source> <new-name>` — O(1) sandbox cloning
-- `sq-snap verify` — recompute Merkle root, check integrity
-- `POST /api/sandboxes/:id/fork` — API endpoint for parallel agent exploration
-- Deterministic snapshot hashes (same content = same hash across machines)
+- `sq-snap fork <source> <new-name>` — O(1) sandbox cloning (zero data copy)
+- `POST /api/sandboxes/:id/fork` — API endpoint
+- Merkle-based sync: only transfer objects the remote doesn't have
+- Branch management: list, delete, merge branches
 
 ### Phase 3: S-expression Layer + Autopoiesis Integration (2-3 weeks)
 
 **Goal**: Eliminate the serialization boundary. Storage format = computation format.
 
-1. Implement hash-consing in CL: `(hash-cons sexp) → content-address`
-2. Store datoms as S-expressions: `(file-123 :content-hash #x... :mode 33188 :mtime 1711324800)`
-3. FSet tree nodes stored by hash, sharing sub-expressions automatically
-4. Autopoiesis can read/write its native data structures directly to the store
-5. Filesystem trees, agent state, and snapshot history become the same data structure
-6. `diff` = structural comparison of S-expression trees (walk DAG, skip matching hashes)
+1. Define Irmin custom content type for S-expressions (via `Irmin.Type` combinators)
+2. Implement hash-consing in CL: `(hash-cons sexp) → content-address`
+3. Store datoms as S-expressions: `(file-123 :content-hash #x... :mode 33188 :mtime 1711324800)`
+4. FSet tree nodes stored by hash, sharing sub-expressions automatically
+5. Autopoiesis can read/write its native data structures directly to Irmin
+6. Filesystem trees, agent state, and snapshot history become the same data structure
 
 **Deliverables**:
 - CL library: `cas-store` with `put-sexp`, `get-sexp`, `root-hash`, `diff-roots`
-- Autopoiesis integration: datom store backed by CAS S-expressions
+- Autopoiesis integration: datom store backed by Irmin via libirmin CFFI
 - Unified storage: filesystem snapshots + agent state in one Merkle DAG
 - REPL-friendly: `(inspect-snapshot "sandbox-abc/snap-3")` → browse tree interactively
+- Custom merge strategies for concurrent agent modifications (Irmin 3-way merge)
 
 ### Phase 4: Virtual Filesystem for Agent Harness (optional, 1-2 weeks)
 
 **Goal**: For agents that don't need `exec`, bypass the filesystem entirely (Kyle's insight).
 
-1. Tool interface: `read_file`, `write_file`, `list_dir`, `search` backed directly by CAS
+1. Tool interface: `read_file`, `write_file`, `list_dir`, `search` backed directly by Irmin
 2. Only materialize to disk when `exec` is requested
 3. Agent sees no difference — same tool API, different backend
 4. Enables running sandboxes without mount privileges, overlayfs, or kernel modules
@@ -838,22 +805,22 @@ Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Me
 
 FUSE was considered for lazy restore (O(1) — just point FUSE at new snapshot_id, decompress on demand). But FUSE adds ~10-50μs latency per syscall due to the kernel → userspace → kernel roundtrip. Coding agents run compilers, test runners, and package managers that do thousands of small file reads — the per-operation tax compounds into measurable slowdowns.
 
-Incremental materialization (built into Phase 1's restore) solves the same problem: diff current state vs target snapshot via Merkle tree, copy only changed files. This is O(changed_files) instead of O(1), but every subsequent read runs at native filesystem speed (~1μs). For coding agents, native I/O performance matters more than shaving milliseconds off restore.
+Incremental materialization (built into Phase 1's restore) solves the same problem: diff current state vs target commit via Irmin tree diff, copy only changed files. This is O(changed_files) instead of O(1), but every subsequent read runs at native filesystem speed (~1μs). For coding agents, native I/O performance matters more than shaving milliseconds off restore.
 
-### Decision Matrix: Which Path to Take
+### Why Irmin Over the Alternatives
 
-| Factor | libmdbx + Okra path | Irmin path |
-|---|---|---|
-| **Time to Phase 1** | ~3 weeks | ~1 week (Irmin gives more for free) |
-| **Time to Phase 2** | +2 weeks (Okra integration) | +1 week (already have branches/diff) |
-| **Raw performance** | Faster (in-process mmap, zero-copy) | Good (libirmin is in-process, but OCaml GC overhead) |
-| **CL integration** | CFFI (tight, C-native) | CFFI via libirmin.so (tight, but OCaml runtime embedded) |
-| **Maintenance burden** | Higher (own the stack) | Lower (Irmin team maintains core) |
-| **Autopoiesis alignment** | Medium (need S-exp layer) | Medium (need S-exp layer) |
-| **Production track record** | Ethereum (libmdbx), experimental (Okra) | Tezos (Irmin) |
-| **OCaml dependency** | No | Yes |
+| Factor | Irmin (chosen) | libmdbx + Okra | CAS S-exp |
+|---|---|---|---|
+| **Time to Phase 1** | ~2 weeks | ~3 weeks | ~2-3 months |
+| **CAS + branches + diff** | Built in | Build on top | Build on top |
+| **GC** | Chunked suffix (no copy) | Manual | Manual |
+| **Production scale** | 400M+ objects (Tezos) | Billions (libmdbx), experimental (Okra) | Unproven |
+| **CL integration** | CFFI via libirmin.so | CFFI (direct C) | Native CL |
+| **Maintenance** | Irmin team (Tarides) | Own the stack | Own everything |
+| **OCaml dependency** | Yes (accepted) | No | No |
+| **Autopoiesis alignment** | Good (tree model + custom content types) | Medium | Native |
 
-**Recommendation**: Start with **libmdbx + Okra** if CL/Zig is the primary ecosystem and you want tight in-process integration. Start with **Irmin** if you want maximum functionality fastest and don't mind the OCaml dependency. Both paths converge at Phase 3 (S-expression layer) where autopoiesis integration happens.
+Irmin gives the most functionality for the least build effort. The OCaml dependency is accepted. The S-expression layer (Phase 3) bridges the gap to autopoiesis-native storage — Irmin's custom content types support S-expressions directly via `Irmin.Type` combinators.
 
 ## References
 

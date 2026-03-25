@@ -312,7 +312,7 @@ The autopoiesis model adds three things that a naive SQLite store doesn't:
 |---|---|---|
 | **Snapshot create (cold)** | O(total_size) — full mksquashfs | O(total_size) — hash + compress all files |
 | **Snapshot create (warm)** | O(total_size) — still full rebuild | **O(changed_size)** — only new/modified blobs |
-| **Restore** | O(1) mount — near-instant | O(total_files) — materialize to upper/ |
+| **Restore** | O(1) mount — near-instant | **O(changed_files)** — incremental materialize to upper/ |
 | **Fork sandbox** | Copy .squashfs file — O(size) | **O(1)** — new branch pointer |
 | **Diff two snapshots** | Mount both + `diff -r` — O(total) | **O(changed)** — SQL join on tree tables |
 | **S3 push** | Full .squashfs — O(size) each time | **O(new_blobs)** — only push new content hashes |
@@ -322,25 +322,30 @@ The autopoiesis model adds three things that a naive SQLite store doesn't:
 
 The trade-off: **restore is slower** (materialize vs mount). But for coding agents, snapshot creation happens far more often than restore, and the creation speedup for incremental changes is dramatic.
 
-### Lazy Materialization (Future: Eliminate the Restore Penalty)
+### Incremental Materialization (Preferred Over FUSE)
 
-Autopoiesis uses `lazy-snapshot` proxies that defer I/O until access. The filesystem equivalent:
+The naive restore approach materializes every file from the CAS. But with content-addressed trees, we can diff the current materialized state against the target snapshot and only copy changed files:
 
 ```
-FUSE mount backed by SQLite CAS
-  ├── On open(path): lookup tree entry, decompress blob on demand
-  ├── On readdir(path): query tree WHERE path LIKE 'dir/%'
-  └── On write(path): copy-up to overlayfs upper/ (like overlay whiteouts)
+Incremental restore:
+  1. Diff current tree vs target tree (O(changed) via Merkle skip)
+  2. Delete files only in current, not in target
+  3. Decompress + write files only in target or with different hash
+  4. Skip unchanged files entirely
 ```
 
-This eliminates the restore materialization step entirely. Files are fetched from the CAS on first access. Combined with overlayfs for writes, this gives:
+This gives **O(changed_files) restore** — not O(1), but close to it for the common case where most files haven't changed between snapshots.
 
-- **O(1) restore** (just point FUSE at new snapshot_id)
-- **O(accessed) read cost** (only decompress what's actually read)
-- **Full POSIX compat** (processes see a real filesystem via FUSE)
-- **exec works** (binaries are materialized to page cache on demand)
+**Why not FUSE?** FUSE was considered for O(1) lazy restore, but it adds ~10-50μs latency per syscall (kernel → userspace → kernel roundtrip). Coding agents run compilers, test runners, and package managers that do thousands of small file reads — the per-operation tax compounds fast. Incremental materialization gives near-instant restore while keeping native filesystem read speed (~1μs) for all subsequent operations.
 
-This is the "lazy loading via MOP slot-unbound hooks" from autopoiesis, but for files instead of CLOS slots.
+| | FUSE mount | Incremental materialize |
+|---|---|---|
+| Restore cost | O(1) | O(changed_files) |
+| Per-read cost | ~10-50μs (FUSE overhead) | ~1μs (native fs) |
+| Compiler/test perf | Degraded | Native |
+| Complexity | FUSE daemon, mount mgmt | Simple file copy loop |
+
+FUSE only wins if restores are very frequent AND most files are never read. For coding agents that `exec` real processes, native filesystem performance matters more than restore latency.
 
 ## Prior Art: Merkle DAG / CAS Filesystems
 
@@ -697,7 +702,7 @@ After surveying the full design space, four architectures emerge as serious cont
 | **Query model** | Tree API + watches | Range scan on sorted keys | Range scan + Merkle skip | Datalog (if built) / tree walk |
 | **Autopoiesis compat** | Good (tree model maps) | Low (raw bytes) | Medium (Merkle + CFFI) | **Native** (datoms = S-exps) |
 | **CL interop** | CFFI via libirmin.so (direct) or GraphQL | CFFI (direct) | CFFI (needs C ABI wrapper) | Native CL |
-| **FUSE ecosystem** | None (novel work) | None (build) | None (build) | None (build) |
+| **FUSE** | Not needed — incremental materialization preferred over FUSE for agent workloads ||||
 | **Build effort** | ~1 week (CFFI via libirmin) | ~3 weeks (everything) | ~2 weeks (C ABI wrapper + CFFI) | ~2-3 months (full store) |
 | **Language** | OCaml | C | Zig (C ABI) | CL (or Zig/C backing) |
 | **Production scale** | 400M+ objects (Tezos) | Billions (Ethereum) | Experimental | Unproven |
@@ -767,15 +772,15 @@ Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Me
 5. Replace `snapshots.jsonl` with snapshot metadata in LMDB
 
 **Option B: Irmin path** (if OCaml is acceptable)
-1. Deploy `irmin-server` alongside sandbox runtime
+1. Install libirmin (`opam install libirmin`), link `libirmin.so` into sandbox runtime
 2. Map filesystem tree to Irmin tree: `path → (hash, mode, size, mtime)` as Irmin contents
 3. Snapshot = Irmin commit. Fork = Irmin branch. Diff = Irmin tree diff.
-4. Store file blobs as Irmin contents (automatic dedup + compression)
-5. CL integration via irmin-server's WebSocket/JSON protocol
+4. Store file blobs as Irmin contents (automatic dedup via content-addressing)
+5. CL integration via CFFI bindings to `libirmin.so` (direct, in-process)
 
 **Deliverables**:
 - `sq-snap create` — hash + store files, create snapshot in DAG
-- `sq-snap restore <label>` — materialize snapshot to upper/
+- `sq-snap restore <label>` — incrementally materialize snapshot to upper/ (only changed files)
 - `sq-snap list` — show snapshot DAG with labels
 - `sq-snap diff <a> <b>` — show changed files between two snapshots
 - S3 sync pushes/pulls individual blobs by hash (content-addressed, dedup across sandboxes)
@@ -820,30 +825,20 @@ Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Me
 - Unified storage: filesystem snapshots + agent state in one Merkle DAG
 - REPL-friendly: `(inspect-snapshot "sandbox-abc/snap-3")` → browse tree interactively
 
-### Phase 4: Lazy FUSE Materialization (2-3 weeks)
+### Phase 4: Virtual Filesystem for Agent Harness (optional, 1-2 weeks)
 
-**Goal**: Eliminate the restore materialization step entirely.
-
-1. FUSE mount backed by CAS store (libmdbx or Irmin)
-2. `open(path)` → lookup tree entry, decompress blob on demand
-3. `readdir(path)` → query tree entries with path prefix
-4. Combined with overlayfs for writes (copy-up on first write)
-5. `sq-snap restore` becomes O(1): just point FUSE at new snapshot_id
-
-**Deliverables**:
-- `sq-fuse mount <snapshot> <mountpoint>` — lazy CAS-backed filesystem
-- Restore penalty eliminated: O(1) instead of O(total_files)
-- Only decompress files actually accessed (O(accessed) not O(total))
-- Full POSIX compat: `exec` works (binaries materialized to page cache on demand)
-
-### Phase 5: Virtual Filesystem for Agent Harness (optional, 1-2 weeks)
-
-**Goal**: For agents that don't need `exec`, bypass FUSE entirely (Kyle's insight).
+**Goal**: For agents that don't need `exec`, bypass the filesystem entirely (Kyle's insight).
 
 1. Tool interface: `read_file`, `write_file`, `list_dir`, `search` backed directly by CAS
 2. Only materialize to disk when `exec` is requested
 3. Agent sees no difference — same tool API, different backend
 4. Enables running sandboxes without mount privileges, overlayfs, or kernel modules
+
+### Why Not FUSE?
+
+FUSE was considered for lazy restore (O(1) — just point FUSE at new snapshot_id, decompress on demand). But FUSE adds ~10-50μs latency per syscall due to the kernel → userspace → kernel roundtrip. Coding agents run compilers, test runners, and package managers that do thousands of small file reads — the per-operation tax compounds into measurable slowdowns.
+
+Incremental materialization (built into Phase 1's restore) solves the same problem: diff current state vs target snapshot via Merkle tree, copy only changed files. This is O(changed_files) instead of O(1), but every subsequent read runs at native filesystem speed (~1μs). For coding agents, native I/O performance matters more than shaving milliseconds off restore.
 
 ### Decision Matrix: Which Path to Take
 

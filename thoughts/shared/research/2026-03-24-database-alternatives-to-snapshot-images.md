@@ -586,29 +586,45 @@ After surveying the full design space, four architectures emerge as serious cont
 
 ### 1. Irmin (OCaml) — The Reference Implementation
 
-**What it is**: The only production-grade system that IS a content-addressed Merkle DAG natively. Used by Tezos blockchain for ledger state (400M+ objects, 8,258 ops/sec during replay, 25 GB store — 10x smaller than equivalent LMDB store).
+**What it is**: The only production-grade system that IS a content-addressed Merkle DAG natively. Used by Tezos blockchain for ledger state (400M+ objects, 1,043 TPS, 25 GB store — 10x smaller than equivalent LMDB store).
 
-**Architecture — irmin-pack**:
-- Append-only pack file with bidirectional hash index
-- Offset-based internal references: once you have a root, traversing children is a direct file seek — no index roundtrip
-- Content-addressing preserved via index for external lookups, but internal tree walks are O(1) per hop
+**Architecture — irmin-pack** (three-component store):
+- **Pack file**: Append-only binary file containing all objects (blobs, tree nodes, commits). Never overwritten, only grows.
+- **Dict**: Separate file mapping integer IDs to path step strings. Deduplicates repeated path components.
+- **Index**: Persistent hash → `(offset, length)` map. Two-level: bounded in-memory log + sorted on-disk data file. Fan-out module achieves single-disk-read lookup.
+- **Offset-based internal references**: Children referenced by int64 pack file offset (8 bytes) rather than 32-byte hash. Tree walks are O(1) per hop — no index roundtrip. Hash index only used for external lookups (primarily commits).
+- **Patricia-trie inodes**: Large directory nodes split into bounded sub-trees. Only the affected sub-path is rewritten on modification, reducing write amplification.
+- **Chunked suffix GC**: Pack file split into immutable chunks + writable tail. GC deletes old chunk files and updates control file atomically — no data copying needed.
 - Object types: `contents` (file data), `node` (directory tree), `commit` (snapshot with parent pointers)
-- BLAKE2B hashes by default (configurable)
-- Irmin 3 achieved 12x latency reduction and 360x index size reduction over Irmin 2
+- BLAKE2B hashes by default (configurable to Blake2s, SHA family, etc.)
+
+**Irmin 3 performance** (Tezos mainnet replay benchmarks):
+
+| Metric | Octez 10 (Irmin 2) | Octez 13 (Irmin 3) | Improvement |
+|---|---|---|---|
+| TPS (storage layer) | ~200 | ~1,043 | 6x |
+| Mean op latency | 274 ± 183 ms | 23.2 ± 2.0 ms | **12x lower** |
+| RAM for bootstrap | ~2 GB | ~400 MB | 5x reduction |
+| Replay time (150k blocks) | ~1 day | ~4 hours | 6x |
+| Index size | ~21 GB | ~59 MB | **360x reduction** |
 
 **What you get for free**:
 - Git-compatible branch/merge semantics (branches, merges, 3-way merge with custom strategies)
 - Automatic deduplication (same content = same hash = stored once)
 - Tree diffing: `Irmin.Diff` walks two trees, skips matching subtrees
 - O(1) fork: new branch = new ref to same commit
-- GC via `irmin-pack`'s garbage collection (rewrite pack, drop unreachable objects)
-- `irmin-server`: binary protocol + JSON mode over WebSocket
+- GC via chunked suffix truncation (no data copy, constant ~5 GB for rolling nodes)
+- CRDT support: built-in merge counters, sets, queues; custom merge functions; `irmin-containers` package
+- Custom content types via `Irmin.Type` combinators (including S-expressions, binary blobs, JSON)
 
-**CL interop**: irmin-server exposes a well-defined binary/JSON protocol over WebSocket. Practical from CL via usocket/dexador. Not zero-overhead (IPC hop) but well-defined and debuggable. Alternative: OCaml C API via ctypes → CL CFFI (tighter coupling, more work).
+**CL interop — three paths** (from best to most complex):
+1. **`libirmin` C bindings** (best for CL): Official shared library (`libirmin.so`) + header (`irmin.h`) via OCaml ctypes inverted stubs. Install: `opam install libirmin`. CL integration via CFFI — `cffi:load-foreign-library`, `cffi:defcfun`. Exposes full API: `irmin_config_pack()`, `irmin_set()`, `irmin_find()`, `irmin_set_tree()`, branch ops. Caveat: embeds OCaml runtime (one per process), manual memory management (`irmin_X_free()`), blocking semantics.
+2. **`irmin-graphql`** (best ergonomics): GraphQL server with subscriptions, single query for deep data, strongly typed schema, GraphiQL browser IDE. Usable from any language with a GraphQL client.
+3. **`irmin-http`** (REST): Lower-level, multiple round-trips per operation. Best for simple integrations.
 
 **FUSE**: No existing FUSE mount — would be novel work. But the tree model maps perfectly: nodes = directories, contents = files, commits = snapshots.
 
-**The catch**: OCaml ecosystem. Build system (dune/opam), runtime (OCaml GC), deployment (need OCaml runtime or static linking). If you're already invested in OCaml this is a non-issue. If not, it's a significant adoption cost.
+**The catch**: OCaml ecosystem. Build system (dune/opam), OCaml runtime embedded in libirmin (GC + signal handling interactions with host process), deployment complexity. `libirmin` is at v3.4.1 (somewhat behind irmin-pack at v3.11.0). If you're already invested in OCaml this is a non-issue. If not, it's a significant adoption cost — but `libirmin` makes it far more practical than previously thought.
 
 ### 2. libmdbx (C) — The Blank Canvas
 
@@ -680,15 +696,15 @@ After surveying the full design space, four architectures emerge as serious cont
 | **Serialization** | OCaml types (Repr lib) | Your problem | Your problem (bytes) | None — IS the format |
 | **Query model** | Tree API + watches | Range scan on sorted keys | Range scan + Merkle skip | Datalog (if built) / tree walk |
 | **Autopoiesis compat** | Good (tree model maps) | Low (raw bytes) | Medium (Merkle + CFFI) | **Native** (datoms = S-exps) |
-| **CL interop** | irmin-server (IPC) | CFFI (direct) | CFFI (needs C ABI wrapper) | Native CL |
+| **CL interop** | CFFI via libirmin.so (direct) or GraphQL | CFFI (direct) | CFFI (needs C ABI wrapper) | Native CL |
 | **FUSE ecosystem** | None (novel work) | None (build) | None (build) | None (build) |
-| **Build effort** | ~1 week (bindings + server) | ~3 weeks (everything) | ~1 week (CFFI + serialization) | ~2-3 months (full store) |
+| **Build effort** | ~1 week (CFFI via libirmin) | ~3 weeks (everything) | ~2 weeks (C ABI wrapper + CFFI) | ~2-3 months (full store) |
 | **Language** | OCaml | C | Zig (C ABI) | CL (or Zig/C backing) |
 | **Production scale** | 400M+ objects (Tezos) | Billions (Ethereum) | Experimental | Unproven |
 
 ### Where Each Wins
 
-**Choose Irmin if**: You want the most complete solution today. Everything — CAS, branches, merges, tree diffing, GC — is built and battle-tested at Tezos scale. The cost is the OCaml ecosystem and an IPC hop for CL integration.
+**Choose Irmin if**: You want the most complete solution today. Everything — CAS, branches, merges, tree diffing, GC — is built and battle-tested at Tezos scale. `libirmin` provides direct C bindings (no IPC needed). The cost is the OCaml runtime embedded in the shared library and the opam build toolchain.
 
 **Choose libmdbx if**: You want maximum raw performance and full control. Best for a team that wants to own the entire stack and optimize every layer. Ethereum-proven at billions of hash-keyed records.
 
@@ -726,12 +742,13 @@ These aren't mutually exclusive. The ideal architecture layers them:
 │  CAS S-exp layer (CL)              │  ← Phase 2: hash-cons + read/print
 │  hash(sexp) → sexp                  │
 ├─────────────────────────────────────┤
-│  Irmin (OCaml, via irmin-server)   │  ← Phase 1: CAS + branches + diff
+│  Irmin (via libirmin.so + CFFI)    │  ← Phase 1: CAS + branches + diff
 │  pack file, Merkle tree, GC         │
+│  1,043 TPS, 23ms latency, 400M obj │
 └─────────────────────────────────────┘
 ```
 
-Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Merkle tree, branching, diffing, and GC out of the box. The trade-off is the OCaml runtime and IPC overhead.
+Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Merkle tree, branching, diffing, and GC out of the box. `libirmin` provides direct C bindings (no IPC needed). The trade-off is the OCaml runtime embedded in the shared library and the opam build toolchain.
 
 ## Revised Implementation Plan
 
@@ -834,8 +851,8 @@ Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Me
 |---|---|---|
 | **Time to Phase 1** | ~3 weeks | ~1 week (Irmin gives more for free) |
 | **Time to Phase 2** | +2 weeks (Okra integration) | +1 week (already have branches/diff) |
-| **Raw performance** | Faster (in-process, zero-copy) | Slower (IPC to irmin-server) |
-| **CL integration** | CFFI (tight) | WebSocket/JSON (loose) |
+| **Raw performance** | Faster (in-process mmap, zero-copy) | Good (libirmin is in-process, but OCaml GC overhead) |
+| **CL integration** | CFFI (tight, C-native) | CFFI via libirmin.so (tight, but OCaml runtime embedded) |
 | **Maintenance burden** | Higher (own the stack) | Lower (Irmin team maintains core) |
 | **Autopoiesis alignment** | Medium (need S-exp layer) | Medium (need S-exp layer) |
 | **Production track record** | Ethereum (libmdbx), experimental (Okra) | Tezos (Irmin) |

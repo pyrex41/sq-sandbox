@@ -3,6 +3,7 @@
 **Date**: 2026-03-24
 **Trigger**: [Kyle Mistele (@0xblacklight) thread](https://x.com/0xblacklight/status/2036534699582255329) on rethinking sandbox filesystem storage
 **Status**: Research / exploration
+**Updated**: 2026-03-25 — added Datom/DAG model, prior art survey (Prolly Trees, OSTree, LMDB CoW B-trees)
 
 ## The Insight
 
@@ -340,6 +341,89 @@ This eliminates the restore materialization step entirely. Files are fetched fro
 - **exec works** (binaries are materialized to page cache on demand)
 
 This is the "lazy loading via MOP slot-unbound hooks" from autopoiesis, but for files instead of CLOS slots.
+
+## Prior Art: Merkle DAG / CAS Filesystems
+
+Every system below solves the same problem from a different angle. The shared insight: **structural sharing through content addressing** — if two states share a subtree, they share the same hash, so you store it once and point from both roots.
+
+### Prolly Trees (Dolt) — the closest match
+
+[DoltHub: How to Chunk Your Database into a Merkle Tree](https://www.dolthub.com/blog/2022-06-27-prolly-chunker/) | [Study in Structural Sharing](https://www.dolthub.com/blog/2024-04-12-study-in-structural-sharing/)
+
+Dolt stores tables in **Prolly Trees** — content-addressed B-trees where each node is identified by SHA-256 of its content. Originating from Attic-Labs' Noms project.
+
+- **History independence**: tree structure is a deterministic function of contents, not insertion order
+- **Content-defined chunking**: chunk boundaries determined by rolling hash of keys — inserting near position K doesn't shift all boundaries after K
+- **O(1) fork**: new branch = new root pointer
+- **O(log N) diff**: walk two trees, skip identical subtrees when hashes match
+- **Caveat**: structural sharing degrades under scattered mutations (secondary indexes can amplify 66x)
+
+Prolly Trees are the ideal data structure for our tree index — but no standalone Rust/Zig library exists yet. The SQLite flat-table approach is a pragmatic first step that could be upgraded to Prolly Trees later.
+
+### OSTree — Git for OS Binaries (production-hardened)
+
+[OSTree overview](https://ostreedev.github.io/ostree/introduction/) | [Repo anatomy](https://ostreedev.github.io/ostree/repo/)
+
+The most mature production system for content-addressed OS filesystem trees:
+- Object types: `commit`, `dirtree`, `dirmeta`, `content` (file)
+- SHA-256 hashes identify all objects
+- Deployments are **hardlink farms** into the object store — creating a new deployment = O(1) fork
+- Dedup is automatic: same content + metadata = same hash = stored once
+- Used by Flatpak, rpm-ostree, Fedora Silverblue, Automotive Grade Linux
+- `bare` mode = real files with hardlinks; `archive` mode = compressed for HTTP serving
+
+**OSTree is the closest to what we want** — but it uses hardlinks on the host filesystem rather than a portable embedded store, and has no EAV/datom metadata model.
+
+### LMDB — Userspace CoW B-tree
+
+[LMDB docs](http://www.lmdb.tech/doc/) | [How LMDB works](https://xgwang.me/posts/how-lmdb-works/)
+
+LMDB implements the exact persistent CoW B-tree primitive that autopoiesis uses via FSet:
+- Copy-on-write per page: modifications copy the modified page and all ancestors to root
+- Two oscillating meta-pages: committed root stored atomically, no WAL needed
+- **MVCC via page immutability**: readers pin current root, writers create new root
+- Zero-copy reads: mmap'd, no malloc in read path
+- `sqlightning` project replaced SQLite's B-tree with LMDB — giving SQLite MVCC for free
+
+### OCI / containerd / Nydus — Container-Native CAS
+
+- **OCI Image Spec**: explicitly a Merkle DAG — every blob, manifest, index identified by SHA-256 digest
+- **containerd snapshotters**: OverlayFS (file-level CoW), btrfs/ZFS (block-level CoW), Nydus (chunk-based CAS with lazy pull)
+- **Nydus snapshotter**: chunk-based CAS using RAFS format — lazy-pulls individual chunks on demand, sub-layer deduplication. This is the container ecosystem's answer to lazy materialization.
+
+### casync / desync — Content-Addressed Sync
+
+[casync (Lennart Poettering)](https://0pointer.net/blog/casync-a-tool-for-distributing-file-system-images.html) | [desync (Go)](https://github.com/folbricht/desync)
+
+Content-defined chunking across serialized byte streams (not tree-structured):
+- `.caidx` index: ordered list of `(offset, length, hash)` tuples
+- `.castr` chunk store: individually compressed chunks named by hash
+- Sync = download only chunks whose hash isn't in local store
+- desync adds S3/GCS backends and parallel chunking (up to 10x faster)
+- No O(1) forking or sub-directory diffs — it's a sync tool, not a versioned store
+
+### bup — Git + Hashsplitting for Backups
+
+[bup](https://github.com/bup/bup) — literally git's packfile format + content-defined chunking for large files. Backup = git branch. FUSE mount exposes snapshots as filesystem.
+
+### Structural Sharing Granularity Comparison
+
+| System | Sharing unit | Fork cost | Diff cost |
+|---|---|---|---|
+| **OSTree** | Per-file | O(1) — new commit object | O(changed files) |
+| **OCI/Docker** | Per-layer (coarse) | O(layers) — copy manifests | O(layers) |
+| **Nydus** | Per-chunk (~64KB) | O(1) | O(changed chunks) |
+| **casync/desync** | Per-chunk (~64KB) | N/A | O(changed chunks) |
+| **restic** | Per-blob (~1MB) | N/A | O(blobs) |
+| **git/bup** | Per-blob + per-tree-node | O(1) — new ref | O(changed) via tree walk |
+| **Dolt Prolly Tree** | Per-B-tree-node (~KB) | O(1) — new root pointer | O(diff × log N) |
+| **LMDB** | Per-B-tree-page (~4KB) | O(1) — new meta-page | O(changed pages) |
+| **Btrfs** | Per-extent (4KB-128MB) | O(1) — new subvol root | O(changed extents) |
+| **Proposed sq-sandbox** | Per-file (CAS blobs) | O(1) — new branch row | O(changed files) via SQL join |
+
+### Key Takeaway
+
+The pattern is universal: **fork = new root pointer, diff = skip matching hashes**. Our proposed SQLite CAS store implements the same primitive as all of these, just with SQL as the query layer instead of a custom tree walker. The upgrade path to Prolly Trees (for sub-file chunk-level sharing) is clear if we ever need it.
 
 ## Embedded DB Comparison (Detailed)
 

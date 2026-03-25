@@ -26,6 +26,7 @@ const cgroup_mod = @import("cgroup.zig");
 const netns_mod = @import("netns.zig");
 const fc_mod = @import("firecracker.zig");
 const s3_mod = @import("s3.zig");
+const store_client = @import("store_client.zig");
 
 const Config = config_mod.Config;
 const log = std.log.scoped(.api);
@@ -1105,6 +1106,38 @@ fn handleSnapshot(request: *http.Server.Request, body: []const u8, has_json_ct: 
         return;
     }
 
+    // Irmin backend: delegate to sq-store sidecar
+    if (store_client.isIrminEnabled()) {
+        var sock_buf: [256]u8 = undefined;
+        const data_dir = std.posix.getenv("SQUASH_DATA") orelse "/data";
+        const sock_path = store_client.getStoreSockPath(data_dir, &sock_buf);
+        var upper_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const upper_data = std.fmt.bufPrint(&upper_buf, "{s}/upper/data", .{sandbox_path}) catch {
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
+            return;
+        };
+        const msg = store_client.buildSnapshotRequest(allocator, id, label, upper_data) catch {
+            try sendJsonError(request, .internal_server_error, "failed to build request", allocator);
+            return;
+        };
+        defer allocator.free(msg);
+        const resp = store_client.request(allocator, sock_path, msg) catch {
+            try sendJsonError(request, .internal_server_error, "sq-store unreachable", allocator);
+            return;
+        };
+        defer allocator.free(resp);
+        if (!store_client.isOk(resp)) {
+            const err_msg = store_client.getError(resp) orelse "unknown error";
+            try sendJsonError(request, .internal_server_error, err_msg, allocator);
+            return;
+        }
+        // Return the raw response from sq-store (already JSON)
+        request.respond(resp, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        } }) catch return;
+        return;
+    }
+
     if (cfg.backend == .firecracker) {
         return doFirecrackerSnapshot(request, cfg, allocator, sandbox_path, id, label);
     }
@@ -1148,6 +1181,37 @@ fn handleRestore(request: *http.Server.Request, body: []const u8, has_json_ct: b
     }
     if (!validate.validLabel(label)) {
         try sendJsonError(request, .bad_request, "label: alphanumeric/dash/underscore/dot only", allocator);
+        return;
+    }
+
+    // Irmin backend: delegate restore to sq-store sidecar
+    if (store_client.isIrminEnabled()) {
+        var sock_buf: [256]u8 = undefined;
+        const data_dir = std.posix.getenv("SQUASH_DATA") orelse "/data";
+        const sock_path = store_client.getStoreSockPath(data_dir, &sock_buf);
+        var upper_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const upper_data = std.fmt.bufPrint(&upper_buf, "{s}/upper/data", .{sandbox_path}) catch {
+            try sendJsonError(request, .internal_server_error, "path error", allocator);
+            return;
+        };
+        const msg = store_client.buildRestoreRequest(allocator, id, label, upper_data) catch {
+            try sendJsonError(request, .internal_server_error, "failed to build request", allocator);
+            return;
+        };
+        defer allocator.free(msg);
+        const resp = store_client.request(allocator, sock_path, msg) catch {
+            try sendJsonError(request, .internal_server_error, "sq-store unreachable", allocator);
+            return;
+        };
+        defer allocator.free(resp);
+        if (!store_client.isOk(resp)) {
+            const err_msg = store_client.getError(resp) orelse "unknown error";
+            try sendJsonError(request, .internal_server_error, err_msg, allocator);
+            return;
+        }
+        request.respond(resp, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        } }) catch return;
         return;
     }
 

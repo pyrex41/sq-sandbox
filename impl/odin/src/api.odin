@@ -382,6 +382,21 @@ _handle_snapshot :: proc(req: ^Http_Request, resp: ^Http_Response) {
 		return
 	}
 
+	// Irmin backend: delegate to sq-store sidecar
+	if is_irmin_enabled() {
+		upper_data := fmt.tprintf("%s/upper/data", ms.sandbox.dir)
+		req_json := store_snapshot_request(id, label, upper_data)
+		store_resp, store_ok := store_request(req_json)
+		if !store_ok {
+			_json_error(resp, 500, "sq-store unreachable")
+			return
+		}
+		_ = os.write_entire_file(fmt.tprintf("%s/.meta/active_snapshot", ms.sandbox.dir), transmute([]byte)label)
+		update_last_active(ms.sandbox.dir)
+		_json_body(resp, 200, store_resp)
+		return
+	}
+
 	snap_path := snapshot_file_path(ms.sandbox.dir, label)
 	sync.mutex_lock(&ms.lock)
 
@@ -446,6 +461,21 @@ _handle_restore :: proc(req: ^Http_Request, resp: ^Http_Response) {
 	}
 	if len(body.label) == 0 || !valid_label(body.label) {
 		_json_error(resp, 400, "label required")
+		return
+	}
+
+	// Irmin backend: delegate restore to sq-store sidecar
+	if is_irmin_enabled() {
+		upper_data := fmt.tprintf("%s/upper/data", ms.sandbox.dir)
+		req_json := store_restore_request(id, body.label, upper_data)
+		store_resp, store_ok := store_request(req_json)
+		if !store_ok {
+			_json_error(resp, 500, "sq-store unreachable")
+			return
+		}
+		_ = os.write_entire_file(fmt.tprintf("%s/.meta/active_snapshot", ms.sandbox.dir), transmute([]byte)body.label)
+		update_last_active(ms.sandbox.dir)
+		_json_body(resp, 200, store_resp)
 		return
 	}
 

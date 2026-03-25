@@ -14,6 +14,9 @@ let create store ~sandbox_id ~label ~upper_data =
       let* (commit_hash, total_size, stats) =
         Walker.snapshot store sandbox_id label upper_data
       in
+      (* Sync new blobs to S3 if configured *)
+      let* _pushed = S3_sync.sync_snapshot_blobs store.Store.config store
+        ~sandbox_id ~label in
       Lwt.return (Protocol.Ok_snapshot {
         label;
         size = total_size;

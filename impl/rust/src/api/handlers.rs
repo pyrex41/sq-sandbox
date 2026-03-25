@@ -484,6 +484,109 @@ pub async fn wg_add_peers(
     }
 }
 
+// ── Irmin-only endpoints ─────────────────────────────────────────────
+
+/// Fork a sandbox's snapshot history to a new sandbox ID (O(1), irmin-only).
+pub async fn fork_sandbox(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.config.irmin_enabled() {
+        return Err(ApiError::internal("fork requires SQUASH_SNAPSHOT_BACKEND=irmin"));
+    }
+
+    let target_id = body
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("target_id required"))?;
+
+    let source_label = body
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("HEAD");
+
+    let client = crate::store_client::StoreClient::from_config(&state.config);
+    let source_id = id.clone();
+    let target = target_id.to_string();
+    let label = source_label.to_string();
+
+    tokio::task::spawn_blocking(move || client.fork(&source_id, &label, &target))
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn_blocking: {}", e)))?
+        .map_err(|e| ApiError::internal(format!("fork: {}", e)))?;
+
+    Ok(Json(serde_json::json!({ "ok": true, "forked_to": target_id })))
+}
+
+/// Diff two snapshots (irmin-only).
+pub async fn diff_snapshots(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.config.irmin_enabled() {
+        return Err(ApiError::internal("diff requires SQUASH_SNAPSHOT_BACKEND=irmin"));
+    }
+
+    let from = params
+        .get("from")
+        .ok_or_else(|| ApiError::bad_request("from parameter required"))?;
+    let to = params
+        .get("to")
+        .ok_or_else(|| ApiError::bad_request("to parameter required"))?;
+
+    let client = crate::store_client::StoreClient::from_config(&state.config);
+    let sandbox_id = id.clone();
+    let from_label = from.clone();
+    let to_label = to.clone();
+
+    let resp = tokio::task::spawn_blocking(move || client.diff(&sandbox_id, &from_label, &to_label))
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn_blocking: {}", e)))?
+        .map_err(|e| ApiError::internal(format!("diff: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "added": resp.added.unwrap_or_default(),
+        "modified": resp.modified.unwrap_or_default(),
+        "deleted": resp.deleted.unwrap_or_default(),
+    })))
+}
+
+/// Get snapshot history for a sandbox (irmin-only).
+pub async fn snapshot_history(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.config.irmin_enabled() {
+        return Err(ApiError::internal("history requires SQUASH_SNAPSHOT_BACKEND=irmin"));
+    }
+
+    let client = crate::store_client::StoreClient::from_config(&state.config);
+    let sandbox_id = id.clone();
+
+    let resp = tokio::task::spawn_blocking(move || client.history(&sandbox_id))
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn_blocking: {}", e)))?
+        .map_err(|e| ApiError::internal(format!("history: {}", e)))?;
+
+    let snapshots = resp.snapshots.unwrap_or_default();
+    let entries: Vec<serde_json::Value> = snapshots
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "label": s.label,
+                "created": s.created,
+                "parent": s.parent,
+                "size": s.size,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "ok": true, "snapshots": entries })))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Build a SandboxInfo response from a locked Sandbox.

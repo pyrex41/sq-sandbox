@@ -3,7 +3,7 @@
 **Date**: 2026-03-24
 **Trigger**: [Kyle Mistele (@0xblacklight) thread](https://x.com/0xblacklight/status/2036534699582255329) on rethinking sandbox filesystem storage
 **Status**: Research / exploration
-**Updated**: 2026-03-25 — added Datom/DAG model, prior art survey (Prolly Trees, OSTree, LMDB CoW B-trees)
+**Updated**: 2026-03-25 — added Datom/DAG model, prior art survey (Prolly Trees, OSTree, LMDB CoW B-trees), four-way architecture comparison (Irmin vs libmdbx vs Okra vs CAS S-exp), revised 5-phase implementation plan
 
 ## The Insight
 
@@ -580,43 +580,295 @@ For reference, the original four-way comparison:
 
 **SQLite** remains the pragmatic first step for sq-sandbox (shell-scriptable, SQL queries, single file, already in use). The 10 alternatives above represent the design space for where to evolve — particularly if autopoiesis integration becomes a priority.
 
-## Concrete Next Steps
+## Four-Way Architecture Comparison: The Final Candidates
 
-### Phase 1: Foundation (compatible with current arch)
+After surveying the full design space, four architectures emerge as serious contenders. Each represents a different point on the build-vs-buy and performance-vs-expressiveness spectrum.
 
-1. **Add content-addressed blob cache alongside squashfs** — when creating a snapshot, also index file hashes. Enable "fast diff" between snapshots.
+### 1. Irmin (OCaml) — The Reference Implementation
 
-2. **Replace `snapshots.jsonl` with SQLite** — already have SQLite for sync queue in `storage.sh`. Unify metadata storage. Add the `snapshots`, `tree`, `blobs`, `branches` tables.
+**What it is**: The only production-grade system that IS a content-addressed Merkle DAG natively. Used by Tezos blockchain for ledger state (400M+ objects, 8,258 ops/sec during replay, 25 GB store — 10x smaller than equivalent LMDB store).
 
-3. **Implement incremental squashfs creation** — use the hash index to `mksquashfs` only changed files (via `-pf` pseudo file definitions or `sqfstar` with filtered input).
+**Architecture — irmin-pack**:
+- Append-only pack file with bidirectional hash index
+- Offset-based internal references: once you have a root, traversing children is a direct file seek — no index roundtrip
+- Content-addressing preserved via index for external lookups, but internal tree walks are O(1) per hop
+- Object types: `contents` (file data), `node` (directory tree), `commit` (snapshot with parent pointers)
+- BLAKE2B hashes by default (configurable)
+- Irmin 3 achieved 12x latency reduction and 360x index size reduction over Irmin 2
 
-### Phase 2: Datom/DAG snapshot format
+**What you get for free**:
+- Git-compatible branch/merge semantics (branches, merges, 3-way merge with custom strategies)
+- Automatic deduplication (same content = same hash = stored once)
+- Tree diffing: `Irmin.Diff` walks two trees, skips matching subtrees
+- O(1) fork: new branch = new ref to same commit
+- GC via `irmin-pack`'s garbage collection (rewrite pack, drop unreachable objects)
+- `irmin-server`: binary protocol + JSON mode over WebSocket
 
-4. **SQLite CAS snapshot store** — implement the schema above. Snapshot creation walks `upper/data`, hashes files, stores new blobs, records tree entries. Restore materializes from the store.
+**CL interop**: irmin-server exposes a well-defined binary/JSON protocol over WebSocket. Practical from CL via usocket/dexador. Not zero-overhead (IPC hop) but well-defined and debuggable. Alternative: OCaml C API via ctypes → CL CFFI (tighter coupling, more work).
 
-5. **O(1) fork via branch refs** — `POST /api/sandboxes/:id/fork` creates a new sandbox by pointing a new branch at the source's current snapshot. Enables cheap sandbox cloning for parallel agent exploration.
+**FUSE**: No existing FUSE mount — would be novel work. But the tree model maps perfectly: nodes = directories, contents = files, commits = snapshots.
 
-6. **Content-addressed S3 sync** — push/pull individual blobs by hash. Dramatically reduces bandwidth. Manifest is just the snapshot DAG metadata (tiny).
+**The catch**: OCaml ecosystem. Build system (dune/opam), runtime (OCaml GC), deployment (need OCaml runtime or static linking). If you're already invested in OCaml this is a non-issue. If not, it's a significant adoption cost.
 
-### Phase 3: Lazy materialization
+### 2. libmdbx (C) — The Blank Canvas
 
-7. **FUSE mount backed by SQLite CAS** — eliminate the materialization step on restore. Files decompressed on demand. Combined with overlayfs for writes.
+**What it is**: LMDB fork, 10-20% faster, with critical fixes. Ordered key-value pairs on mmap'd B+-tree. The fastest possible embedded read (~1μs zero-copy mmap) and fastest possible sorted write (`MDB_APPEND` mode).
 
-8. **Virtual filesystem tools for agent harness** — for agents that only need read/write/search (not exec), bypass FUSE entirely. Serve file operations from the DB. Only materialize to disk when `exec` is requested (Kyle's insight).
+**Key improvements over LMDB**:
+- LIFO GC reclamation: eliminates long-reader degradation that plagued LMDB
+- Automatic geometry management: no manual map size tuning
+- `MDB_APPEND` mode: pre-sorted hash key ingestion at near-sequential-write speed (~500MB/s) — tailor-made for CAS (SHA-256 keys are uniformly distributed)
+- Amalgamated single-file C source: trivial to embed
+- Used by Ethereum clients (Erigon, Reth) for exactly the hash-keyed CAS workload
+
+**What you must build**: Everything. Hashing, tree structure, serialization format, snapshot logic, diff algorithm, forking, indexing, GC. libmdbx just stores and retrieves bytes. Maximum flexibility, minimum leverage.
+
+**CL interop**: Universal C FFI. CFFI bindings are straightforward — libmdbx's API is small and well-documented.
+
+### 3. Okra (Zig on LMDB) — The Practical Middle Ground
+
+**What it is**: Prolly tree with Merkle root, built on LMDB. Content-addressed deterministic B-tree: same entries = same root hash regardless of insertion order.
+
+**What you get beyond libmdbx**:
+- Deterministic Merkle root hash (same data = same hash, always)
+- Tree reconciliation for P2P sync (compare root hashes, walk divergent subtrees)
+- CRDT-compatible `merge` operation for state-based CRDTs
+- Leaf hashes: SHA256(key||value); internal: SHA256(concat children hashes)
+- Written in Zig → exports C ABI natively → callable from CL via CFFI
+
+**What you must still build**: Serialization (values are opaque bytes), datom model, fork semantics (branch refs), query layer. Okra gives you the Merkle index; you supply the meaning.
+
+**The semantic gap**: Okra sees `key → bytes`, not `entity → attribute → value`. Your datoms get serialized to bytes going in and deserialized coming out. Every read/write crosses a serialization boundary. The Prolly tree diffs byte ranges, not semantic structures.
+
+### 4. CAS S-expression Store (Novel, Unbuilt) — The Autopoiesis Endgame
+
+**What it is**: `hash(sexp) → sexp` as the universal storage primitive. Every cons cell, symbol, integer, list is content-addressed. Compound expressions reference children by hash → Merkle DAG of S-expressions. Lurk (Rust) proves the concept works.
+
+**What makes it unique**: There is no serialization boundary. A datom `(file-123 :content-hash "abc123" :mtime 1711324800 :tx-42 t)` is stored as-is. Its hash commits to all sub-expressions. When you change one attribute, you create a new list S-expression that shares all unchanged atoms with the old one.
+
+**Operations**:
+- `diff` = structural comparison of S-expression trees, stop when hashes match
+- `fork` = new root pointer to same S-expression DAG
+- `read`/`print` IS the codec — no serialization/deserialization boundary
+- The Merkle DAG IS the datom index
+- Filesystem trees, agent state, and snapshot history are the same data structure
+
+**Hashing overhead**: For 10,000 files → ~50,000 hash operations (files + dir nodes + metadata). At ~500ns per BLAKE3 hash on small inputs → ~25ms. Negligible vs file I/O. For bulk (100K files), batch and sort hashes before commit (what Okra does internally).
+
+**Backed by**: libmdbx or Redb for durability. The S-exp layer is ~500 lines of CL above the KV store.
+
+### Head-to-Head Comparison
+
+| Dimension | Irmin (OCaml) | libmdbx (C) | Okra (Zig/LMDB) | CAS S-exp (unbuilt) |
+|---|---|---|---|---|
+| **Exists today** | Yes, production (Tezos) | Yes, battle-tested | Yes, working | No |
+| **CAS native** | Yes | No (build on top) | Yes (Prolly tree) | Yes (hash-consing) |
+| **Point lookup** | O(1) via index | ~1μs (mmap) | ~few μs (LMDB + tree) | ~1μs (backed by libmdbx) |
+| **Root hash** | Yes (commit hash) | None | Yes (Merkle root) | Yes (root S-exp hash) |
+| **Fork** | O(1) — new branch ref | Manual | O(1) — new root pointer | O(1) — new root pointer |
+| **Diff** | O(changed) — tree walk | Manual — iterate both | O(changes × log N) — Prolly walk | O(changes) — DAG walk |
+| **Structural sharing** | Per tree node | None | Per Prolly node (~KB) | Per S-expression (finest) |
+| **Serialization** | OCaml types (Repr lib) | Your problem | Your problem (bytes) | None — IS the format |
+| **Query model** | Tree API + watches | Range scan on sorted keys | Range scan + Merkle skip | Datalog (if built) / tree walk |
+| **Autopoiesis compat** | Good (tree model maps) | Low (raw bytes) | Medium (Merkle + CFFI) | **Native** (datoms = S-exps) |
+| **CL interop** | irmin-server (IPC) | CFFI (direct) | CFFI (Zig C ABI) | Native CL |
+| **FUSE ecosystem** | None (novel work) | None (build) | None (build) | None (build) |
+| **Build effort** | ~1 week (bindings + server) | ~3 weeks (everything) | ~1 week (CFFI + serialization) | ~2-3 months (full store) |
+| **Language** | OCaml | C | Zig (C ABI) | CL (or Zig/C backing) |
+| **Production scale** | 400M+ objects (Tezos) | Billions (Ethereum) | Experimental | Unproven |
+
+### Where Each Wins
+
+**Choose Irmin if**: You want the most complete solution today. Everything — CAS, branches, merges, tree diffing, GC — is built and battle-tested at Tezos scale. The cost is the OCaml ecosystem and an IPC hop for CL integration.
+
+**Choose libmdbx if**: You want maximum raw performance and full control. Best for a team that wants to own the entire stack and optimize every layer. Ethereum-proven at billions of hash-keyed records.
+
+**Choose Okra if**: You want CAS with Merkle diffing as a library, callable from CL via CFFI, without building the tree structure yourself. The practical middle ground — get Prolly tree semantics, defer the S-expression layer until needed.
+
+**Choose CAS S-exp if**: Autopoiesis integration is the primary goal. The store speaks the same language as the runtime. No serialization boundary. But it requires 2-3 months of novel implementation.
+
+### The Composition That Wins
+
+These aren't mutually exclusive. The ideal architecture layers them:
+
+```
+┌─────────────────────────────────────┐
+│  Autopoiesis (Common Lisp)          │
+│  datoms, FSet, S-expressions        │
+├─────────────────────────────────────┤
+│  CAS S-exp layer (CL)              │  ← Phase 3: hash-cons + read/print
+│  hash(sexp) → sexp                  │
+├─────────────────────────────────────┤
+│  Okra Prolly tree (Zig, C ABI)     │  ← Phase 2: Merkle index + diff
+│  deterministic tree, root hash      │
+├─────────────────────────────────────┤
+│  libmdbx (C)                       │  ← Phase 1: fast durable KV
+│  mmap'd B+-tree, zero-copy reads    │
+└─────────────────────────────────────┘
+```
+
+**Or**, replace the bottom two layers with Irmin (if OCaml is acceptable):
+
+```
+┌─────────────────────────────────────┐
+│  Autopoiesis (Common Lisp)          │
+│  datoms, FSet, S-expressions        │
+├─────────────────────────────────────┤
+│  CAS S-exp layer (CL)              │  ← Phase 2: hash-cons + read/print
+│  hash(sexp) → sexp                  │
+├─────────────────────────────────────┤
+│  Irmin (OCaml, via irmin-server)   │  ← Phase 1: CAS + branches + diff
+│  pack file, Merkle tree, GC         │
+└─────────────────────────────────────┘
+```
+
+Irmin collapses Phase 1 and Phase 2 into a single dependency — you get CAS, Merkle tree, branching, diffing, and GC out of the box. The trade-off is the OCaml runtime and IPC overhead.
+
+## Revised Implementation Plan
+
+### Phase 1: Foundation — CAS Blob Store + Metadata (2-3 weeks)
+
+**Goal**: Replace squashfs snapshots with content-addressed storage. Keep overlayfs for execution.
+
+**Option A: libmdbx path** (if building from scratch)
+1. Embed libmdbx (amalgamated C source) into sq-sandbox build
+2. Three LMDB databases (sub-databases in one file):
+   - `blobs`: SHA-256 hash → zstd-compressed file content
+   - `tree`: `(snapshot_id, path)` → `(hash, mode, size, mtime, link_target)`
+   - `refs`: `branch_name` → `snapshot_id`
+3. Snapshot creation: walk `upper/data`, BLAKE3-hash each file, store new blobs, record tree
+4. Restore: read tree entries, materialize files to `upper/data`
+5. Replace `snapshots.jsonl` with snapshot metadata in LMDB
+
+**Option B: Irmin path** (if OCaml is acceptable)
+1. Deploy `irmin-server` alongside sandbox runtime
+2. Map filesystem tree to Irmin tree: `path → (hash, mode, size, mtime)` as Irmin contents
+3. Snapshot = Irmin commit. Fork = Irmin branch. Diff = Irmin tree diff.
+4. Store file blobs as Irmin contents (automatic dedup + compression)
+5. CL integration via irmin-server's WebSocket/JSON protocol
+
+**Deliverables**:
+- `sq-snap create` — hash + store files, create snapshot in DAG
+- `sq-snap restore <label>` — materialize snapshot to upper/
+- `sq-snap list` — show snapshot DAG with labels
+- `sq-snap diff <a> <b>` — show changed files between two snapshots
+- S3 sync pushes/pulls individual blobs by hash (content-addressed, dedup across sandboxes)
+
+### Phase 2: Merkle Index + O(1) Fork (1-2 weeks on top of Phase 1)
+
+**Goal**: Add Prolly tree indexing and branch-based forking.
+
+**If Phase 1 was Option A (libmdbx)**:
+1. Integrate Okra (Zig Prolly tree) via CFFI for the tree index
+2. Replace flat `(snapshot_id, path)` keys with Prolly tree nodes
+3. Get deterministic Merkle root hash for each snapshot (same files = same hash, always)
+4. Implement O(changes × log N) diff via Prolly tree walk
+5. O(1) fork: `INSERT INTO refs (name, snapshot_id)` pointing at source's current snapshot
+
+**If Phase 1 was Option B (Irmin)**:
+1. Already have Merkle tree and branch semantics — this phase is mostly wiring
+2. `POST /api/sandboxes/:id/fork` → create Irmin branch pointing at source's HEAD
+3. Expose Irmin diff as `sq-snap diff`
+4. Add P2P sync capability via Irmin's tree reconciliation
+
+**Deliverables**:
+- `sq-snap fork <source> <new-name>` — O(1) sandbox cloning
+- `sq-snap verify` — recompute Merkle root, check integrity
+- `POST /api/sandboxes/:id/fork` — API endpoint for parallel agent exploration
+- Deterministic snapshot hashes (same content = same hash across machines)
+
+### Phase 3: S-expression Layer + Autopoiesis Integration (2-3 weeks)
+
+**Goal**: Eliminate the serialization boundary. Storage format = computation format.
+
+1. Implement hash-consing in CL: `(hash-cons sexp) → content-address`
+2. Store datoms as S-expressions: `(file-123 :content-hash #x... :mode 33188 :mtime 1711324800)`
+3. FSet tree nodes stored by hash, sharing sub-expressions automatically
+4. Autopoiesis can read/write its native data structures directly to the store
+5. Filesystem trees, agent state, and snapshot history become the same data structure
+6. `diff` = structural comparison of S-expression trees (walk DAG, skip matching hashes)
+
+**Deliverables**:
+- CL library: `cas-store` with `put-sexp`, `get-sexp`, `root-hash`, `diff-roots`
+- Autopoiesis integration: datom store backed by CAS S-expressions
+- Unified storage: filesystem snapshots + agent state in one Merkle DAG
+- REPL-friendly: `(inspect-snapshot "sandbox-abc/snap-3")` → browse tree interactively
+
+### Phase 4: Lazy FUSE Materialization (2-3 weeks)
+
+**Goal**: Eliminate the restore materialization step entirely.
+
+1. FUSE mount backed by CAS store (libmdbx or Irmin)
+2. `open(path)` → lookup tree entry, decompress blob on demand
+3. `readdir(path)` → query tree entries with path prefix
+4. Combined with overlayfs for writes (copy-up on first write)
+5. `sq-snap restore` becomes O(1): just point FUSE at new snapshot_id
+
+**Deliverables**:
+- `sq-fuse mount <snapshot> <mountpoint>` — lazy CAS-backed filesystem
+- Restore penalty eliminated: O(1) instead of O(total_files)
+- Only decompress files actually accessed (O(accessed) not O(total))
+- Full POSIX compat: `exec` works (binaries materialized to page cache on demand)
+
+### Phase 5: Virtual Filesystem for Agent Harness (optional, 1-2 weeks)
+
+**Goal**: For agents that don't need `exec`, bypass FUSE entirely (Kyle's insight).
+
+1. Tool interface: `read_file`, `write_file`, `list_dir`, `search` backed directly by CAS
+2. Only materialize to disk when `exec` is requested
+3. Agent sees no difference — same tool API, different backend
+4. Enables running sandboxes without mount privileges, overlayfs, or kernel modules
+
+### Decision Matrix: Which Path to Take
+
+| Factor | libmdbx + Okra path | Irmin path |
+|---|---|---|
+| **Time to Phase 1** | ~3 weeks | ~1 week (Irmin gives more for free) |
+| **Time to Phase 2** | +2 weeks (Okra integration) | +1 week (already have branches/diff) |
+| **Raw performance** | Faster (in-process, zero-copy) | Slower (IPC to irmin-server) |
+| **CL integration** | CFFI (tight) | WebSocket/JSON (loose) |
+| **Maintenance burden** | Higher (own the stack) | Lower (Irmin team maintains core) |
+| **Autopoiesis alignment** | Medium (need S-exp layer) | Medium (need S-exp layer) |
+| **Production track record** | Ethereum (libmdbx), experimental (Okra) | Tezos (Irmin) |
+| **OCaml dependency** | No | Yes |
+
+**Recommendation**: Start with **libmdbx + Okra** if CL/Zig is the primary ecosystem and you want tight in-process integration. Start with **Irmin** if you want maximum functionality fastest and don't mind the OCaml dependency. Both paths converge at Phase 3 (S-expression layer) where autopoiesis integration happens.
 
 ## References
 
+### Core
 - [pyrex41/autopoiesis](https://github.com/pyrex41/autopoiesis) — Datom store, snapshot DAG, O(1) forking, structural diffing
-- [SQLite Archive (sqlar)](https://www.sqlite.org/sqlar.html) — built-in archive format
-- [SQLite Faster Than Filesystem](https://sqlite.org/fasterthanfs.html) — SQLite benchmark for blob access
-- [sqlarfs FUSE](https://github.com/nicmcd/sqlarfs) — mount sqlar as filesystem
-- [libsqlfs](https://github.com/guardianproject/libsqlfs) — full POSIX filesystem on SQLite
-- [LMDB](http://www.lmdb.tech/doc/) — zero-copy memory-mapped KV store
-- [RocksDB BlobDB](https://rocksdb.org/blog/2021/05/26/integrated-blob-db.html) — key-value separation for large values
-- [Alluxio + RocksDB](https://www.alluxio.io/blog/scalable-metadata-service-in-alluxio-storing-billions-of-files) — billion-file filesystem metadata in RocksDB
-- [erofs](https://erofs.docs.kernel.org/) — next-gen read-only filesystem (kernel-native)
-- [composefs](https://github.com/containers/composefs) — EROFS + overlayfs for containers (state of the art)
+- Kyle Mistele thread on [separating tool interface from execution](https://x.com/0xblacklight/status/2036534699582255329)
+
+### Storage Engines (Final Candidates)
+- [Irmin](https://github.com/mirage/irmin) — OCaml content-addressed Merkle DAG store (Tezos)
+- [libmdbx](https://github.com/erthink/libmdbx) — LMDB fork, 10-20% faster, used by Erigon/Reth
+- [Okra](https://github.com/canvasxyz/okra) — Zig Prolly tree on LMDB, Merkle root, C ABI
+- [Lurk](https://github.com/lurk-lab/lurk-beta) — content-addressed S-expression store in Rust
+
+### Storage Engines (Surveyed)
+- [Redb](https://github.com/cberner/redb) — Rust CoW B-tree with Savepoints
+- [Pebble](https://github.com/cockroachdb/pebble) — Go LSM-tree with value separation
+- [Datahike](https://github.com/replikativ/datahike) — Clojure Datomic-compatible with hitchhiker trees
+- [Datalevin](https://github.com/juji-io/datalevin) — Clojure Datomic API on LMDB
+- [XTDB v2](https://docs.xtdb.com/intro/what-is-xtdb.html) — Clojure bitemporal database
+
+### Prior Art
+- [DoltHub: Prolly Trees](https://www.dolthub.com/blog/2022-06-27-prolly-chunker/) — content-addressed B-trees
+- [DoltHub: Structural Sharing](https://www.dolthub.com/blog/2024-04-12-study-in-structural-sharing/) — sharing analysis
+- [OSTree](https://ostreedev.github.io/ostree/) — content-addressed OS tree (Fedora/RHEL)
+- [LMDB internals](http://www.lmdb.tech/doc/) — zero-copy CoW B-tree
+- [How LMDB works](https://xgwang.me/posts/how-lmdb-works/) — deep technical overview
 - [casync](https://github.com/systemd/casync) — content-addressable sync tool
 - [desync](https://github.com/folbricht/desync) — Go implementation of casync protocol
-- [ostree](https://ostreedev.github.io/ostree/) — content-addressed OS tree (used by Fedora/RHEL)
-- Kyle Mistele thread on [separating tool interface from execution](https://x.com/0xblacklight/status/2036534699582255329)
+- [Nydus](https://github.com/dragonflyoss/nydus) — container-native CAS with lazy pull
+
+### Filesystem / Snapshot
+- [SQLite Archive (sqlar)](https://www.sqlite.org/sqlar.html) — built-in archive format
+- [SQLite Faster Than Filesystem](https://sqlite.org/fasterthanfs.html) — blob access benchmarks
+- [sqlarfs FUSE](https://github.com/nicmcd/sqlarfs) — mount sqlar as filesystem
+- [libsqlfs](https://github.com/guardianproject/libsqlfs) — full POSIX filesystem on SQLite
+- [erofs](https://erofs.docs.kernel.org/) — next-gen read-only filesystem (kernel-native)
+- [composefs](https://github.com/containers/composefs) — EROFS + overlayfs for containers
+- [RocksDB BlobDB](https://rocksdb.org/blog/2021/05/26/integrated-blob-db.html) — key-value separation
+- [Alluxio + RocksDB](https://www.alluxio.io/blog/scalable-metadata-service-in-alluxio-storing-billions-of-files) — billion-file metadata

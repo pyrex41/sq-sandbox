@@ -425,9 +425,146 @@ Content-defined chunking across serialized byte streams (not tree-structured):
 
 The pattern is universal: **fork = new root pointer, diff = skip matching hashes**. Our proposed SQLite CAS store implements the same primitive as all of these, just with SQL as the query layer instead of a custom tree walker. The upgrade path to Prolly Trees (for sub-file chunk-level sharing) is clear if we ever need it.
 
-## Embedded DB Comparison (Detailed)
+## 10 Alternative Storage Engines (Expanded Survey)
 
-Research from web sources on each candidate:
+### Tier 1: CAS-Native / Purpose-Built
+
+**1. Irmin (OCaml)** — The only system that IS a content-addressed Merkle DAG natively.
+- BLAKE2B-keyed append-only pack file with bidirectional hash index
+- Git-compatible branch/merge semantics built in
+- Deduplication automatic (same content = same hash = stored once)
+- Used by Tezos blockchain for ledger state
+- Notafs (Nov 2024): proves Irmin can be a standalone filesystem on MirageOS block devices
+- v3.11.0 stable
+- **Constraint**: OCaml ecosystem. [github.com/mirage/irmin](https://github.com/mirage/irmin)
+
+**2. Okra (Zig, on LMDB)** — Prolly tree with Merkle root, written in Zig.
+- Content-addressed deterministic B-tree: same entries = same root hash regardless of insertion order
+- Built on LMDB for durability, Zig for zero-cost C ABI
+- CRDT-compatible `merge` operation for state-based CRDTs
+- Leaf hashes: SHA256(key||value); internal: SHA256(concat children hashes)
+- **Callable from CL via CFFI** (Zig exports C ABI natively)
+- Enables P2P sync via Merkle tree reconciliation
+- [github.com/canvasxyz/okra](https://github.com/canvasxyz/okra)
+
+**3. Lurk (Rust)** — Content-addressed S-expression storage, existence proof.
+- Turing-complete Lisp where every expression is identified by `hash(sexp)`
+- The `Store` is literally `hash → sexp preimage` — a Merkle DAG of S-expressions
+- Uses Poseidon hashes (ZK-friendly) but architecture works with SHA256/BLAKE3
+- Proves that hash-consed S-expression storage is viable and performant
+- **The natural autopoiesis storage primitive** if generalized
+- [github.com/lurk-lab/lurk-beta](https://github.com/lurk-lab/lurk-beta)
+
+### Tier 2: High-Performance Embedded (build CAS on top)
+
+**4. libmdbx (C)** — LMDB fork, 10-20% faster, critical fixes.
+- `MDB_APPEND` mode for pre-sorted hash keys = maximum write throughput for CAS
+- LIFO GC reclamation eliminates long-reader degradation that plagued LMDB
+- Automatic geometry management (no manual map sizing)
+- Amalgamated single-file C source (trivial to embed)
+- Used by Ethereum clients (Erigon, Reth) for hash-keyed blockchain state
+- Apache 2.0 since May 2024
+- [github.com/erthink/libmdbx](https://github.com/erthink/libmdbx)
+
+**5. Redb (Rust)** — Pure Rust CoW B-tree with first-class Savepoints.
+- **Savepoints**: capture entire DB state in ~64KB per GB of data. Restore = atomic rollback.
+- Copy-on-write B-tree = every committed state is implicitly a snapshot
+- Zero-copy reads via mmap'd MVCC
+- Stable file format, v3.1.1 (Mar 2026), production-ready
+- `redbx` fork adds AES-256-GCM encryption as drop-in replacement
+- [github.com/cberner/redb](https://github.com/cberner/redb)
+
+**6. Pebble (Go)** — CockroachDB's LSM-tree with value separation.
+- **Value separation** (v25.3): stores large values in separate files, reducing write amplification ~47%
+- `DeleteSized`: tombstone carries deleted value's size for space-aware compaction
+- Bloom filters for fast hash-existence checks (avoid disk I/O for "already stored?" queries)
+- Range tombstones for efficient bulk deletion
+- Pure Go, no CGO, BSD-3 license
+- [github.com/cockroachdb/pebble](https://github.com/cockroachdb/pebble)
+
+### Tier 3: Datom-Native / Autopoiesis-Compatible
+
+**7. Datahike (Clojure)** — Datomic-compatible with hitchhiker trees + structural sharing.
+- **Hitchhiker trees**: write-optimized persistent B+-tree with structural sharing across snapshots
+- Full time-travel queries (as-of any transaction)
+- Pluggable backends via Konserve: LMDB, S3, filesystem, Redis, JDBC
+- Database snapshots are immutable Clojure values — pass them around freely
+- Datoms are first-class, Datalog queries built in
+- **JVM dependency** — best integrated as server or via Konserve's LMDB backend pattern
+- [github.com/replikativ/datahike](https://github.com/replikativ/datahike)
+
+**8. Datalevin (Clojure on LMDB)** — Datomic API, LMDB performance.
+- LMDB's DUPSORT for nested B+ tree EAV indexing (EAVT, AEVT, AVET, VAET)
+- 100K datoms to disk in <0.2 seconds
+- Cost-based query optimizer, ~2x faster than PostgreSQL on complex joins
+- No history retention (simplification vs Datomic) — but could be extended
+- **The reference design** for implementing EAV indexing over LMDB in any language
+- [github.com/juji-io/datalevin](https://github.com/juji-io/datalevin)
+
+**9. XTDB v2 (Clojure)** — Bitemporal by default.
+- Every record carries system-time AND valid-time automatically
+- Query: "what did the filesystem look like at T1, as of what we knew at T2?"
+- Columnar Arrow storage, append-only immutable transaction log
+- SQL:2011 temporal standard over Postgres wire protocol
+- **The time-travel query model** — unmatched for snapshot history analysis
+- [docs.xtdb.com](https://docs.xtdb.com/intro/what-is-xtdb.html)
+
+### Tier 4: Inspirational / Novel Architecture
+
+**10. Content-Addressed S-Expression Store (novel, unbuilt)**
+- `hash(sexp) → sexp` as the universal storage primitive
+- Every cons cell, symbol, integer, list is content-addressed
+- Compound expressions reference children by hash → Merkle DAG of S-expressions
+- FSet tree nodes, datoms, filesystem tree entries are ALL the same data structure
+- Backed by libmdbx or Redb for durability
+- **Homoiconic storage**: the storage format IS the computation format
+- Lurk proves the concept; Okra provides the Merkle index; autopoiesis provides the runtime
+- No existing implementation — this is the design space autopoiesis could pioneer
+
+### Comparison Matrix
+
+| # | System | Language | CAS-Native | Datom-Native | Embeddable | S-exp | Point lookup |
+|---|---|---|---|---|---|---|---|
+| 1 | Irmin | OCaml | Yes | No | Yes | No | O(1) hash index |
+| 2 | Okra | Zig/LMDB | Yes (Prolly) | No | Yes | No | O(log N) |
+| 3 | Lurk Store | Rust | Yes | No | Yes | **Yes** | O(1) hash map |
+| 4 | libmdbx | C | Build on top | No | Yes | No | ~1μs mmap |
+| 5 | Redb | Rust | Savepoints | No | Yes | No | ~few μs |
+| 6 | Pebble | Go | Build on top | No | Yes | No | ~few μs |
+| 7 | Datahike | Clojure/JVM | Structural | **Yes** | Server | EDN | Datalog |
+| 8 | Datalevin | Clojure/JVM | No | **Yes** | Server | EDN | ~few μs (LMDB) |
+| 9 | XTDB v2 | Clojure/JVM | Immutable log | Bitemporal | Server | EDN | SQL/Datalog |
+| 10 | CAS S-exp | Novel | **Yes** | **Yes** | **Yes** | **Yes** | O(1) hash |
+
+### Eliminated Candidates
+
+| System | Why not |
+|---|---|
+| **DuckDB** | Columnar/OLAP — point lookups ~15x slower than SQLite. Wrong workload. |
+| **FoundationDB** | Not embeddable (daemon), 100KB value hard limit, IPC latency overhead. Wrong scale. |
+| **ClickHouse** | OLAP engine, multi-file storage, point lookups are worst case. |
+| **Sled** | Still beta, unstable on-disk format, no ETA for 1.0. |
+| **SurrealDB/KV** | VART is interesting but file format unstable, RocksDB still recommended for production. |
+
+### The Autopoiesis Integration Thesis
+
+The S-expression angle changes the question from "which DB stores blobs" to:
+
+> **What if the storage format IS the computation format?**
+
+Autopoiesis already represents state as datoms and FSet persistent trees. If on-disk storage is content-addressed S-expressions (#10), then:
+- No serialization/deserialization boundary — `read`/`print` IS the codec
+- The Merkle DAG IS the datom index
+- Filesystem trees, agent state, and snapshot history are the same data structure
+- `diff` = structural comparison of S-expression trees
+- `fork` = new root pointer to the same S-expression DAG
+- Hash-consing (classical Lisp, 1970s) becomes durable persistence
+
+**Most viable composition**: Okra (Zig Prolly tree on LMDB, C ABI) + content-addressed S-expression serialization + CL CFFI bindings. This gives autopoiesis a durable, content-addressed, Merkle-rooted datom store callable directly from Common Lisp, with P2P sync capability via tree reconciliation.
+
+## Original Embedded DB Comparison
+
+For reference, the original four-way comparison:
 
 | Property | SQLite/sqlar | LMDB | RocksDB | BoltDB/bbolt |
 |---|---|---|---|---|
@@ -439,18 +576,9 @@ Research from web sources on each candidate:
 | **FUSE ecosystem** | sqlarfs, libsqlfs (mature) | None (must build) | None (must build) | None |
 | **Snapshot semantics** | WAL checkpoint | MVCC read txn = snapshot | Checkpoint = hard-linked SSTs | COW paging |
 | **Max blob size** | ~1-2 GB (must chunk larger) | ~4 GB value limit | Multi-GB via BlobDB | Virtual addr space |
-| **Container ecosystem use** | None in production | None | Alluxio, Ceph (metadata) | containerd (metadata) |
 | **Single-file portable** | Yes | Yes | No (directory of files) | Yes |
 
-**Recommendation for sq-sandbox**: **SQLite** for the tree/metadata store + DAG, with **application-level zstd compression** of blob values. SQLite gives us:
-- Single portable `.db` file per sandbox (or global)
-- SQL queries for diffing, history, search
-- FUSE mount option via sqlarfs for backward compat
-- Widest language support (C, Rust, Zig, shell via `sqlite3` CLI)
-- ACID transactions for atomic snapshot commits
-- Already used in sq-sandbox for the sync queue (`storage.sh:174-237`)
-
-LMDB would win on raw read performance (zero-copy mmap) but loses on queryability, compression, and ecosystem. RocksDB is overkill for our scale and adds operational complexity (not single-file).
+**SQLite** remains the pragmatic first step for sq-sandbox (shell-scriptable, SQL queries, single file, already in use). The 10 alternatives above represent the design space for where to evolve — particularly if autopoiesis integration becomes a priority.
 
 ## Concrete Next Steps
 

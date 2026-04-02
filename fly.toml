@@ -2,7 +2,7 @@ app = 'sq-sandbox'
 primary_region = 'iad'
 
 [build]
-  dockerfile = 'Dockerfile.zig'
+  dockerfile = 'Dockerfile'
 
 [env]
   SQUASH_DATA = '/data'

@@ -164,7 +164,7 @@ func (a *RhoAdapter) Name() string { return "rho" }
 func (a *RhoAdapter) RunBatch(ctx context.Context, req BatchRequest) (*BatchResult, error) {
 	envExports := buildEnvExports(req.EnvVars)
 
-	cmd := fmt.Sprintf("%srho-cli loop --mode build --model %s --output-format stream-json -C %s --plan %s --max-iterations %d 2>/dev/null",
+	cmd := fmt.Sprintf("%srho-cli --tools read,write,edit,bash,glob,grep loop --mode build --model %s --output-format stream-json -C %s --plan %s --max-iterations %d 2>/dev/null",
 		envExports, a.model, req.Workdir, req.Plan, req.MaxTurns)
 
 	_, lines, done, cancel, err := a.exec.ExecBg(cmd, "/", 7200)

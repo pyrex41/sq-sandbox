@@ -157,6 +157,16 @@ func (r *TaskRunner) Run(ctx context.Context) {
 		}
 	}()
 
+	// Ensure bash is available. rho-cli requires /bin/bash.
+	// If bash-real is in /usr/local/bin (from module), create a wrapper.
+	// Otherwise symlink sh as bash (busybox-compatible fallback).
+	r.exec.Exec(`if [ -x /usr/local/bin/bash-real ]; then
+		printf '#!/bin/sh\nLD_LIBRARY_PATH=/usr/local/lib exec /usr/local/bin/bash-real "$@"\n' > /bin/bash
+		chmod +x /bin/bash
+	elif ! [ -x /bin/bash ]; then
+		ln -sf /bin/sh /bin/bash
+	fi`, "/", 5)
+
 	// Detect workdir
 	r.Workdir = r.Spec.Workdir
 	if r.Workdir == "" {

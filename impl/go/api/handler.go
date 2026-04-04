@@ -58,6 +58,14 @@ func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/logs", h.handleLogs)
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/wg/peers", h.handleWGPeers)
 
+	// Task runner — autonomous agent execution
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task", h.handleStartTask)
+	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/task", h.handleGetTask)
+	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/task/events", h.handleTaskEvents)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/pause", h.handlePauseTask)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/resume", h.handleResumeTask)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/kill", h.handleKillTask)
+
 	// Irmin-only endpoints
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/fork", h.handleFork)
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/diff", h.handleDiff)
@@ -263,10 +271,7 @@ func (h *Handler) handleExecBg(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "workdir must be absolute path, no ..", http.StatusBadRequest)
 		return
 	}
-	timeout := intOr(body["timeout"], 7200)
-	if timeout <= 0 {
-		timeout = 7200
-	}
+	timeout := clampTimeout(intOr(body["timeout"], 7200), 1, 86400)
 
 	jobID, err := h.mgr.ExecBg(id, cmd, workdir, timeout)
 	if err != nil {
@@ -282,7 +287,11 @@ func (h *Handler) handleExecBg(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	id := sandboxID(r)
-	jobID := jobIDFromPath(r)
+	jobID, err := jobIDFromPath(r)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	job, err := h.mgr.GetJob(id, jobID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusNotFound)
@@ -298,7 +307,11 @@ func (h *Handler) handleGetJob(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	id := sandboxID(r)
-	jobID := jobIDFromPath(r)
+	jobID, err := jobIDFromPath(r)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	job, err := h.mgr.GetJob(id, jobID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusNotFound)
@@ -355,7 +368,11 @@ func (h *Handler) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleKillJob(w http.ResponseWriter, r *http.Request) {
 	id := sandboxID(r)
-	jobID := jobIDFromPath(r)
+	jobID, err := jobIDFromPath(r)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := h.mgr.KillJob(id, jobID); err != nil {
 		jsonError(w, err.Error(), http.StatusNotFound)
 		return
@@ -363,9 +380,12 @@ func (h *Handler) handleKillJob(w http.ResponseWriter, r *http.Request) {
 	jsonNoContent(w)
 }
 
-func jobIDFromPath(r *http.Request) int {
-	n, _ := strconv.Atoi(r.PathValue("jobId"))
-	return n
+func jobIDFromPath(r *http.Request) (int, error) {
+	n, err := strconv.Atoi(r.PathValue("jobId"))
+	if err != nil {
+		return 0, fmt.Errorf("invalid job_id")
+	}
+	return n, nil
 }
 
 func (h *Handler) handleActivate(w http.ResponseWriter, r *http.Request) {
@@ -492,6 +512,14 @@ func (h *Handler) handleFork(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "source_label and target_id required", http.StatusBadRequest)
 		return
 	}
+	if !validID(targetID) {
+		jsonError(w, "invalid target_id: must be 1-64 alphanumeric/dash/underscore chars", http.StatusBadRequest)
+		return
+	}
+	if !validLabel(sourceLabel) {
+		jsonError(w, "invalid source_label: alphanumeric/dash/underscore/dot only", http.StatusBadRequest)
+		return
+	}
 	if err := h.mgr.Fork(sourceID, sourceLabel, targetID); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -509,6 +537,10 @@ func (h *Handler) handleDiff(w http.ResponseWriter, r *http.Request) {
 	to := r.URL.Query().Get("to")
 	if from == "" || to == "" {
 		jsonError(w, "from and to query params required", http.StatusBadRequest)
+		return
+	}
+	if !validLabel(from) || !validLabel(to) {
+		jsonError(w, "from/to must be alphanumeric/dash/underscore/dot only", http.StatusBadRequest)
 		return
 	}
 	result, err := h.mgr.Diff(id, from, to)

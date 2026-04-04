@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -78,6 +79,21 @@ type Manager struct {
 	jobMu  sync.Mutex
 	jobSeq int
 	jobs   map[string]map[int]*Job // sandboxID → jobID → Job
+
+	taskMu sync.Mutex
+	tasks  map[string]TaskRunner // sandboxID → task runner
+}
+
+// TaskRunner is the interface that runner.TaskRunner satisfies.
+// Defined here to avoid a circular import between manager and runner.
+type TaskRunner interface {
+	Run(ctx context.Context)
+	Status() string
+	State() any
+	Pause()
+	Resume()
+	Kill()
+	EventLog() any // returns *runner.EventLog; typed as any to avoid import cycle
 }
 
 // New returns a new empty Manager.
@@ -85,7 +101,22 @@ func New(cfg *config.Config) *Manager {
 	return &Manager{
 		sandboxes: make(map[string]*Sandbox),
 		cfg:       cfg,
+		tasks:     make(map[string]TaskRunner),
 	}
+}
+
+// SetTask registers a task runner for a sandbox.
+func (m *Manager) SetTask(sandboxID string, t TaskRunner) {
+	m.taskMu.Lock()
+	defer m.taskMu.Unlock()
+	m.tasks[sandboxID] = t
+}
+
+// GetTask returns the task runner for a sandbox, or nil.
+func (m *Manager) GetTask(sandboxID string) TaskRunner {
+	m.taskMu.Lock()
+	defer m.taskMu.Unlock()
+	return m.tasks[sandboxID]
 }
 
 // SandboxCount returns the number of ready sandboxes.
@@ -99,6 +130,17 @@ func (m *Manager) SandboxCount() int {
 		}
 	}
 	return n
+}
+
+// SandboxDir returns the base directory for a sandbox, or "" if not found.
+func (m *Manager) SandboxDir(id string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sandboxes[id]
+	if s == nil {
+		return ""
+	}
+	return s.Dir
 }
 
 // List returns info for all ready sandboxes.
@@ -182,8 +224,17 @@ func (m *Manager) Destroy(id string) error {
 	delete(m.sandboxes, id)
 	m.mu.Unlock()
 
-	// Teardown outside lock.
+	// Teardown outside lock. Write state under per-sandbox lock since
+	// concurrent List/Get may still hold a pointer to s.
+	s.mu.Lock()
 	s.State = "destroying"
+	s.mu.Unlock()
+
+	// Clean up job registry for this sandbox to prevent unbounded memory growth.
+	m.jobMu.Lock()
+	delete(m.jobs, id)
+	m.jobMu.Unlock()
+
 	m.destroySandbox(s)
 	return nil
 }
@@ -326,15 +377,22 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 		return SnapshotResult{}, fmt.Errorf("mkdir snapshots: %w", err)
 	}
 	snapFile := filepath.Join(snapDir, label+".squashfs")
+
+	// Hold per-sandbox lock around the existence check + mksquashfs to prevent
+	// two concurrent snapshot requests with the same label from racing.
+	s.mu.Lock()
 	if _, err := os.Stat(snapFile); err == nil {
+		s.mu.Unlock()
 		return SnapshotResult{}, fmt.Errorf("snapshot exists: %s", label)
 	}
 
 	args := []string{"mksquashfs", s.upperDataDir(), snapFile,
 		"-comp", "gzip", "-b", "256K", "-noappend", "-quiet"}
 	if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+		s.mu.Unlock()
 		return SnapshotResult{}, fmt.Errorf("mksquashfs: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	s.mu.Unlock()
 
 	fi, _ := os.Stat(snapFile)
 	size := int64(0)
@@ -361,16 +419,6 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 		return SandboxInfo{}, fmt.Errorf("label: alphanumeric/dash/underscore/dot only")
 	}
 
-	snapFile := filepath.Join(s.snapshotsDir(), label+".squashfs")
-	if _, err := os.Stat(snapFile); os.IsNotExist(err) {
-		// Try S3 pull.
-		s3Key := "snapshots/" + id + "/" + label + ".squashfs"
-		_ = os.MkdirAll(s.snapshotsDir(), 0755)
-		if err2 := s3Pull(m.cfg, s3Key, snapFile); err2 != nil {
-			return SandboxInfo{}, fmt.Errorf("snapshot not found: %s", label)
-		}
-	}
-
 	// Irmin backend: restore via sidecar (materialises files into upper_data).
 	if m.cfg.SnapshotBackend == "irmin" {
 		c := store.New(m.cfg.StoreSockPath)
@@ -380,7 +428,17 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 		return s.ToInfo(), nil
 	}
 
-	// squashfs backend: unmount overlay, clear upper, mount snapshot, remount overlay.
+	// squashfs backend: ensure snapshot file exists (pull from S3 if needed).
+	snapFile := filepath.Join(s.snapshotsDir(), label+".squashfs")
+	if _, err := os.Stat(snapFile); os.IsNotExist(err) {
+		s3Key := "snapshots/" + id + "/" + label + ".squashfs"
+		_ = os.MkdirAll(s.snapshotsDir(), 0755)
+		if err2 := s3Pull(m.cfg, s3Key, snapFile); err2 != nil {
+			return SandboxInfo{}, fmt.Errorf("snapshot not found: %s", label)
+		}
+	}
+
+	// Unmount overlay, clear upper, mount snapshot, remount overlay.
 	snapMP := filepath.Join(s.imagesDir(), "_snapshot")
 
 	// Unmount overlay.
@@ -786,19 +844,25 @@ func injectSecrets(cfg *config.Config, s *Sandbox) error {
 
 	var lines []string
 	lines = append(lines, "#!/bin/sh")
-	for _, secret := range secretsFile.Secrets {
+	secretNames := make([]string, 0, len(secretsFile.Secrets))
+	for name := range secretsFile.Secrets {
+		secretNames = append(secretNames, name)
+	}
+	sort.Strings(secretNames)
+	for _, name := range secretNames {
+		secret := secretsFile.Secrets[name]
 		if secret.Placeholder != "" {
-			lines = append(lines, fmt.Sprintf("export %s", secret.Placeholder))
+			lines = append(lines, fmt.Sprintf("export %s=%q", name, secret.Placeholder))
 		}
 	}
 
 	// Proxy env vars — sandboxes route outbound traffic through the MITM proxy.
-	// Using 127.0.0.1 (host loopback); sandbox netns shares host network in chroot mode.
+	// With slirp4netns (net=1), the host is reachable as 10.0.2.2 from inside the sandbox.
 	lines = append(lines,
-		"export http_proxy=http://127.0.0.1:8888",
-		"export https_proxy=http://127.0.0.1:8888",
-		"export HTTP_PROXY=http://127.0.0.1:8888",
-		"export HTTPS_PROXY=http://127.0.0.1:8888",
+		"export http_proxy=http://10.0.2.2:8888",
+		"export https_proxy=http://10.0.2.2:8888",
+		"export HTTP_PROXY=http://10.0.2.2:8888",
+		"export HTTPS_PROXY=http://10.0.2.2:8888",
 	)
 
 	if cfg.ProxyHTTPS {
@@ -808,6 +872,20 @@ func injectSecrets(cfg *config.Config, s *Sandbox) error {
 			_ = os.MkdirAll(destCADir, 0755)
 			if caData, err := os.ReadFile(caPath); err == nil {
 				_ = os.WriteFile(filepath.Join(destCADir, "sq-proxy-ca.crt"), caData, 0644)
+
+				// Shadow the system bundle in the upper layer so non-Node clients
+				// trust the proxy CA without needing /etc/profile.d to be sourced.
+				destBundlePath := filepath.Join(s.upperDataDir(), "etc", "ssl", "certs", "ca-certificates.crt")
+				_ = os.MkdirAll(filepath.Dir(destBundlePath), 0755)
+				bundleData, _ := os.ReadFile(filepath.Join(s.mergedDir(), "etc", "ssl", "certs", "ca-certificates.crt"))
+				if len(bundleData) > 0 && bundleData[len(bundleData)-1] != '\n' {
+					bundleData = append(bundleData, '\n')
+				}
+				bundleData = append(bundleData, caData...)
+				if len(bundleData) > 0 && bundleData[len(bundleData)-1] != '\n' {
+					bundleData = append(bundleData, '\n')
+				}
+				_ = os.WriteFile(destBundlePath, bundleData, 0644)
 			}
 			lines = append(lines,
 				"export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/sq-proxy-ca.crt",

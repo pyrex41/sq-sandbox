@@ -46,6 +46,9 @@ func (h *Handler) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	taskID := fmt.Sprintf("task-%s-%d", id, time.Now().Unix())
 	tr := runner.NewTaskRunner(taskID, spec, exec)
 
+	// Wire up snapshotter for automatic snapshots at turn boundaries
+	tr.SetSnapshotter(h.mgr.NewSandboxSnapshotter(id))
+
 	// Register with manager so other endpoints can find it
 	h.mgr.SetTask(id, tr)
 
@@ -168,4 +171,32 @@ func (h *Handler) handleKillTask(w http.ResponseWriter, r *http.Request) {
 	}
 	tr.Kill()
 	jsonOK(w, map[string]string{"status": "killed"})
+}
+
+func (h *Handler) handleTaskSnapshot(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	tr := h.mgr.GetTask(id)
+	if tr == nil {
+		jsonError(w, "no task for sandbox "+id, http.StatusNotFound)
+		return
+	}
+
+	var body struct {
+		Label string `json:"label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		// Generate a label if none provided
+		body.Label = fmt.Sprintf("manual-%d", time.Now().Unix())
+	}
+	if body.Label == "" {
+		body.Label = fmt.Sprintf("manual-%d", time.Now().Unix())
+	}
+
+	// Type-assert to get TakeSnapshot
+	if rt, ok := tr.(*runner.TaskRunner); ok {
+		rt.TakeSnapshot(body.Label, 0)
+		jsonOK(w, map[string]any{"label": body.Label, "snapshots": rt.Snapshots()})
+	} else {
+		jsonError(w, "task does not support snapshots", http.StatusBadRequest)
+	}
 }

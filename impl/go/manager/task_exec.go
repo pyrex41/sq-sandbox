@@ -6,6 +6,24 @@ import (
 	"squashd/runner"
 )
 
+// SandboxSnapshotter adapts Manager.Snapshot to runner.Snapshotter.
+type SandboxSnapshotter struct {
+	mgr       *Manager
+	sandboxID string
+}
+
+func (m *Manager) NewSandboxSnapshotter(sandboxID string) *SandboxSnapshotter {
+	return &SandboxSnapshotter{mgr: m, sandboxID: sandboxID}
+}
+
+func (s *SandboxSnapshotter) Snapshot(label string) (string, int64, error) {
+	result, err := s.mgr.Snapshot(s.sandboxID, label)
+	if err != nil {
+		return "", 0, err
+	}
+	return result.Snapshot, result.Size, nil
+}
+
 // SandboxExecutor adapts the Manager's exec methods to the runner.Executor interface.
 // It runs commands inside a specific sandbox's chroot/bwrap environment.
 type SandboxExecutor struct {

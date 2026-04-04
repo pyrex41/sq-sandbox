@@ -65,6 +65,7 @@ func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/pause", h.handlePauseTask)
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/resume", h.handleResumeTask)
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/kill", h.handleKillTask)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task/snapshot", h.handleTaskSnapshot)
 
 	// Irmin-only endpoints
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/fork", h.handleFork)

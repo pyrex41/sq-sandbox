@@ -24,31 +24,33 @@ const (
 
 // TaskSpec is the input to start an autonomous task in a sandbox.
 type TaskSpec struct {
-	Agent         string            `json:"agent"`
-	Plan          string            `json:"plan"`
-	GitRemote     string            `json:"git_remote"`
-	Branch        string            `json:"branch"`
-	Workdir       string            `json:"workdir"`
-	MaxTurns      int               `json:"max_turns"`
-	MaxBudgetUsd  float64           `json:"max_budget_usd"`
-	TurnsPerBatch int               `json:"turns_per_batch"`
-	EnvVars       map[string]string `json:"env_vars"`
-	IssueKey      string            `json:"issue_key"`
-	GitLabProject string            `json:"gitlab_project"`
+	Agent          string            `json:"agent"`
+	Plan           string            `json:"plan"`
+	GitRemote      string            `json:"git_remote"`
+	Branch         string            `json:"branch"`
+	Workdir        string            `json:"workdir"`
+	MaxTurns       int               `json:"max_turns"`
+	MaxBudgetUsd   float64           `json:"max_budget_usd"`
+	TurnsPerBatch  int               `json:"turns_per_batch"`
+	EnvVars        map[string]string `json:"env_vars"`
+	IssueKey       string            `json:"issue_key"`
+	GitLabProject  string            `json:"gitlab_project"`
+	SnapshotPolicy SnapshotPolicy    `json:"snapshot_policy"`
 }
 
 // TaskState is the queryable snapshot of a running task.
 type TaskState struct {
-	TaskID       string     `json:"task_id"`
-	Status       TaskStatus `json:"status"`
-	TotalTurns   int        `json:"total_turns"`
-	TotalCostUsd float64    `json:"total_cost_usd"`
-	FilesChanged []string   `json:"files_changed,omitempty"`
-	Commits      []Commit   `json:"commits,omitempty"`
-	MRUrl        string     `json:"mr_url,omitempty"`
-	Error        string     `json:"error,omitempty"`
-	StartedAt    time.Time  `json:"started_at"`
-	ElapsedMs    int64      `json:"elapsed_ms"`
+	TaskID       string         `json:"task_id"`
+	Status       TaskStatus     `json:"status"`
+	TotalTurns   int            `json:"total_turns"`
+	TotalCostUsd float64        `json:"total_cost_usd"`
+	FilesChanged []string       `json:"files_changed,omitempty"`
+	Commits      []Commit       `json:"commits,omitempty"`
+	Snapshots    []SnapshotInfo `json:"snapshots,omitempty"`
+	MRUrl        string         `json:"mr_url,omitempty"`
+	Error        string         `json:"error,omitempty"`
+	StartedAt    time.Time      `json:"started_at"`
+	ElapsedMs    int64          `json:"elapsed_ms"`
 }
 
 // TaskRunner is an autonomous task executor.
@@ -58,11 +60,12 @@ type TaskRunner struct {
 	Events  *EventLog
 	Workdir string // resolved workdir
 
-	exec    Executor
-	adapter AgentAdapter
-	gitOps  *GitOps
-	status  atomic.Value
-	cancel  context.CancelFunc
+	exec        Executor
+	snapshotter Snapshotter // nil if snapshots not available
+	adapter     AgentAdapter
+	gitOps      *GitOps
+	status      atomic.Value
+	cancel      context.CancelFunc
 
 	mu         sync.Mutex
 	totalTurns int
@@ -71,6 +74,14 @@ type TaskRunner struct {
 	errMsg     string
 	startedAt  time.Time
 	pauseCh    chan struct{}
+	snapshots  []SnapshotInfo
+}
+
+type SnapshotInfo struct {
+	Label string    `json:"label"`
+	Size  int64     `json:"size"`
+	Batch int       `json:"batch"`
+	Time  time.Time `json:"time"`
 }
 
 // NewTaskRunner creates a runner for the given spec.
@@ -114,8 +125,21 @@ func NewTaskRunner(id string, spec TaskSpec, exec Executor) *TaskRunner {
 		adapter: adapter,
 		pauseCh: make(chan struct{}),
 	}
+	// Default snapshot policy
+	if spec.SnapshotPolicy.EveryNBatches == 0 {
+		spec.SnapshotPolicy.EveryNBatches = 5
+	}
+	if spec.SnapshotPolicy.MaxSnapshots == 0 {
+		spec.SnapshotPolicy.MaxSnapshots = 10
+	}
+
 	r.status.Store(StatusQueued)
 	return r
+}
+
+// SetSnapshotter sets the snapshotter for automatic snapshots at turn boundaries.
+func (r *TaskRunner) SetSnapshotter(s Snapshotter) {
+	r.snapshotter = s
 }
 
 // Run executes the task autonomously. Call this in a goroutine.
@@ -240,6 +264,9 @@ func (r *TaskRunner) Run(ctx context.Context) {
 			"succeeded":   result.Succeeded,
 		})
 
+		// Snapshot at configured intervals
+		r.maybeSnapshot(batch)
+
 		if result.Succeeded {
 			break
 		}
@@ -362,6 +389,9 @@ func (r *TaskRunner) TaskState() TaskState {
 		commits = ws.Commits
 	}
 
+	snaps := make([]SnapshotInfo, len(r.snapshots))
+	copy(snaps, r.snapshots)
+
 	return TaskState{
 		TaskID:       r.ID,
 		Status:       r.StatusEnum(),
@@ -369,6 +399,7 @@ func (r *TaskRunner) TaskState() TaskState {
 		TotalCostUsd: r.totalCost,
 		FilesChanged: files,
 		Commits:      commits,
+		Snapshots:    snaps,
 		MRUrl:        r.mrURL,
 		Error:        r.errMsg,
 		StartedAt:    r.startedAt,
@@ -397,6 +428,51 @@ func (r *TaskRunner) Kill() {
 		r.cancel()
 	}
 	r.Events.Emit("task_complete", map[string]any{"status": "killed"})
+}
+
+func (r *TaskRunner) maybeSnapshot(batch int) {
+	policy := r.Spec.SnapshotPolicy
+	if policy.EveryNBatches <= 0 || r.snapshotter == nil {
+		return
+	}
+	if batch%policy.EveryNBatches != 0 {
+		return
+	}
+
+	label := fmt.Sprintf("%s-batch-%d", r.Spec.IssueKey, batch)
+	r.TakeSnapshot(label, batch)
+}
+
+// TakeSnapshot takes a named snapshot. Can be called externally (on-demand from orchestrator).
+func (r *TaskRunner) TakeSnapshot(label string, batch int) {
+	if r.snapshotter == nil {
+		r.Events.Emit("snapshot_skip", map[string]any{"reason": "no snapshotter"})
+		return
+	}
+
+	_, size, err := r.snapshotter.Snapshot(label)
+	if err != nil {
+		log.Printf("[task %s] snapshot error: %v", r.ID, err)
+		r.Events.Emit("snapshot_error", map[string]any{"label": label, "error": err.Error()})
+		return
+	}
+
+	snap := SnapshotInfo{Label: label, Size: size, Batch: batch, Time: time.Now()}
+	r.mu.Lock()
+	r.snapshots = append(r.snapshots, snap)
+	r.mu.Unlock()
+
+	r.Events.Emit("snapshot", map[string]any{"label": label, "size": size, "batch": batch})
+	log.Printf("[task %s] snapshot: %s (%d bytes)", r.ID, label, size)
+}
+
+// Snapshots returns the list of snapshots taken during this task.
+func (r *TaskRunner) Snapshots() []SnapshotInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]SnapshotInfo, len(r.snapshots))
+	copy(out, r.snapshots)
+	return out
 }
 
 func backoffDuration(attempt int) time.Duration {

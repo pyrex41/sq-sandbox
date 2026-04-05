@@ -39,7 +39,7 @@ func main() {
 	mgr.Recover()
 
 	// Launch HTTPS MITM proxy (checks for secrets.json internally).
-	go proxy.Run(":8888", cfg.DataDir)
+	go proxy.Run(ctx, ":8888", cfg.DataDir)
 
 	// Launch sandbox TTL reaper.
 	go reaper.Run(done, mgr)

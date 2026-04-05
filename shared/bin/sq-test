@@ -78,6 +78,11 @@ result=$(_api POST /cgi-bin/api/sandboxes/test-fs/exec \
 # but the write goes to upper, not the squashfs
 _pass  # overlayfs COW is working if exec succeeded
 
+_log "exec runtime has /proc and /dev"
+result=$(_api POST /cgi-bin/api/sandboxes/test-fs/exec \
+    -d '{"cmd":"test -r /proc/self/status && test -c /dev/null && echo READY"}')
+echo "$result" | jq -r '.stdout' | grep -q "READY" && _pass || _fail "missing /proc or /dev"
+
 _api DELETE /cgi-bin/api/sandboxes/test-fs >/dev/null 2>&1
 
 echo
@@ -159,6 +164,12 @@ if [ -f "$DATA/secrets.json" ]; then
     grep -q "http_proxy" "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
         && _pass || _fail "no http_proxy"
 
+    _log "proxy env sourced during exec"
+    result=$(_api POST /cgi-bin/api/sandboxes/test-sec/exec \
+        -d '{"cmd":"printf \"%s\" \"${HTTPS_PROXY:-}\""}')
+    proxy=$(echo "$result" | jq -r '.stdout' | tr -d '[:space:]')
+    [ "$proxy" = "http://10.0.2.2:8888" ] && _pass || _fail "got $proxy"
+
     _log "proxy CA cert injected into sandbox"
     [ -f "$SANDBOXES/test-sec/upper/data/usr/local/share/ca-certificates/sq-proxy-ca.crt" ] \
         && _pass || _skip "no CA (SQUASH_PROXY_HTTPS not enabled)"
@@ -183,8 +194,21 @@ if [ -f "$DATA/secrets.json" ]; then
         "$SANDBOXES/test-sec/upper/data/etc/profile.d/squash-secrets.sh" 2>/dev/null \
         && _pass || _skip "no REQUESTS_CA_BUNDLE (SQUASH_PROXY_HTTPS not enabled)"
 
+    _log "CA env sourced during exec"
+    if [ "${SQUASH_PROXY_HTTPS:-}" = "1" ]; then
+        result=$(_api POST /cgi-bin/api/sandboxes/test-sec/exec \
+            -d '{"cmd":"printf \"%s|%s\" \"${NODE_EXTRA_CA_CERTS:-}\" \"${SSL_CERT_FILE:-}\""}')
+        ca_env=$(echo "$result" | jq -r '.stdout' | tr -d '[:space:]')
+        [ "$ca_env" = "/usr/local/share/ca-certificates/sq-proxy-ca.crt|/etc/ssl/certs/ca-certificates.crt" ] \
+            && _pass || _fail "got $ca_env"
+    else
+        _skip "no CA env expected (SQUASH_PROXY_HTTPS not enabled)"
+    fi
+
     _api DELETE /cgi-bin/api/sandboxes/test-sec >/dev/null 2>&1
 else
+    _skip "no secrets.json"
+    _skip "no secrets.json"
     _skip "no secrets.json"
     _skip "no secrets.json"
     _skip "no secrets.json"

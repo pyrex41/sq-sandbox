@@ -13,6 +13,8 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -75,16 +77,16 @@ type SecretsFile struct {
 	Secrets map[string]Secret `json:"secrets"`
 }
 
-func loadSecrets(path string) *SecretsFile {
+func loadSecrets(path string) (*SecretsFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalf("cannot read secrets file: %v", err)
+		return nil, fmt.Errorf("cannot read secrets file: %w", err)
 	}
 	var sf SecretsFile
 	if err := json.Unmarshal(data, &sf); err != nil {
-		log.Fatalf("cannot parse secrets file: %v", err)
+		return nil, fmt.Errorf("cannot parse secrets file: %w", err)
 	}
-	return &sf
+	return &sf, nil
 }
 
 // hostAllowed checks if a hostname is in any secret's allowed_hosts list.
@@ -101,28 +103,28 @@ func (sf *SecretsFile) hostAllowed(host string) bool {
 
 // ── CA + cert generation ─────────────────────────────────────────────
 
-func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey) {
+func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	certPEM, err := os.ReadFile(dir + "/ca.crt")
 	if err != nil {
-		log.Fatalf("cannot read CA cert: %v", err)
+		return nil, nil, fmt.Errorf("cannot read CA cert: %w", err)
 	}
 	keyPEM, err := os.ReadFile(dir + "/ca.key")
 	if err != nil {
-		log.Fatalf("cannot read CA key: %v", err)
+		return nil, nil, fmt.Errorf("cannot read CA key: %w", err)
 	}
 
 	certBlock, _ := pem.Decode(certPEM)
 	if certBlock == nil {
-		log.Fatal("cannot decode CA cert PEM")
+		return nil, nil, fmt.Errorf("cannot decode CA cert PEM")
 	}
 	caCert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
-		log.Fatalf("cannot parse CA cert: %v", err)
+		return nil, nil, fmt.Errorf("cannot parse CA cert: %w", err)
 	}
 
 	keyBlock, _ := pem.Decode(keyPEM)
 	if keyBlock == nil {
-		log.Fatal("cannot decode CA key PEM")
+		return nil, nil, fmt.Errorf("cannot decode CA key PEM")
 	}
 
 	// Try PKCS#8 first (OpenSSL default for EC keys), fall back to SEC 1
@@ -131,15 +133,15 @@ func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey) {
 		var ok bool
 		caKey, ok = key.(*ecdsa.PrivateKey)
 		if !ok {
-			log.Fatal("CA key is not ECDSA")
+			return nil, nil, fmt.Errorf("CA key is not ECDSA")
 		}
 	} else if key, err := x509.ParseECPrivateKey(keyBlock.Bytes); err == nil {
 		caKey = key
 	} else {
-		log.Fatalf("cannot parse CA key: %v", err)
+		return nil, nil, fmt.Errorf("cannot parse CA key: %w", err)
 	}
 
-	return caCert, caKey
+	return caCert, caKey, nil
 }
 
 // certCache is a bounded LRU-ish cert cache. When full, it's cleared entirely
@@ -159,9 +161,20 @@ func newCertCache(maxSize int) *certCache {
 
 func (c *certCache) get(host string) (*tls.Certificate, bool) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	cert, ok := c.certs[host]
-	return cert, ok
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	// Evict expired certs so we don't serve them past their 24h validity.
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil || time.Now().After(leaf.NotAfter) {
+		c.mu.Lock()
+		delete(c.certs, host)
+		c.mu.Unlock()
+		return nil, false
+	}
+	return cert, true
 }
 
 func (c *certCache) put(host string, cert *tls.Certificate) {
@@ -392,16 +405,29 @@ func (p *ProxyHandler) tlsMITM(clientConn net.Conn, host, hostPort string) {
 		req.URL.Host = hostPort
 		req.RequestURI = ""
 
-		// Limit request body
+		// Buffer request body so Go's transport can retry on stale connections.
+		// Without GetBody, a retry after connection loss fails with
+		// "net/http: cannot rewind body after connection loss".
 		if req.Body != nil {
-			req.Body = io.NopCloser(io.LimitReader(req.Body, maxRequestBody))
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(req.Body, maxRequestBody))
+			req.Body.Close()
+			if readErr != nil {
+				log.Printf("read body error for %s: %v", host, readErr)
+				tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+				return
+			}
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			req.ContentLength = int64(len(bodyBytes))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
 		}
 
 		p.replaceHeaders(req, host)
 		stripHopByHop(req.Header)
 
-		// Set write deadline for sending response back
-		tlsConn.SetWriteDeadline(time.Now().Add(connReadTimeout))
+		// Long write deadline — streaming API responses can take minutes.
+		tlsConn.SetWriteDeadline(time.Now().Add(20 * time.Minute))
 
 		resp, err := http.DefaultTransport.RoundTrip(req)
 		if err != nil {
@@ -526,22 +552,22 @@ func replaceInHeader(v, placeholder, value, host string, allowedHosts []string) 
 // ── Main ─────────────────────────────────────────────────────────────
 
 // ensureCA generates a self-signed ECDSA CA if ca.crt/ca.key don't exist yet.
-func ensureCA(dir string) {
+func ensureCA(dir string) error {
 	certPath := dir + "/ca.crt"
 	keyPath := dir + "/ca.key"
 
 	if _, err := os.Stat(certPath); err == nil {
-		return // already exists
+		return nil // already exists
 	}
 
 	log.Printf("generating CA certificate in %s", dir)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		log.Fatalf("cannot create CA dir: %v", err)
+		return fmt.Errorf("cannot create CA dir: %w", err)
 	}
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		log.Fatalf("cannot generate CA key: %v", err)
+		return fmt.Errorf("cannot generate CA key: %w", err)
 	}
 
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
@@ -557,34 +583,35 @@ func ensureCA(dir string) {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &caKey.PublicKey, caKey)
 	if err != nil {
-		log.Fatalf("cannot create CA cert: %v", err)
+		return fmt.Errorf("cannot create CA cert: %w", err)
 	}
 
 	certOut, err := os.Create(certPath)
 	if err != nil {
-		log.Fatalf("cannot write CA cert: %v", err)
+		return fmt.Errorf("cannot write CA cert: %w", err)
 	}
 	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	certOut.Close()
 
 	keyBytes, err := x509.MarshalECPrivateKey(caKey)
 	if err != nil {
-		log.Fatalf("cannot marshal CA key: %v", err)
+		return fmt.Errorf("cannot marshal CA key: %w", err)
 	}
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		log.Fatalf("cannot write CA key: %v", err)
+		return fmt.Errorf("cannot write CA key: %w", err)
 	}
 	pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 	keyOut.Close()
 
 	log.Printf("CA certificate generated")
+	return nil
 }
 
 // Run starts the HTTPS MITM proxy on listenAddr, using secrets and CA from dataDir.
-// It blocks until the server fails; intended to be run in a goroutine.
+// It blocks until the server fails or ctx is cancelled; intended to be run in a goroutine.
 // If no secrets.json exists in dataDir, it logs and returns without starting.
-func Run(listenAddr, dataDir string) {
+func Run(ctx context.Context, listenAddr, dataDir string) {
 	secretsFile := dataDir + "/secrets.json"
 	if _, err := os.Stat(secretsFile); os.IsNotExist(err) {
 		log.Printf("proxy: no secrets.json at %s, skipping proxy startup", secretsFile)
@@ -592,9 +619,20 @@ func Run(listenAddr, dataDir string) {
 	}
 
 	caDir := dataDir + "/proxy-ca"
-	ensureCA(caDir)
-	secrets := loadSecrets(secretsFile)
-	caCert, caKey := loadCA(caDir)
+	if err := ensureCA(caDir); err != nil {
+		log.Printf("proxy: %v", err)
+		return
+	}
+	secrets, err := loadSecrets(secretsFile)
+	if err != nil {
+		log.Printf("proxy: %v", err)
+		return
+	}
+	caCert, caKey, err := loadCA(caDir)
+	if err != nil {
+		log.Printf("proxy: %v", err)
+		return
+	}
 
 	handler := &ProxyHandler{
 		secrets:   secrets,
@@ -610,6 +648,14 @@ func Run(listenAddr, dataDir string) {
 		WriteTimeout: 0, // disabled — CONNECT hijacks bypass this anyway
 		IdleTimeout:  connIdleTimeout,
 	}
+
+	// Graceful shutdown when context is cancelled.
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
 
 	log.Printf("proxy: starting on %s (%d secrets configured)", listenAddr, len(secrets.Secrets))
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

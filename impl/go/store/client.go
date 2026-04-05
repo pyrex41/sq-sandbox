@@ -13,7 +13,10 @@ import (
 	"time"
 )
 
-const dialTimeout = 5 * time.Second
+const (
+	dialTimeout = 5 * time.Second
+	readTimeout = 5 * time.Minute // max time to wait for sidecar response
+)
 
 // SnapshotResult is the response from an "snapshot" op.
 type SnapshotResult struct {
@@ -149,8 +152,12 @@ func (c *Client) do(req any, out any) error {
 		return fmt.Errorf("sq-store send: %w", err)
 	}
 
-	// Read one line response.
+	// Set read deadline so we don't hang forever if the sidecar stalls.
+	conn.SetDeadline(time.Now().Add(readTimeout))
+
+	// Read one line response. Use a larger buffer for diff responses with many paths.
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
 			return fmt.Errorf("sq-store read: %w", err)

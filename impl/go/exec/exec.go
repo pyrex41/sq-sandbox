@@ -30,7 +30,7 @@ type Result struct {
 // sq-exec handles isolation (bubblewrap/unshare+chroot), timeout enforcement,
 // network namespace lookup, and seccomp — the daemon just orchestrates.
 //
-// argv: sq-exec <merged> <cmd> <workdir> <timeout_s>
+// argv: sq-exec <merged> <cmd> <workdir> <timeout_s> [net]
 func Run(merged, cmd, workdir string, timeoutS int) (*Result, error) {
 	if timeoutS <= 0 {
 		timeoutS = 300
@@ -42,6 +42,7 @@ func Run(merged, cmd, workdir string, timeoutS int) (*Result, error) {
 		cmd,
 		workdir,
 		fmt.Sprintf("%d", timeoutS),
+		"1", // net=1: enable slirp4netns so sandbox can reach MITM proxy
 	}
 
 	c := exec.Command(args[0], args[1:]...)
@@ -157,6 +158,7 @@ func RunBg(merged, cmd, workdir string, timeoutS int, onLine func(string)) (canc
 		cmd,
 		workdir,
 		fmt.Sprintf("%d", timeoutS),
+		"1", // net=1: enable slirp4netns so sandbox can reach MITM proxy
 	}
 
 	c := exec.Command(args[0], args[1:]...)
@@ -174,6 +176,8 @@ func RunBg(merged, cmd, workdir string, timeoutS int, onLine func(string)) (canc
 	}
 
 	if err := c.Start(); err != nil {
+		stdoutPipe.Close()
+		stderrPipe.Close()
 		onLine("spawn error: " + err.Error())
 		go func() { ch <- 126 }()
 		return func() {}, ch

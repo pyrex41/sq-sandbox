@@ -896,5 +896,22 @@ func injectSecrets(cfg *config.Config, s *Sandbox) error {
 	}
 
 	script := strings.Join(lines, "\n") + "\n"
-	return os.WriteFile(filepath.Join(profileDir, "squash-secrets.sh"), []byte(script), 0644)
+	if err := os.WriteFile(filepath.Join(profileDir, "squash-secrets.sh"), []byte(script), 0644); err != nil {
+		return err
+	}
+
+	// Pre-create resolv.conf in the upper layer so bwrap doesn't need --ro-bind
+	// for it (which fails when /etc/ already exists in the overlay from above).
+	// For net=1 sandboxes, sq-exec will overwrite this with slirp4netns DNS.
+	// For net=0, the host's resolv.conf is a reasonable default.
+	resolvDir := filepath.Join(s.upperDataDir(), "etc")
+	resolvPath := filepath.Join(resolvDir, "resolv.conf")
+	if _, err := os.Stat(resolvPath); os.IsNotExist(err) {
+		hostResolv, _ := os.ReadFile("/etc/resolv.conf")
+		if len(hostResolv) > 0 {
+			_ = os.WriteFile(resolvPath, hostResolv, 0644)
+		}
+	}
+
+	return nil
 }

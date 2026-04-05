@@ -292,6 +292,26 @@ func (r *TaskRunner) Run(ctx context.Context) {
 }
 
 func (r *TaskRunner) setupWorkspace() error {
+	// Ensure workspace directory exists
+	r.exec.Exec("mkdir -p "+r.Workdir, "/", 5)
+
+	// Check if the workdir is already a git repo; if not, clone from remote
+	result, _ := r.exec.Exec("git rev-parse --git-dir", r.Workdir, 5)
+	if result == nil || result.ExitCode != 0 {
+		if r.Spec.GitRemote != "" {
+			r.Events.Emit("git_clone", map[string]any{"remote": "***", "workdir": r.Workdir})
+			cloneResult, err := r.exec.Exec(
+				fmt.Sprintf("GIT_SSL_NO_VERIFY=1 git clone %q %s", r.Spec.GitRemote, r.Workdir),
+				"/", 300)
+			if err != nil {
+				return fmt.Errorf("git clone: %w", err)
+			}
+			if cloneResult.ExitCode != 0 {
+				return fmt.Errorf("git clone: exit %d: %s", cloneResult.ExitCode, cloneResult.Stderr)
+			}
+		}
+	}
+
 	r.gitOps = NewGitOps(r.exec, r.Workdir, r.Spec.GitRemote, r.Spec.Branch)
 
 	r.Events.Emit("git_pull", nil)

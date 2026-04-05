@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -183,10 +184,34 @@ func (r *TaskRunner) Run(ctx context.Context) {
 
 	// Write plan
 	planPath := "/workspace/IMPLEMENTATION_PLAN.md"
-	_, err := r.exec.Exec(fmt.Sprintf("cat > %s << 'PLAN_EOF'\n%s\nPLAN_EOF", planPath, r.Spec.Plan), "/", 10)
+	plan := r.Spec.Plan
+
+	// For rho agents: ensure plan uses [TODO] markers that rho's loop expects.
+	// If the plan doesn't already contain [TODO], wrap each numbered step.
+	if strings.HasPrefix(r.Spec.Agent, "rho") && !strings.Contains(plan, "[TODO]") {
+		plan = formatPlanForRho(plan)
+	}
+
+	_, err := r.exec.Exec(fmt.Sprintf("cat > %s << 'PLAN_EOF'\n%s\nPLAN_EOF", planPath, plan), "/", 10)
 	if err != nil {
 		r.fail(fmt.Sprintf("write plan: %v", err))
 		return
+	}
+
+	// For rho agents: write a RHO.md with validation commands if not present
+	if strings.HasPrefix(r.Spec.Agent, "rho") {
+		r.exec.Exec(fmt.Sprintf(`[ -f %s/RHO.md ] || cat > %s/RHO.md << 'RHO_EOF'
+# RHO Configuration
+
+## Validation
+No validation commands configured.
+
+## Instructions
+- Work in %s
+- Use bash tool for shell commands
+- Use git to commit changes when done
+- Do NOT write .stop — just complete all [TODO] tasks
+RHO_EOF`, r.Workdir, r.Workdir, r.Workdir), "/", 5)
 	}
 
 	// Main turn loop
@@ -301,8 +326,8 @@ func (r *TaskRunner) setupWorkspace() error {
 		if r.Spec.GitRemote != "" {
 			r.Events.Emit("git_clone", map[string]any{"remote": "***", "workdir": r.Workdir})
 			cloneResult, err := r.exec.Exec(
-				fmt.Sprintf("GIT_SSL_NO_VERIFY=1 git clone %q %s", r.Spec.GitRemote, r.Workdir),
-				"/", 300)
+				fmt.Sprintf("GIT_SSL_NO_VERIFY=1 git clone --depth 50 %q %s", r.Spec.GitRemote, r.Workdir),
+				"/", 600)
 			if err != nil {
 				return fmt.Errorf("git clone: %w", err)
 			}
@@ -503,6 +528,49 @@ func (r *TaskRunner) Snapshots() []SnapshotInfo {
 	out := make([]SnapshotInfo, len(r.snapshots))
 	copy(out, r.snapshots)
 	return out
+}
+
+// formatPlanForRho transforms a plain plan into rho's expected format
+// with [TODO] markers on each numbered step.
+func formatPlanForRho(plan string) string {
+	var out strings.Builder
+	lines := strings.Split(plan, "\n")
+	inTasks := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect numbered steps: "1. ...", "2. ...", "- ..."
+		isStep := false
+		if len(trimmed) >= 3 {
+			if trimmed[0] >= '1' && trimmed[0] <= '9' && trimmed[1] == '.' {
+				isStep = true
+			}
+			if trimmed[0] == '-' && trimmed[1] == ' ' {
+				isStep = true
+			}
+		}
+
+		if isStep && !strings.Contains(trimmed, "[TODO]") && !strings.Contains(trimmed, "[DONE]") && !strings.Contains(trimmed, "[CURRENT]") {
+			inTasks = true
+			// Insert [TODO] before the step content
+			if trimmed[0] >= '1' && trimmed[0] <= '9' {
+				// "1. Do something" → "### [TODO] 1. Do something"
+				out.WriteString("### [TODO] " + trimmed + "\n")
+			} else {
+				out.WriteString("### [TODO] " + trimmed[2:] + "\n")
+			}
+		} else {
+			// Add "## Tasks" header before first task if not present
+			if isStep && !inTasks {
+				out.WriteString("\n## Tasks\n\n")
+				inTasks = true
+			}
+			out.WriteString(line + "\n")
+		}
+	}
+
+	return out.String()
 }
 
 func backoffDuration(attempt int) time.Duration {

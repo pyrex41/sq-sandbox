@@ -96,7 +96,7 @@ func (g *GitOps) AutoCommit(issueKey string) (string, error) {
 func (g *GitOps) Push() error {
 	cmd := fmt.Sprintf("git remote set-url origin %q && GIT_SSL_NO_VERIFY=1 git push -u origin %s",
 		g.remote, g.branch)
-	result, err := g.exec.Exec(cmd, g.workdir, 120)
+	result, err := g.exec.Exec(cmd, g.workdir, 600)
 	if err != nil {
 		return fmt.Errorf("git push: %w", err)
 	}

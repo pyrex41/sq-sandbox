@@ -101,6 +101,16 @@ func (a *ClaudeAdapter) parseClaudeLine(line string, result *BatchResult) {
 			a.events.Emit("session_start", map[string]any{"session_id": sid})
 		}
 
+	case "rate_limit_event":
+		info, _ := raw["rate_limit_info"].(map[string]any)
+		if info != nil {
+			status, _ := info["status"].(string)
+			limitType, _ := info["rateLimitType"].(string)
+			a.events.Emit("rate_limited", map[string]any{
+				"status": status, "type": limitType,
+			})
+		}
+
 	case "stream_event":
 		ev, _ := raw["event"].(map[string]any)
 		if ev == nil {
@@ -138,12 +148,19 @@ func (a *ClaudeAdapter) parseClaudeLine(line string, result *BatchResult) {
 	case "result":
 		sub, _ := raw["subtype"].(string)
 		cost, _ := raw["total_cost_usd"].(float64)
+		isError, _ := raw["is_error"].(bool)
 		result.CostUsd = cost
-		if sub == "success" {
+		if sub == "success" && !isError && cost > 0 {
 			result.Succeeded = true
 		}
+		// Rate-limited / out of credits: cost=0, is_error=true
+		if cost == 0 && isError {
+			a.events.Emit("error", map[string]any{
+				"message": "Claude returned with zero cost — likely rate-limited or out of credits",
+			})
+		}
 		a.events.Emit("batch_done", map[string]any{
-			"subtype": sub, "cost_usd": cost, "turns": result.TurnsUsed,
+			"subtype": sub, "cost_usd": cost, "turns": result.TurnsUsed, "is_error": isError,
 		})
 	}
 }

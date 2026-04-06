@@ -46,13 +46,14 @@ func (a *ClaudeAdapter) RunBatch(ctx context.Context, req BatchRequest) (*BatchR
 	// Build the shell command with env exports + claude invocation
 	envExports := buildEnvExports(req.EnvVars)
 
-	args := fmt.Sprintf("claude -p %s --output-format stream-json --verbose --max-turns %d",
-		req.Plan, req.MaxTurns)
+	allowedTools := `"Bash,Read,Write,Edit,Glob,Grep,Agent"`
+	args := fmt.Sprintf("claude -p %s --output-format stream-json --verbose --max-turns %d --allowedTools %s",
+		req.Plan, req.MaxTurns, allowedTools)
 	if req.SessionID != "" {
 		args += " --resume " + req.SessionID
 	}
 
-	cmd := fmt.Sprintf("cd %s && %s%s 2>/dev/null", req.Workdir, envExports, args)
+	cmd := fmt.Sprintf("cd %s && %s%s", req.Workdir, envExports, args)
 
 	// Run as background job so we can stream output
 	_, lines, done, cancel, err := a.exec.ExecBg(cmd, "/", 7200)

@@ -121,7 +121,7 @@ func (g *GitOps) CreateDraftMR(gitlabURL, project, title, description string) (s
 	body := map[string]any{
 		"source_branch":        g.branch,
 		"target_branch":        "main",
-		"title":                "Draft: " + title,
+		"title":                title,
 		"description":          description,
 		"labels":               "agent-generated",
 		"remove_source_branch": true,

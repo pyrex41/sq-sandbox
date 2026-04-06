@@ -380,8 +380,41 @@ func (r *TaskRunner) finalize() {
 	r.Events.Emit("creating_mr", nil)
 	gitlabURL := GitLabURLFromRemote(r.Spec.GitRemote)
 	project := r.Spec.GitLabProject
-	title := fmt.Sprintf("%s: agent implementation", r.Spec.IssueKey)
-	desc := fmt.Sprintf("## Automated by fg-claude-bot\n\nJira: %s\n\nGenerated autonomously. **Review carefully.**", r.Spec.IssueKey)
+
+	// Build MR title from the first commit message, or fall back to issue key
+	title := r.Spec.IssueKey
+	commitLog, _ := r.exec.Exec("git log --oneline main..HEAD", r.Workdir, 5)
+	if commitLog != nil && commitLog.Stdout != "" {
+		lines := strings.Split(strings.TrimSpace(commitLog.Stdout), "\n")
+		if len(lines) > 0 {
+			// First commit message (after SHA) becomes the title
+			parts := strings.SplitN(lines[0], " ", 2)
+			if len(parts) > 1 {
+				title = parts[1]
+			}
+		}
+	}
+
+	// Build MR description with summary, diff stats, and context
+	var descParts []string
+	descParts = append(descParts, fmt.Sprintf("## Summary\n\nAutomated fix for [%s](https://facilitygrid.atlassian.net/browse/%s).",
+		r.Spec.IssueKey, r.Spec.IssueKey))
+
+	// Add commit list
+	if commitLog != nil && commitLog.Stdout != "" {
+		descParts = append(descParts, fmt.Sprintf("## Commits\n\n```\n%s\n```", strings.TrimSpace(commitLog.Stdout)))
+	}
+
+	// Add diff stats
+	diffStat, _ := r.exec.Exec("git diff --stat main..HEAD", r.Workdir, 5)
+	if diffStat != nil && diffStat.Stdout != "" {
+		descParts = append(descParts, fmt.Sprintf("## Changes\n\n```\n%s\n```", strings.TrimSpace(diffStat.Stdout)))
+	}
+
+	descParts = append(descParts, "## Test plan\n\n- [ ] Verify loading behavior on page navigation\n- [ ] Verify initial page load still shows splash briefly\n- [ ] Verify login/logout still shows full-screen loader")
+	descParts = append(descParts, "---\n\n🤖 Generated with [fg-claude-bot](https://github.com/facilitygrid/fg-claude-bot)")
+
+	desc := strings.Join(descParts, "\n\n")
 
 	mrURL, err := r.gitOps.CreateDraftMR(gitlabURL, project, title, desc)
 	if err != nil {

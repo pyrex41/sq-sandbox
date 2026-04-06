@@ -214,6 +214,12 @@ No validation commands configured.
 RHO_EOF`, r.Workdir, r.Workdir, r.Workdir), "/", 5)
 	}
 
+	// Ensure runner artifacts don't get committed.
+	// Write a .gitignore entry for them (appends if not already present).
+	r.exec.Exec(fmt.Sprintf(
+		`cd %s && for f in RHO.md .stop IMPLEMENTATION_PLAN.md; do grep -qxF "$f" .gitignore 2>/dev/null || echo "$f" >> .gitignore; done`,
+		r.Workdir), "/", 5)
+
 	// Main turn loop
 	var sessionID string
 	for batch := 1; ; batch++ {

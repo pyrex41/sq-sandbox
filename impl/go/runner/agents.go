@@ -46,11 +46,14 @@ func (a *ClaudeAdapter) RunBatch(ctx context.Context, req BatchRequest) (*BatchR
 	// Build the shell command with env exports + claude invocation
 	envExports := buildEnvExports(req.EnvVars)
 
-	allowedTools := `"Bash,Read,Write,Edit,Glob,Grep,Agent"`
-	args := fmt.Sprintf("claude -p %s --output-format stream-json --verbose --max-turns %d --allowedTools %s",
-		req.Plan, req.MaxTurns, allowedTools)
+	var args string
 	if req.SessionID != "" {
-		args += " --resume " + req.SessionID
+		args = fmt.Sprintf(`claude -p --resume %s --output-format stream-json --verbose --max-turns %d --allowedTools \"Bash,Read,Write,Edit,Glob,Grep,Agent\"`,
+			req.SessionID, req.MaxTurns)
+	} else {
+		// Pipe plan as prompt via stdin; allowedTools with escaped quotes for sh -c
+		args = fmt.Sprintf(`cat %s | claude -p --output-format stream-json --verbose --max-turns %d --allowedTools \"Bash,Read,Write,Edit,Glob,Grep,Agent\"`,
+			req.Plan, req.MaxTurns)
 	}
 
 	cmd := fmt.Sprintf("cd %s && %s%s", req.Workdir, envExports, args)

@@ -313,6 +313,16 @@ RHO_EOF`, r.Workdir, r.Workdir, r.Workdir), "/", 5)
 		}
 
 		if result.ExitCode != 0 {
+			// Check if the agent made commits despite the non-zero exit.
+			// Claude exits 1 when any tool returns non-zero, even if the task succeeded.
+			// If there are commits on the branch, proceed to finalize instead of failing.
+			ws, _ := InspectWorkspace(r.exec, r.Workdir)
+			if ws != nil && len(ws.Commits) > 0 {
+				r.Events.Emit("exit_with_commits", map[string]any{
+					"exit_code": result.ExitCode, "commits": len(ws.Commits),
+				})
+				break
+			}
 			r.fail(fmt.Sprintf("agent exited %d", result.ExitCode))
 			return
 		}

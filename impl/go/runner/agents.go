@@ -46,15 +46,20 @@ func (a *ClaudeAdapter) RunBatch(ctx context.Context, req BatchRequest) (*BatchR
 	// Build the shell command with env exports + claude invocation
 	envExports := buildEnvExports(req.EnvVars)
 
-	var args string
+	// Write a settings file that pre-approves all tools, then use --permission-mode dontAsk.
+	// This avoids shell quoting issues with --allowedTools through sq-exec's sh -c layers.
+	settingsCmd := `echo '{"permissions":{"allow":["Bash","Read","Write","Edit","Glob","Grep","Agent"]}}' > /tmp/.claude-settings.json`
+
+	var claudeArgs string
 	if req.SessionID != "" {
-		args = fmt.Sprintf(`claude -p --resume %s --output-format stream-json --verbose --max-turns %d --allowedTools \"Bash,Read,Write,Edit,Glob,Grep,Agent\"`,
+		claudeArgs = fmt.Sprintf("claude -p --resume %s --output-format stream-json --verbose --max-turns %d --permission-mode dontAsk --settings /tmp/.claude-settings.json",
 			req.SessionID, req.MaxTurns)
 	} else {
-		// Pipe plan as prompt via stdin; allowedTools with escaped quotes for sh -c
-		args = fmt.Sprintf(`cat %s | claude -p --output-format stream-json --verbose --max-turns %d --allowedTools \"Bash,Read,Write,Edit,Glob,Grep,Agent\"`,
+		claudeArgs = fmt.Sprintf("cat %s | claude -p --output-format stream-json --verbose --max-turns %d --permission-mode dontAsk --settings /tmp/.claude-settings.json",
 			req.Plan, req.MaxTurns)
 	}
+
+	args := fmt.Sprintf("%s && %s", settingsCmd, claudeArgs)
 
 	cmd := fmt.Sprintf("cd %s && %s%s", req.Workdir, envExports, args)
 

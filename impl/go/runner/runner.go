@@ -363,6 +363,9 @@ func (r *TaskRunner) setupWorkspace() error {
 }
 
 func (r *TaskRunner) finalize() {
+	// Restore .gitignore to avoid committing runner artifact entries
+	r.exec.Exec("git checkout -- .gitignore", r.Workdir, 5)
+
 	r.Events.Emit("auto_commit", nil)
 	sha, err := r.gitOps.AutoCommit(r.Spec.IssueKey)
 	if err != nil {
@@ -391,13 +394,25 @@ func (r *TaskRunner) finalize() {
 	gitlabURL := GitLabURLFromRemote(r.Spec.GitRemote)
 	project := r.Spec.GitLabProject
 
-	// Build MR title from the first commit message, or fall back to issue key
+	// Build MR title from the oldest non-auto-commit message on the branch.
+	// Claude's commit (conventional format) is preferred over the runner's auto-commit.
 	title := r.Spec.IssueKey
-	commitLog, _ := r.exec.Exec("git log --oneline main..HEAD", r.Workdir, 5)
+	commitLog, _ := r.exec.Exec("git log --oneline --reverse main..HEAD", r.Workdir, 5)
 	if commitLog != nil && commitLog.Stdout != "" {
 		lines := strings.Split(strings.TrimSpace(commitLog.Stdout), "\n")
-		if len(lines) > 0 {
-			// First commit message (after SHA) becomes the title
+		for _, line := range lines {
+			parts := strings.SplitN(line, " ", 2)
+			if len(parts) > 1 {
+				msg := parts[1]
+				// Skip generic auto-commit messages
+				if !strings.Contains(msg, "agent implementation") {
+					title = msg
+					break
+				}
+			}
+		}
+		// Fallback to first commit if all are auto-commits
+		if title == r.Spec.IssueKey && len(lines) > 0 {
 			parts := strings.SplitN(lines[0], " ", 2)
 			if len(parts) > 1 {
 				title = parts[1]

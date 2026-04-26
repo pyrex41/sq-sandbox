@@ -96,17 +96,30 @@ All endpoints live under `/cgi-bin/`. If `SQUASH_AUTH_TOKEN` is set, include
 `Authorization: Bearer <token>` on all requests.
 
 ```
-GET    /cgi-bin/health                      {"status":"ok"}
-GET    /cgi-bin/api/sandboxes               list all
-POST   /cgi-bin/api/sandboxes               create
-GET    /cgi-bin/api/sandboxes/:id           info
-DELETE /cgi-bin/api/sandboxes/:id           destroy
-POST   /cgi-bin/api/sandboxes/:id/exec      run command
-POST   /cgi-bin/api/sandboxes/:id/activate  add module layer
-POST   /cgi-bin/api/sandboxes/:id/snapshot  checkpoint upper layer
-POST   /cgi-bin/api/sandboxes/:id/restore   restore from checkpoint
-GET    /cgi-bin/api/sandboxes/:id/logs      execution history
-GET    /cgi-bin/api/modules                 available modules
+GET    /cgi-bin/health                              {"status":"ok"}
+GET    /cgi-bin/api/sandboxes                       list all
+POST   /cgi-bin/api/sandboxes                       create
+GET    /cgi-bin/api/sandboxes/:id                   info
+DELETE /cgi-bin/api/sandboxes/:id                   destroy
+POST   /cgi-bin/api/sandboxes/:id/exec              run command (sync)
+POST   /cgi-bin/api/sandboxes/:id/exec-bg           run command (async, returns jobId)
+GET    /cgi-bin/api/sandboxes/:id/jobs/:jobId       job status
+GET    /cgi-bin/api/sandboxes/:id/jobs/:jobId/logs  job logs (SSE)
+DELETE /cgi-bin/api/sandboxes/:id/jobs/:jobId       kill job
+POST   /cgi-bin/api/sandboxes/:id/activate          add module layer
+POST   /cgi-bin/api/sandboxes/:id/snapshot          checkpoint upper layer
+POST   /cgi-bin/api/sandboxes/:id/restore           restore from checkpoint
+POST   /cgi-bin/api/sandboxes/:id/fork              clone sandbox state
+GET    /cgi-bin/api/sandboxes/:id/diff              upper-layer diff
+GET    /cgi-bin/api/sandboxes/:id/logs              execution history
+POST   /cgi-bin/api/sandboxes/:id/task              start autonomous task
+GET    /cgi-bin/api/sandboxes/:id/task              task status
+GET    /cgi-bin/api/sandboxes/:id/task/events       SSE event stream
+POST   /cgi-bin/api/sandboxes/:id/task/pause        pause turn loop
+POST   /cgi-bin/api/sandboxes/:id/task/resume       resume turn loop
+POST   /cgi-bin/api/sandboxes/:id/task/kill         kill task
+POST   /cgi-bin/api/sandboxes/:id/task/snapshot     on-demand task snapshot
+GET    /cgi-bin/api/modules                         available modules
 ```
 
 ### Create
@@ -149,6 +162,66 @@ Only `id` and `layers` are required. Defaults: `cpu=2`, `memory_mb=1024`,
 // POST .../restore   — mount snapshot as layer, clear upper, remount
 {"label": "my-checkpoint"}
 ```
+
+### Autonomous Task Runner
+
+Sandboxes can run a long-lived agent task with a built-in turn loop —
+useful for driving Claude Code, rho-cli, or any agent CLI through a
+multi-iteration plan without round-trips through the API per turn.
+
+```json
+// POST /cgi-bin/api/sandboxes/dev/task
+{
+    "agent": "claude",                  // "claude" | "rho"
+    "plan": "/workspace/PLAN.md",
+    "workdir": "/workspace/repo",
+    "git_remote": "https://oauth2:${TOKEN}@gitlab.example.com/org/repo.git",
+    "branch": "agent/issue-123",
+    "issue_key": "PROJ-184",
+    "gitlab_project": "org/repo",
+    "max_turns": 40,
+    "turns_per_batch": 8,
+    "max_budget_usd": 5.0,
+    "env_vars": {"ANTHROPIC_API_KEY": "sk-..."},
+    "snapshot_policy": {
+        "every_n_batches": 1,           // 0 = disabled, default 5
+        "max_snapshots": 10
+    }
+}
+```
+
+Lifecycle: the runner clones the repo (if `workdir` is empty), prepares a
+`.gitignore` for runner artifacts (`RHO.md`, `.stop`, `IMPLEMENTATION_PLAN.md`),
+loops through batches of turns with rate-limit detection and exponential
+backoff retry, auto-commits each batch, snapshots per `snapshot_policy`,
+then pushes the branch and creates a draft MR (title pulled from the
+agent's first conventional-commit message; description includes Jira link,
+commit list, diff stats, and a test plan).
+
+Stream events via SSE:
+
+```sh
+curl -N localhost:8080/cgi-bin/api/sandboxes/dev/task/events
+# task_start | workdir_detected | git_clone | git_pull | git_branch |
+# batch_start | session_start | retry | batch_complete | workspace_state |
+# exit_with_commits | turn_limit | budget_limit | auto_commit | commit |
+# no_changes | snapshot | snapshot_skip | snapshot_error |
+# pushing | creating_mr | mr_created | mr_error |
+# paused | resumed | cancelled | task_complete
+```
+
+Each event includes a structured payload (batch index, cost, files changed,
+diff stats, etc.) so an orchestrator can drive multiple sandboxes
+concurrently and surface progress in a dashboard.
+
+Supported agents:
+
+| Agent     | Adapter behavior                                                    |
+|-----------|---------------------------------------------------------------------|
+| `claude`  | `claude -p <plan> --permission-mode dontAsk --output-format stream-json` |
+| `rho`     | `rho-cli loop --mode build --output-format stream-json` with bash tool |
+
+Adding an adapter is a single struct in `impl/go/runner/agents.go`.
 
 ## Modules
 

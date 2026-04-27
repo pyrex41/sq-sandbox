@@ -1,9 +1,12 @@
 package manager
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +85,7 @@ func (m *Manager) DisableGUI(id string) error {
 	s.GUI = &GUIState{Enabled: false, Module: gui.Module}
 	s.mu.Unlock()
 	_ = writeMeta(s.Dir, s)
+	_ = os.Remove(filepath.Join(s.metaDir(), "gui.pid"))
 
 	return nil
 }
@@ -103,6 +107,48 @@ func (m *Manager) GUIStatus(id string) (*GUIState, error) {
 	}
 	state := *s.GUI
 	return &state, nil
+}
+
+// GUITarget describes everything the noVNC reverse-proxy needs to route a
+// request: the netns to enter, the in-sandbox port to dial, and the token
+// the caller must supply. Returned only when GUI is fully running.
+type GUITarget struct {
+	BwrapPID     int
+	NoVNCPort    int
+	SessionToken string
+}
+
+// GUITarget returns the routing info for the GUI on sandbox id, or an error
+// if the sandbox doesn't exist or GUI isn't enabled / not yet ready. The
+// returned BwrapPID and SessionToken are only valid for as long as the GUI
+// remains running — callers should not cache them across requests.
+func (m *Manager) GUITarget(id string) (*GUITarget, error) {
+	m.mu.Lock()
+	s, exists := m.sandboxes[id]
+	m.mu.Unlock()
+	if !exists || s == nil {
+		return nil, fmt.Errorf("sandbox not found: %s", id)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.GUI == nil || !s.GUI.Enabled {
+		return nil, fmt.Errorf("gui not enabled: %s", id)
+	}
+	if s.GUI.BwrapPID == 0 {
+		// Try once more — the GUI may have been restored from disk before
+		// the in-sandbox PID was published.
+		pidfile := filepath.Join(s.metaDir(), "gui.pid")
+		if pid := pollPID(pidfile, 0); pid > 0 {
+			s.GUI.BwrapPID = pid
+		} else {
+			return nil, fmt.Errorf("gui starting; pid not yet known")
+		}
+	}
+	return &GUITarget{
+		BwrapPID:     s.GUI.BwrapPID,
+		NoVNCPort:    s.GUI.NoVNCPort,
+		SessionToken: s.GUI.SessionToken,
+	}, nil
 }
 
 // startGUI mounts the GUI module if needed, writes /etc/sq-gui.conf into the
@@ -151,22 +197,44 @@ func (m *Manager) startGUI(s *Sandbox, opts *GUIOpts) error {
 		return fmt.Errorf("write gui config: %w", err)
 	}
 
+	// Generate a fresh session token. This authorises /novnc/ traffic and is
+	// returned to the caller — the daemon-wide auth token is never embedded
+	// in browser URLs.
+	sessionToken, err := newSessionToken()
+	if err != nil {
+		return fmt.Errorf("generate session token: %w", err)
+	}
+
+	// Path the in-sandbox sq-exec writes the bwrap child PID to. Lives under
+	// the sandbox meta dir so it's namespaced and survives daemon restarts.
+	pidfile := filepath.Join(s.metaDir(), "gui.pid")
+	_ = os.Remove(pidfile) // stale entries from previous runs would mislead pollPID
+
 	// Launch the GUI stack as a background job. The script lives inside the
 	// GUI module rootfs at /usr/local/bin/sq-gui-start.
-	jobID, err := m.ExecBg(s.ID, "sq-gui-start", "/", 0)
+	jobID, err := m.ExecBgEnv(s.ID, "sq-gui-start", "/", 0, []string{
+		"SQEXEC_PIDFILE=" + pidfile,
+	})
 	if err != nil {
 		return fmt.Errorf("exec sq-gui-start: %w", err)
 	}
 
+	// Wait briefly for sq-exec to write the bwrap child PID. This is best-
+	// effort: the proxy will refuse connections until BwrapPID is set, but
+	// /gui/enable still returns success so callers can poll /gui/status.
+	bwrapPID := pollPID(pidfile, 5*time.Second)
+
 	state := &GUIState{
-		Enabled:    true,
-		Desktop:    desktop,
-		Resolution: resolution,
-		Module:     module,
-		JobID:      jobID,
-		NoVNCPort:  defaultGUINoVNCPort,
-		VNCPort:    defaultGUIVNCPort,
-		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+		Enabled:      true,
+		Desktop:      desktop,
+		Resolution:   resolution,
+		Module:       module,
+		JobID:        jobID,
+		NoVNCPort:    defaultGUINoVNCPort,
+		VNCPort:      defaultGUIVNCPort,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		SessionToken: sessionToken,
+		BwrapPID:     bwrapPID,
 	}
 	s.mu.Lock()
 	s.GUI = state
@@ -177,6 +245,31 @@ func (m *Manager) startGUI(s *Sandbox, opts *GUIOpts) error {
 	_ = writeMeta(s.Dir, s)
 
 	return nil
+}
+
+// newSessionToken returns 32 hex chars of crypto-random data.
+func newSessionToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// pollPID watches path until it contains a numeric PID or timeout elapses.
+// Returns 0 on timeout; callers treat 0 as "not yet known" rather than fatal.
+func pollPID(path string, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			if pid, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return 0
 }
 
 // writeGUIConfig writes /etc/sq-gui.conf into the sandbox upper layer. The

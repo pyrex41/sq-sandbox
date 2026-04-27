@@ -115,6 +115,7 @@ GET    /cgi-bin/api/sandboxes/:id/logs              execution history
 POST   /cgi-bin/api/sandboxes/:id/gui/enable        start GUI desktop (idempotent)
 POST   /cgi-bin/api/sandboxes/:id/gui/disable       stop GUI desktop (idempotent)
 GET    /cgi-bin/api/sandboxes/:id/gui/status        current GUI state + noVNC URL
+*      /cgi-bin/api/sandboxes/:id/novnc/...         noVNC reverse-proxy (session-token auth)
 POST   /cgi-bin/api/sandboxes/:id/task              start autonomous task
 GET    /cgi-bin/api/sandboxes/:id/task              task status
 GET    /cgi-bin/api/sandboxes/:id/task/events       SSE event stream
@@ -194,13 +195,22 @@ Toggle on/off at runtime — sandbox state is preserved either way:
 
 ```sh
 curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/enable \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
   -d '{"resolution":"1280x720"}'
-# → {"enabled":true,"desktop":"xfce","novnc_port":6080,"novnc_url":"/session/user-123/novnc"}
+# → {
+#     "enabled": true,
+#     "desktop": "xfce",
+#     "novnc_port": 6080,
+#     "session_token": "a1b2…(32 hex chars)",
+#     "novnc_url": "/cgi-bin/api/sandboxes/user-123/novnc/vnc.html?_token=a1b2…"
+#   }
 
-curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/disable
-# → {"enabled":false}
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/disable \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN"
+# → {"enabled": false}
 
-curl localhost:8080/cgi-bin/api/sandboxes/user-123/gui/status
+curl -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  localhost:8080/cgi-bin/api/sandboxes/user-123/gui/status
 ```
 
 `POST /gui/enable` is idempotent — call it again and you get the current
@@ -214,9 +224,36 @@ and `VNC_PASSWORD`. Set `SQUASH_DEFAULT_FEATURES=gui` to make every new
 sandbox boot with GUI enabled, or `SQUASH_GUI_MODULE=510-gui-minimal` to
 swap the default desktop layer.
 
+#### How the desktop reaches the browser
+
 The noVNC websocket listens on port 6080 inside the sandbox network
-namespace. Expose it via slirp4netns port mapping or a reverse-proxy
-sidecar that picks up `novnc_url` from `/gui/status`.
+namespace. squashd ships a built-in reverse proxy that crosses into that
+netns (via `setns(2)` on the bwrap child PID) and forwards traffic from a
+public path on the daemon port:
+
+```
+https://<host>:8080/cgi-bin/api/sandboxes/<id>/novnc/vnc.html?_token=<session_token>
+```
+
+That single URL — returned as `novnc_url` from `/gui/enable` and
+`/gui/status` — is everything a browser needs. Open it; the noVNC web UI
+loads, opens a WebSocket back through the same proxy, and you get a
+desktop in the tab. **It works unchanged on Fly.io, OrbStack, PorteuX, or
+bare Linux** because there's only one externally exposed port (the daemon's),
+and TLS termination happens at the platform edge.
+
+Authentication is split:
+
+- The daemon-wide `SQUASH_AUTH_TOKEN` (Bearer header) protects everything
+  *except* the `/novnc/` subtree.
+- A per-sandbox `session_token` — fresh hex generated at `/gui/enable` time,
+  rotated on every re-enable — protects the `/novnc/` subtree.
+  Browsers pass it as `?_token=…`; HTTP/WS clients can use either the
+  query param or `Authorization: Bearer <session_token>`.
+
+Leaking a noVNC URL exposes one sandbox's desktop, never the API. The
+proxy also caps each sandbox at 4 concurrent noVNC connections, so a
+runaway client can't starve daemon goroutines.
 
 Build the GUI layer once, then S3-sync makes it available everywhere:
 

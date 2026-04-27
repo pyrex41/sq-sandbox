@@ -67,13 +67,15 @@ func (h *Handler) handleGUIStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // guiResp wraps a GUIState in the response envelope, computing a relative
-// noVNC URL ("/session/{id}/novnc") when the GUI is enabled. Hosts running
-// a sq-gui-proxy sidecar can reverse-proxy that path; bare deployments can
-// expose port 6080 directly via slirp4netns port mapping.
+// noVNC URL when the GUI is enabled. The URL is the in-daemon reverse-proxy
+// path that crosses into the sandbox netns and forwards to the in-sandbox
+// websockify on port 6080. The session token is appended as `?_token=` so
+// the URL is directly browser-pasteable for the noVNC web UI; for raw
+// HTTP/WS clients, the same token can be supplied as Authorization: Bearer.
 func guiResp(id string, state *manager.GUIState) guiResponse {
 	resp := guiResponse{GUIState: state}
-	if state != nil && state.Enabled {
-		resp.NoVNCURL = "/session/" + id + "/novnc"
+	if state != nil && state.Enabled && state.SessionToken != "" {
+		resp.NoVNCURL = "/cgi-bin/api/sandboxes/" + id + "/novnc/vnc.html?_token=" + state.SessionToken
 	}
 	return resp
 }

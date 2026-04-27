@@ -63,6 +63,14 @@ func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/disable", h.handleGUIDisable)
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/gui/status", h.handleGUIStatus)
 
+	// /novnc/ reverse-proxy. Authenticated by the per-sandbox session token
+	// (NOT the daemon-wide auth token), so we mount it on the proxy directly.
+	// Both GET and CONNECT-style upgrades land here; net/http's mux pattern
+	// without an explicit method matches all verbs.
+	gp := newGUIProxy(h)
+	mux.Handle("/cgi-bin/api/sandboxes/{id}/novnc/{path...}", gp)
+	mux.Handle("/cgi-bin/api/sandboxes/{id}/novnc", gp)
+
 	// Task runner — autonomous agent execution
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task", h.handleStartTask)
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/task", h.handleGetTask)

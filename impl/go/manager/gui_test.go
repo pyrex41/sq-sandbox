@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -94,3 +95,71 @@ func TestGUIStatusUnknownSandbox(t *testing.T) {
 		t.Errorf("GUIStatus missing sandbox: want error, got nil")
 	}
 }
+
+func TestGUITargetUnknownSandbox(t *testing.T) {
+	mgr := New(&config.Config{})
+	if _, err := mgr.GUITarget("missing"); err == nil {
+		t.Errorf("GUITarget missing sandbox: want error, got nil")
+	}
+}
+
+func TestGUITargetReturnsRoutingFields(t *testing.T) {
+	mgr := New(&config.Config{})
+	dir := t.TempDir()
+	for _, sub := range []string{".meta", "merged", "upper/data", "upper/work"} {
+		if err := mkdirP(dir, sub); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	s := &Sandbox{
+		ID:    "demo",
+		Dir:   dir,
+		State: "ready",
+		GUI: &GUIState{
+			Enabled:      true,
+			BwrapPID:     12345,
+			NoVNCPort:    6080,
+			SessionToken: "tok-abc",
+		},
+	}
+	mgr.Register(s)
+	tg, err := mgr.GUITarget("demo")
+	if err != nil {
+		t.Fatalf("GUITarget: %v", err)
+	}
+	if tg.BwrapPID != 12345 || tg.NoVNCPort != 6080 || tg.SessionToken != "tok-abc" {
+		t.Errorf("GUITarget fields: %+v", tg)
+	}
+}
+
+func TestGUITargetRejectsDisabled(t *testing.T) {
+	mgr := New(&config.Config{})
+	s := &Sandbox{ID: "demo", State: "ready", GUI: &GUIState{Enabled: false}}
+	mgr.Register(s)
+	if _, err := mgr.GUITarget("demo"); err == nil {
+		t.Errorf("GUITarget on disabled GUI: want error, got nil")
+	}
+}
+
+func TestNewSessionTokenIsDistinct(t *testing.T) {
+	a, err := newSessionToken()
+	if err != nil {
+		t.Fatalf("a: %v", err)
+	}
+	b, err := newSessionToken()
+	if err != nil {
+		t.Fatalf("b: %v", err)
+	}
+	if a == b || len(a) != 32 || len(b) != 32 {
+		t.Errorf("session tokens not distinct/sized: a=%q b=%q", a, b)
+	}
+}
+
+func mkdirP(base, sub string) error {
+	return os.MkdirAll(filepathJoin(base, sub), 0755)
+}
+
+// filepathJoin avoids importing filepath at the top of the test file just
+// for one helper; we already do path concat in the production code. Inline
+// minimal join: assumes unix-style paths.
+func filepathJoin(a, b string) string { return a + "/" + b }

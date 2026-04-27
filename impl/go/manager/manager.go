@@ -68,6 +68,17 @@ type GUIState struct {
 	NoVNCPort  int    `json:"novnc_port,omitempty"` // typically 6080 (in-sandbox netns)
 	VNCPort    int    `json:"vnc_port,omitempty"`   // typically 5900
 	StartedAt  string `json:"started_at,omitempty"`
+
+	// SessionToken authorises requests to the /novnc/ reverse-proxy. Distinct
+	// from the daemon-wide auth token: leaking the noVNC URL leaks access to
+	// only this sandbox's desktop, not the whole API.
+	SessionToken string `json:"session_token,omitempty"`
+
+	// BwrapPID is the host PID of the bwrap child that owns the sandbox netns.
+	// The /novnc/ proxy uses /proc/<pid>/ns/net + setns(2) to dial the
+	// in-sandbox websockify on 127.0.0.1:6080. Zero until the GUI job has
+	// started and SQEXEC_PIDFILE has been read.
+	BwrapPID int `json:"bwrap_pid,omitempty"`
 }
 
 // ExecOpts holds the parameters for executing a command in a sandbox.

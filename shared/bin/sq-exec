@@ -148,6 +148,13 @@ if command -v bwrap >/dev/null 2>&1; then
             child_pid=$(grep '"child-pid"' "$tmpdir/bwrap-info.json" | grep -o '[0-9]*')
         fi
 
+        # If the daemon asked for the bwrap child PID (via SQEXEC_PIDFILE),
+        # publish it now. Used by the GUI reverse-proxy to setns into the
+        # sandbox netns when serving /novnc/ traffic.
+        if [ -n "${SQEXEC_PIDFILE:-}" ] && [ -n "$child_pid" ]; then
+            printf '%s\n' "$child_pid" > "$SQEXEC_PIDFILE" 2>/dev/null || true
+        fi
+
         slirp_pid=""
         if printf '%s' "${child_pid:-}" | grep -qE '^[0-9]+$' 2>/dev/null; then
             # Set up a fifo for slirp4netns ready notification.
@@ -255,6 +262,11 @@ if [ "$net" = "1" ]; then
         kill "$child_wrapper_pid" 2>/dev/null || true
         wait "$child_wrapper_pid" 2>/dev/null || true
         exit 1
+    fi
+
+    # Mirror the bwrap-path behavior: publish child PID for the GUI proxy.
+    if [ -n "${SQEXEC_PIDFILE:-}" ]; then
+        printf '%s\n' "$child_pid" > "$SQEXEC_PIDFILE" 2>/dev/null || true
     fi
 
     slirp4netns \

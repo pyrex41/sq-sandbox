@@ -26,6 +26,8 @@ type Config struct {
 	BusSockPath   string
 	SnapshotBackend string // "squashfs", "irmin"
 	StoreSockPath string
+	GUIModule       string   // default GUI layer (e.g. "500-gui-base")
+	DefaultFeatures []string // features auto-applied to every new sandbox
 }
 
 // FromEnv builds a Config from environment variables.
@@ -49,6 +51,14 @@ func FromEnv() Config {
 	c.LocalCacheDir = envOr("SQUASH_LOCAL_CACHE_DIR", filepath.Join(dataDir, "cache"))
 	c.BusSockPath = envOr("SQUASH_BUS_SOCK", filepath.Join(dataDir, ".sq-bus.sock"))
 	c.StoreSockPath = envOr("SQUASH_STORE_SOCK", filepath.Join(dataDir, ".sq-store.sock"))
+	c.GUIModule = envOr("SQUASH_GUI_MODULE", "500-gui-base")
+	if v := os.Getenv("SQUASH_DEFAULT_FEATURES"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				c.DefaultFeatures = append(c.DefaultFeatures, p)
+			}
+		}
+	}
 	return c
 }
 

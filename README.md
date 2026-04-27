@@ -112,6 +112,10 @@ POST   /cgi-bin/api/sandboxes/:id/restore           restore from checkpoint
 POST   /cgi-bin/api/sandboxes/:id/fork              clone sandbox state
 GET    /cgi-bin/api/sandboxes/:id/diff              upper-layer diff
 GET    /cgi-bin/api/sandboxes/:id/logs              execution history
+POST   /cgi-bin/api/sandboxes/:id/gui/enable        start GUI desktop (idempotent)
+POST   /cgi-bin/api/sandboxes/:id/gui/disable       stop GUI desktop (idempotent)
+GET    /cgi-bin/api/sandboxes/:id/gui/status        current GUI state + noVNC URL
+*      /cgi-bin/api/sandboxes/:id/novnc/...         noVNC reverse-proxy (session-token auth)
 POST   /cgi-bin/api/sandboxes/:id/task              start autonomous task
 GET    /cgi-bin/api/sandboxes/:id/task              task status
 GET    /cgi-bin/api/sandboxes/:id/task/events       SSE event stream
@@ -161,6 +165,103 @@ Only `id` and `layers` are required. Defaults: `cpu=2`, `memory_mb=1024`,
 
 // POST .../restore   — mount snapshot as layer, clear upper, remount
 {"label": "my-checkpoint"}
+```
+
+### GUI Mode
+
+Sandboxes can run a full Linux desktop (XFCE) reachable through a browser
+via noVNC. GUI mode is opt-in: zero overhead when not requested, identical
+container image whether or not it's used.
+
+Set `features: ["gui"]` at create time and squashd auto-mounts the
+`500-gui-base` layer and starts Xvfb + the window manager + x11vnc +
+websockify in the sandbox network namespace:
+
+```json
+// POST /cgi-bin/api/sandboxes
+{
+    "id": "user-123",
+    "layers": "000-base-alpine,100-dev-tools",
+    "features": ["gui"],
+    "gui": {
+        "desktop": "xfce",
+        "resolution": "1920x1080",
+        "vnc_password": null
+    }
+}
+```
+
+Toggle on/off at runtime — sandbox state is preserved either way:
+
+```sh
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/enable \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  -d '{"resolution":"1280x720"}'
+# → {
+#     "enabled": true,
+#     "desktop": "xfce",
+#     "novnc_port": 6080,
+#     "session_token": "a1b2…(32 hex chars)",
+#     "novnc_url": "/cgi-bin/api/sandboxes/user-123/novnc/vnc.html?_token=a1b2…"
+#   }
+
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/disable \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN"
+# → {"enabled": false}
+
+curl -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  localhost:8080/cgi-bin/api/sandboxes/user-123/gui/status
+```
+
+`POST /gui/enable` is idempotent — call it again and you get the current
+state. `POST /gui/disable` kills the GUI processes inside the sandbox; the
+GUI layer stays mounted so re-enabling is fast.
+
+The GUI module ships a `/usr/local/bin/sq-gui-start` script that reads
+`/etc/sq-gui.conf` (written by squashd into the sandbox upper layer when
+GUI is enabled) for `DESKTOP`, `RESOLUTION`, `VNC_PORT`, `NOVNC_PORT`,
+and `VNC_PASSWORD`. Set `SQUASH_DEFAULT_FEATURES=gui` to make every new
+sandbox boot with GUI enabled, or `SQUASH_GUI_MODULE=510-gui-minimal` to
+swap the default desktop layer.
+
+#### How the desktop reaches the browser
+
+The noVNC websocket listens on port 6080 inside the sandbox network
+namespace. squashd ships a built-in reverse proxy that crosses into that
+netns (via `setns(2)` on the bwrap child PID) and forwards traffic from a
+public path on the daemon port:
+
+```
+https://<host>:8080/cgi-bin/api/sandboxes/<id>/novnc/vnc.html?_token=<session_token>
+```
+
+That single URL — returned as `novnc_url` from `/gui/enable` and
+`/gui/status` — is everything a browser needs. Open it; the noVNC web UI
+loads, opens a WebSocket back through the same proxy, and you get a
+desktop in the tab. **It works unchanged on Fly.io, OrbStack, PorteuX, or
+bare Linux** because there's only one externally exposed port (the daemon's),
+and TLS termination happens at the platform edge.
+
+Authentication is split:
+
+- The daemon-wide `SQUASH_AUTH_TOKEN` (Bearer header) protects everything
+  *except* the `/novnc/` subtree.
+- A per-sandbox `session_token` — fresh hex generated at `/gui/enable` time,
+  rotated on every re-enable — protects the `/novnc/` subtree.
+  Browsers use `?_token=…` on the first noVNC URL; squashd then sets a
+  scoped noVNC cookie so static assets and the WebSocket authenticate
+  without copying the token into every subrequest. HTTP/WS clients can use
+  either the query param or `Authorization: Bearer <session_token>`.
+
+Leaking a noVNC URL exposes one sandbox's desktop, never the API. The
+proxy also caps each sandbox at 4 concurrent noVNC connections, so a
+runaway client can't starve daemon goroutines.
+
+Build the GUI layer once, then S3-sync makes it available everywhere:
+
+```sh
+sq-mkmod preset gui-base                 # → 500-gui-base.squashfs (~120 MB)
+# pushed to S3 automatically when SQUASH_S3_BUCKET is set
 ```
 
 ### Autonomous Task Runner
@@ -231,9 +332,10 @@ Adding an adapter is a single struct in `impl/go/runner/agents.go`.
 | 10x   | Language runtimes | python312, nodejs22, golang       |
 | 11x   | Build tools       | gcc, make, cmake, git             |
 | 20x   | Services/daemons  | tailscale, nginx, postgres        |
+| 50x   | Desktop/GUI       | gui-base (XFCE + noVNC)           |
 | 9xx   | Checkpoints       | (auto-generated from upper layer) |
 
-Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale`
+Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale|gui-base`
 
 Build from directory: `sq-mkmod from-dir /path/to/tree 110-my-tools`
 
@@ -352,6 +454,8 @@ etc. — anything that supports privileged containers.
 | `SQUASH_SNAPSHOT_BACKEND` | `squashfs`                | Snapshot backend: `squashfs` or `irmin` |
 | `SQUASH_STORE_SOCK`   | `$SQUASH_DATA/.sq-store.sock` | sq-store sidecar socket path         |
 | `SQUASH_STORE_DIR`    | `$SQUASH_DATA/.sq-store/`     | Irmin pack data directory            |
+| `SQUASH_GUI_MODULE`   | `500-gui-base`                | Default layer used when `features:["gui"]` is set |
+| `SQUASH_DEFAULT_FEATURES` | `""`                      | Comma-separated features applied to every new sandbox (e.g. `gui`) |
 
 ### Irmin Snapshot Backend
 

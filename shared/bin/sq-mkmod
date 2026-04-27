@@ -176,6 +176,141 @@ preset_tailscale() {
     squash_it "$root" "$name"
 }
 
+# ── GUI base (XFCE + x11vnc + noVNC) ───────────────────────────────────
+#
+# Builds 500-gui-base.squashfs from the host distro's package manager
+# (apk on Alpine, apt on Debian/Ubuntu). The result is a portable squashfs
+# layer that, when stacked on a base sandbox, provides:
+#   - Xvfb (in-memory X server)
+#   - XFCE desktop (or set DESKTOP=minimal for a bare X session)
+#   - x11vnc + websockify + noVNC (browser-accessible desktop on :6080)
+#   - /usr/local/bin/sq-gui-start — the entrypoint squashd execs to start it
+#
+# Runtime config is read from /etc/sq-gui.conf (DESKTOP, RESOLUTION,
+# VNC_PORT, NOVNC_PORT, optional VNC_PASSWORD). squashd writes that file
+# into the sandbox upper layer when GUI mode is enabled.
+
+preset_gui_base() {
+    local root="$WORK/rootfs" name="500-gui-base"
+    mkdir -p "$root"
+
+    log "building GUI base module ($name)"
+
+    if command -v apk >/dev/null 2>&1; then
+        log "using apk (Alpine) to populate rootfs"
+        # --initdb so the result is self-contained; --no-cache to avoid leaking
+        # the host's package index. The package list mirrors the README.
+        apk add --root "$root" --initdb --no-cache \
+            xvfb \
+            xfce4 \
+            xfce4-terminal \
+            x11vnc \
+            novnc \
+            websockify \
+            dbus-x11 \
+            xauth \
+            ttf-dejavu \
+            >/dev/null 2>&1 || die "apk add failed (need root or fakeroot)"
+    elif command -v debootstrap >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
+        log "Debian/Ubuntu host — recommended path is build-in-sandbox:"
+        log "  1. sq-ctl create gui-builder anon 000-base-debian"
+        log "  2. sq-ctl exec gui-builder 'apt-get update && apt-get install -y \\"
+        log "       xvfb xfce4 xfce4-terminal x11vnc novnc websockify dbus-x11 xauth'"
+        log "  3. sq-mkmod from-sandbox gui-builder $name"
+        log "  4. sq-ctl destroy gui-builder"
+        die "no automated apt path; use build-in-sandbox"
+    else
+        die "no supported package manager found (apk or apt)"
+    fi
+
+    # Drop in the entrypoint script. Lives inside the layer so it's available
+    # in every sandbox that mounts this module.
+    mkdir -p "$root/usr/local/bin"
+    cat > "$root/usr/local/bin/sq-gui-start" <<'GUI_START_EOF'
+#!/bin/sh
+# sq-gui-start — boots the in-sandbox GUI stack.
+# Sourced by squashd via `sq-exec ... sq-gui-start`. Reads /etc/sq-gui.conf
+# for runtime parameters; falls back to sensible defaults.
+set -eu
+
+CONF="/etc/sq-gui.conf"
+DESKTOP="xfce"
+RESOLUTION="1920x1080"
+VNC_PORT="5900"
+NOVNC_PORT="6080"
+VNC_PASSWORD=""
+DISPLAY_NUM="99"
+
+if [ -r "$CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+fi
+
+export DISPLAY=":${DISPLAY_NUM}"
+export HOME="${HOME:-/root}"
+mkdir -p "$HOME"
+
+log() { echo "[sq-gui] $*"; }
+
+# Xvfb — virtual framebuffer
+log "Xvfb $DISPLAY ${RESOLUTION}x24"
+Xvfb "$DISPLAY" -screen 0 "${RESOLUTION}x24" -nolisten tcp >/var/log/xvfb.log 2>&1 &
+XVFB_PID=$!
+sleep 1
+
+# Window manager / desktop session
+case "$DESKTOP" in
+    xfce|xfce4)
+        log "starting XFCE"
+        if command -v dbus-launch >/dev/null 2>&1; then
+            dbus-launch --exit-with-session startxfce4 >/var/log/xfce.log 2>&1 &
+        else
+            startxfce4 >/var/log/xfce.log 2>&1 &
+        fi
+        ;;
+    minimal|none)
+        log "minimal session — no window manager"
+        ;;
+    *)
+        log "unknown DESKTOP=$DESKTOP — falling back to xterm"
+        if command -v xterm >/dev/null 2>&1; then
+            xterm >/var/log/xterm.log 2>&1 &
+        fi
+        ;;
+esac
+WM_PID=$!
+
+# x11vnc — bridge X to VNC. Optional password.
+VNC_AUTH_ARGS="-nopw"
+if [ -n "$VNC_PASSWORD" ]; then
+    VNC_PWFILE="$HOME/.vnc/passwd"
+    mkdir -p "$HOME/.vnc"
+    x11vnc -storepasswd "$VNC_PASSWORD" "$VNC_PWFILE" >/dev/null 2>&1 || true
+    VNC_AUTH_ARGS="-rfbauth $VNC_PWFILE"
+fi
+log "x11vnc :$DISPLAY_NUM → tcp/$VNC_PORT"
+# shellcheck disable=SC2086
+x11vnc -display "$DISPLAY" -forever -shared -rfbport "$VNC_PORT" $VNC_AUTH_ARGS \
+    >/var/log/x11vnc.log 2>&1 &
+VNC_PID=$!
+
+# websockify + noVNC. The novnc package usually drops files at /usr/share/novnc.
+NOVNC_DIR="/usr/share/novnc"
+if [ ! -d "$NOVNC_DIR" ] && [ -d "/usr/share/webapps/novnc" ]; then
+    NOVNC_DIR="/usr/share/webapps/novnc"
+fi
+log "websockify $NOVNC_PORT → localhost:$VNC_PORT (web=$NOVNC_DIR)"
+exec websockify --web="$NOVNC_DIR" "$NOVNC_PORT" "localhost:$VNC_PORT"
+GUI_START_EOF
+    chmod +x "$root/usr/local/bin/sq-gui-start"
+
+    # Marker so sandboxes can detect the GUI layer is present.
+    mkdir -p "$root/etc"
+    echo "$name" > "$root/etc/sq-gui-module"
+
+    squash_it "$root" "$name"
+}
+
 # ── From directory or sandbox ──────────────────────────────────────────
 
 from_dir() {
@@ -204,8 +339,8 @@ case "${1:-help}" in
             build*|dev*) preset_build_tools ;;
     tailscale)   preset_tailscale ;;
   sqlite-libs) preset_sqlite_libs ;;
-  nullclaw)    preset_nullclaw ;; 
   nullclaw)    preset_nullclaw ;;
+            gui|gui-base) preset_gui_base ;;
 
             *)           die "unknown preset: ${2:-}. Run '$0 list'" ;;
         esac
@@ -227,6 +362,7 @@ presets:
   nodejs20     → 100-nodejs20.squashfs     Node.js 20 LTS
   golang       → 100-golang.squashfs       Go (latest)
   tailscale    → 200-tailscale.squashfs    Tailscale client
+  gui-base     → 500-gui-base.squashfs     XFCE + x11vnc + noVNC desktop
 
 build-in-sandbox (recommended for base-specific packages):
   1. sq-ctl create builder anon 000-base-alpine

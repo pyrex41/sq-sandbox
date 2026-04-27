@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -145,9 +146,11 @@ func min(a, b int) int {
 
 // RunBg starts a background execution of cmd inside the merged rootfs.
 // onLine is called for each line of stdout or stderr (merged).
+// extraEnv is appended to os.Environ() for the spawned sq-exec process; pass
+// nil for default environment.
 // Returns a cancel func (kills the process) and a channel that receives the
 // exit code when the process completes.
-func RunBg(merged, cmd, workdir string, timeoutS int, onLine func(string)) (cancel func(), exitCh <-chan int) {
+func RunBg(merged, cmd, workdir string, timeoutS int, extraEnv []string, onLine func(string)) (cancel func(), exitCh <-chan int) {
 	if timeoutS <= 0 {
 		timeoutS = 7200
 	}
@@ -162,6 +165,9 @@ func RunBg(merged, cmd, workdir string, timeoutS int, onLine func(string)) (canc
 	}
 
 	c := exec.Command(args[0], args[1:]...)
+	if len(extraEnv) > 0 {
+		c.Env = append(os.Environ(), extraEnv...)
+	}
 	ch := make(chan int, 1)
 
 	stdoutPipe, err := c.StdoutPipe()

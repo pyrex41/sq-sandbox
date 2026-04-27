@@ -67,3 +67,35 @@ func TestModulesDir(t *testing.T) {
 		t.Errorf("ModulesDir() = %q, want /data/modules", got)
 	}
 }
+
+func TestGUIModuleDefault(t *testing.T) {
+	os.Setenv("SQUASH_DATA", "/data")
+	defer os.Unsetenv("SQUASH_DATA")
+	os.Unsetenv("SQUASH_GUI_MODULE")
+	os.Unsetenv("SQUASH_DEFAULT_FEATURES")
+	c := FromEnv()
+	if c.GUIModule != "500-gui-base" {
+		t.Errorf("GUIModule default = %q, want 500-gui-base", c.GUIModule)
+	}
+	if len(c.DefaultFeatures) != 0 {
+		t.Errorf("DefaultFeatures default = %v, want empty", c.DefaultFeatures)
+	}
+}
+
+func TestDefaultFeaturesParsesCommaList(t *testing.T) {
+	os.Setenv("SQUASH_DATA", "/data")
+	os.Setenv("SQUASH_DEFAULT_FEATURES", "gui, secret-proxy")
+	os.Setenv("SQUASH_GUI_MODULE", "510-gui-minimal")
+	defer os.Unsetenv("SQUASH_DATA")
+	defer os.Unsetenv("SQUASH_DEFAULT_FEATURES")
+	defer os.Unsetenv("SQUASH_GUI_MODULE")
+
+	c := FromEnv()
+	if c.GUIModule != "510-gui-minimal" {
+		t.Errorf("GUIModule = %q, want 510-gui-minimal", c.GUIModule)
+	}
+	if len(c.DefaultFeatures) != 2 || c.DefaultFeatures[0] != "gui" ||
+		c.DefaultFeatures[1] != "secret-proxy" {
+		t.Errorf("DefaultFeatures = %v, want [gui secret-proxy]", c.DefaultFeatures)
+	}
+}

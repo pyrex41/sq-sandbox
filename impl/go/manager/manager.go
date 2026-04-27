@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,25 +13,27 @@ import (
 	"sync"
 	"time"
 
-	sqexec "squashd/exec"
 	"squashd/config"
+	sqexec "squashd/exec"
 	"squashd/store"
 )
 
 // SandboxInfo is the JSON-serializable view of a sandbox returned by the API.
 type SandboxInfo struct {
-	ID           string   `json:"id"`
-	State        string   `json:"state"`
-	Owner        string   `json:"owner"`
-	Task         string   `json:"task,omitempty"`
-	Layers       []string `json:"layers"`
-	Backend      string   `json:"backend"`
-	CreatedAt    string   `json:"created"`
-	LastActiveAt string   `json:"last_active"`
-	CPULimit     float64  `json:"cpu"`
-	MemoryMB     int      `json:"memory_mb"`
-	MaxLifetimeS int      `json:"max_lifetime_s"`
-	AllowNet     []string `json:"allow_net,omitempty"`
+	ID           string    `json:"id"`
+	State        string    `json:"state"`
+	Owner        string    `json:"owner"`
+	Task         string    `json:"task,omitempty"`
+	Layers       []string  `json:"layers"`
+	Backend      string    `json:"backend"`
+	CreatedAt    string    `json:"created"`
+	LastActiveAt string    `json:"last_active"`
+	CPULimit     float64   `json:"cpu"`
+	MemoryMB     int       `json:"memory_mb"`
+	MaxLifetimeS int       `json:"max_lifetime_s"`
+	AllowNet     []string  `json:"allow_net,omitempty"`
+	Features     []string  `json:"features,omitempty"`
+	GUI          *GUIState `json:"gui,omitempty"`
 }
 
 // CreateOpts holds the parameters for creating a new sandbox.
@@ -42,6 +45,40 @@ type CreateOpts struct {
 	MemoryMB     int
 	MaxLifetimeS int
 	AllowNet     []string
+	Features     []string
+	GUI          *GUIOpts
+}
+
+// GUIOpts is the user-supplied GUI configuration (from the create body or
+// gui/enable endpoint). All fields are optional; missing values use defaults.
+type GUIOpts struct {
+	Desktop     string `json:"desktop,omitempty"`      // "xfce" (default), "minimal"
+	Resolution  string `json:"resolution,omitempty"`   // "1920x1080" (default)
+	VNCPassword string `json:"vnc_password,omitempty"` // unset = no password
+	Module      string `json:"module,omitempty"`       // override default GUI layer
+}
+
+// GUIState reflects the runtime state of GUI mode for a sandbox.
+type GUIState struct {
+	Enabled    bool   `json:"enabled"`
+	Desktop    string `json:"desktop,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+	Module     string `json:"module,omitempty"`
+	JobID      int    `json:"job_id,omitempty"`     // background sq-gui-start job
+	NoVNCPort  int    `json:"novnc_port,omitempty"` // typically 6080 (in-sandbox netns)
+	VNCPort    int    `json:"vnc_port,omitempty"`   // typically 5900
+	StartedAt  string `json:"started_at,omitempty"`
+
+	// SessionToken authorises requests to the /novnc/ reverse-proxy. Distinct
+	// from the daemon-wide auth token: leaking the noVNC URL leaks access to
+	// only this sandbox's desktop, not the whole API.
+	SessionToken string `json:"session_token,omitempty"`
+
+	// BwrapPID is the host PID of the bwrap child that owns the sandbox netns.
+	// The /novnc/ proxy uses /proc/<pid>/ns/net + setns(2) to dial the
+	// in-sandbox websockify on 127.0.0.1:6080. Zero until the GUI job has
+	// started and SQEXEC_PIDFILE has been read.
+	BwrapPID int `json:"bwrap_pid,omitempty"`
 }
 
 // ExecOpts holds the parameters for executing a command in a sandbox.
@@ -52,16 +89,16 @@ type ExecOpts struct {
 
 // ExecResult is the stored record of a command execution.
 type ExecResult struct {
-	Seq       int    `json:"seq"`
-	Cmd       string `json:"cmd"`
-	WorkDir   string `json:"workdir"`
-	ExitCode  int    `json:"exit_code"`
-	Started   int64  `json:"started"`   // Unix timestamp (matches Janet/shell format)
-	Finished  int64  `json:"finished"`  // Unix timestamp
-	DurMS     int64  `json:"duration_ms"`
-	Stdout    string `json:"stdout"`
-	Stderr    string `json:"stderr"`
-	TimedOut  bool   `json:"timed_out"`
+	Seq      int    `json:"seq"`
+	Cmd      string `json:"cmd"`
+	WorkDir  string `json:"workdir"`
+	ExitCode int    `json:"exit_code"`
+	Started  int64  `json:"started"`  // Unix timestamp (matches Janet/shell format)
+	Finished int64  `json:"finished"` // Unix timestamp
+	DurMS    int64  `json:"duration_ms"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	TimedOut bool   `json:"timed_out"`
 }
 
 // SnapshotResult is returned after a snapshot operation.
@@ -575,10 +612,10 @@ func (m *Manager) SetupWireGuard(id string, peers []map[string]any) (map[string]
 	pubKey := strings.TrimSpace(string(pubKeyBytes))
 
 	return map[string]any{
-		"status":      "ok",
-		"publicKey":   pubKey,
-		"listenPort":  51820,
-		"peersAdded":  len(peers),
+		"status":     "ok",
+		"publicKey":  pubKey,
+		"listenPort": 51820,
+		"peersAdded": len(peers),
 	}, nil
 }
 
@@ -606,6 +643,22 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		opts.Layers = []string{"000-base-alpine"}
 	}
 
+	// Merge daemon-wide default features (e.g. SQUASH_DEFAULT_FEATURES=gui) into
+	// the per-sandbox features list.
+	opts.Features = mergeFeatures(opts.Features, m.cfg.DefaultFeatures)
+
+	// If "gui" is in features, auto-append the GUI module so it mounts as part
+	// of the initial overlay (no second remount needed at startup).
+	if hasFeature(opts.Features, "gui") {
+		mod := guiModule(m.cfg, opts.GUI)
+		if !validModuleName(mod) {
+			return nil, fmt.Errorf("invalid module: %s", mod)
+		}
+		if !contains(opts.Layers, mod) {
+			opts.Layers = append(opts.Layers, mod)
+		}
+	}
+
 	// Create directory tree.
 	for _, d := range []string{
 		filepath.Join(sdir, "images"),
@@ -631,6 +684,7 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		MemoryMB:     opts.MemoryMB,
 		MaxLifetimeS: opts.MaxLifetimeS,
 		AllowNet:     opts.AllowNet,
+		Features:     opts.Features,
 		Dir:          sdir,
 		CreatedAt:    time.Now(),
 		LastActiveAt: time.Now(),
@@ -689,6 +743,23 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 	}
 
 	s.State = "ready"
+
+	// Auto-start GUI if requested. Failures are non-fatal — the sandbox is
+	// usable without the desktop, and /gui/enable can retry.
+	if hasFeature(opts.Features, "gui") {
+		m.mu.Lock()
+		if current, exists := m.sandboxes[id]; exists && current == nil {
+			m.sandboxes[id] = s
+		}
+		m.mu.Unlock()
+
+		s.guiMu.Lock()
+		if err := m.startGUI(s, opts.GUI); err != nil {
+			slog.Warn("gui auto-start failed", "id", id, "err", err)
+		}
+		s.guiMu.Unlock()
+	}
+
 	return s, nil
 }
 

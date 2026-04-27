@@ -10,24 +10,31 @@ import (
 
 // Config holds all runtime configuration derived from environment variables.
 type Config struct {
-	DataDir       string
-	Port          int
-	MaxSandboxes  int
-	UpperLimitMB  int
-	Backend       string // "chroot", "firecracker", "gvisor"
-	AuthToken     string // empty = no auth
-	S3Bucket      string
-	S3Endpoint    string
-	S3Region      string
-	S3Prefix      string
-	ProxyHTTPS    bool
-	UpperBackend  string // "tmpfs", "btrfs", "loop"
-	LocalCacheDir string
-	BusSockPath   string
-	SnapshotBackend string // "squashfs", "irmin"
-	StoreSockPath string
-	GUIModule       string   // default GUI layer (e.g. "500-gui-base")
-	DefaultFeatures []string // features auto-applied to every new sandbox
+	DataDir               string
+	Port                  int
+	MaxSandboxes          int
+	UpperLimitMB          int
+	Backend               string // "chroot", "firecracker", "gvisor"
+	AuthToken             string // empty = no auth
+	S3Bucket              string
+	S3Endpoint            string
+	S3Region              string
+	S3Prefix              string
+	ProxyHTTPS            bool
+	UpperBackend          string // "tmpfs", "btrfs", "loop"
+	LocalCacheDir         string
+	BusSockPath           string
+	SnapshotBackend       string // "squashfs", "irmin"
+	StoreSockPath         string
+	GUIModule             string   // default GUI layer (e.g. "500-gui-base")
+	DefaultFeatures       []string // features auto-applied to every new sandbox
+	ControlDBPath         string   // SQLite control-plane DB path
+	StripeSecretKey       string
+	StripeWebhookSecret   string
+	StripeCheckoutPriceID string
+	PublicBaseURL         string
+	ShenAdmissionCommand  string
+	ShenPolicyPath        string
 }
 
 // FromEnv builds a Config from environment variables.
@@ -52,6 +59,13 @@ func FromEnv() Config {
 	c.BusSockPath = envOr("SQUASH_BUS_SOCK", filepath.Join(dataDir, ".sq-bus.sock"))
 	c.StoreSockPath = envOr("SQUASH_STORE_SOCK", filepath.Join(dataDir, ".sq-store.sock"))
 	c.GUIModule = envOr("SQUASH_GUI_MODULE", "500-gui-base")
+	c.ControlDBPath = envOr("SQUASH_CONTROL_DB", filepath.Join(dataDir, "app.db"))
+	c.StripeSecretKey = os.Getenv("STRIPE_SECRET_KEY")
+	c.StripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
+	c.StripeCheckoutPriceID = os.Getenv("STRIPE_CHECKOUT_PRICE_ID")
+	c.PublicBaseURL = envOr("SQUASH_PUBLIC_BASE_URL", "http://localhost:8080")
+	c.ShenAdmissionCommand = os.Getenv("SQUASH_SHEN_ADMISSION_CMD")
+	c.ShenPolicyPath = envOr("SQUASH_SHEN_POLICY", filepath.Join(dataDir, "shen-backpressure.shen"))
 	if v := os.Getenv("SQUASH_DEFAULT_FEATURES"); v != "" {
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p != "" {

@@ -8,7 +8,7 @@ import (
 const maxBodySize = 64 * 1024 * 1024 // 64 MiB — matches Go proxy limit
 
 // authMiddleware wraps a handler with Bearer token authentication.
-// Routes under /cgi-bin/api/ require the token; others are public.
+// Routes under /cgi-bin/api/ and /app require the token; health stays public.
 // If authToken is empty, all requests pass through.
 //
 // The noVNC reverse-proxy subtree (/cgi-bin/api/sandboxes/.../novnc/...) is
@@ -21,7 +21,8 @@ func authMiddleware(authToken string, next http.Handler) http.Handler {
 	}
 	expected := "Bearer " + authToken
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/cgi-bin/api/") && !isNoVNCPath(r.URL.Path) {
+		protected := strings.HasPrefix(r.URL.Path, "/cgi-bin/api/") || strings.HasPrefix(r.URL.Path, "/app")
+		if protected && !isNoVNCPath(r.URL.Path) {
 			if r.Header.Get("Authorization") != expected {
 				jsonError(w, "unauthorized", http.StatusUnauthorized)
 				return

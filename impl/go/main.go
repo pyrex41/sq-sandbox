@@ -12,6 +12,7 @@ import (
 
 	"squashd/api"
 	"squashd/config"
+	"squashd/controlplane"
 	"squashd/manager"
 	"squashd/proxy"
 	"squashd/reaper"
@@ -29,6 +30,17 @@ func main() {
 	})))
 
 	mgr := manager.New(&cfg)
+	if err := controlplane.EnsureShenPolicy(cfg.ShenPolicyPath); err != nil {
+		fmt.Fprintf(os.Stderr, "squashd: shen policy error: %v\n", err)
+		os.Exit(1)
+	}
+	cpStore, err := controlplane.Open(context.Background(), cfg.ControlDBPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "squashd: control db error: %v\n", err)
+		os.Exit(1)
+	}
+	defer cpStore.Close()
+	cp := controlplane.New(cpStore, cfg.ShenAdmissionCommand, cfg.ShenPolicyPath)
 
 	// Graceful shutdown: stop proxy, reaper, and API server on SIGTERM/SIGINT.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -44,7 +56,7 @@ func main() {
 	// Launch sandbox TTL reaper.
 	go reaper.Run(done, mgr)
 
-	handler := api.NewHandler(&cfg, mgr)
+	handler := api.NewHandlerWithControlPlane(&cfg, mgr, cp)
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	srv := &http.Server{
 		Addr:         addr,

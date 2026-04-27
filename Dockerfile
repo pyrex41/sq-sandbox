@@ -3,7 +3,7 @@
 # Requires: --privileged or SYS_ADMIN cap (for mount, overlayfs, unshare)
 
 # ── Stage 1: Build Go daemon (includes proxy) ─────────────────────────────
-FROM golang:1.22-alpine AS go-build
+FROM golang:1.25-alpine AS go-build
 
 WORKDIR /build
 COPY impl/go/ .

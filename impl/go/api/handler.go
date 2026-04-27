@@ -10,30 +10,46 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"squashd/config"
+	"squashd/controlplane"
 	"squashd/manager"
 )
-
 
 // Handler holds the API dependencies.
 type Handler struct {
 	cfg *config.Config
 	mgr *manager.Manager
+	cp  *controlplane.ControlPlane
 }
 
 // NewHandler creates a new Handler and registers all routes on mux.
 func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
-	h := &Handler{cfg: cfg, mgr: mgr}
+	return NewHandlerWithControlPlane(cfg, mgr, nil)
+}
+
+// NewHandlerWithControlPlane creates a handler with hosted-product control-plane
+// features enabled when cp is non-nil.
+func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *controlplane.ControlPlane) http.Handler {
+	h := &Handler{cfg: cfg, mgr: mgr, cp: cp}
 
 	mux := http.NewServeMux()
 
 	// Health — public
 	mux.HandleFunc("GET /cgi-bin/health", h.handleHealth)
 	mux.HandleFunc("/cgi-bin/health", h.handleHealth) // method-agnostic fallback
+	mux.HandleFunc("GET /app", h.handleDashboard)
+	mux.HandleFunc("GET /app/", h.handleDashboard)
 
 	// Modules
 	mux.HandleFunc("GET /cgi-bin/api/modules", h.handleListModules)
+
+	// Hosted control-plane MVP
+	mux.HandleFunc("GET /cgi-bin/api/control-plane/summary", h.handleControlPlaneSummary)
+	mux.HandleFunc("GET /cgi-bin/api/control-plane/usage", h.handleControlPlaneUsage)
+	mux.HandleFunc("POST /cgi-bin/api/billing/checkout", h.handleBillingCheckout)
+	mux.HandleFunc("POST /cgi-bin/api/billing/webhook", h.handleBillingWebhook)
 
 	// Sandboxes collection
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes", h.handleListSandboxes)
@@ -181,11 +197,11 @@ func (h *Handler) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := manager.CreateOpts{
-		Owner:  stringOr(body["owner"], "anon"),
-		Task:   stringOr(body["task"], ""),
-		Layers: layers,
-		CPU:    floatOr(body["cpu"], 2),
-		MemoryMB: intOr(body["memory_mb"], 1024),
+		Owner:        stringOr(body["owner"], "anon"),
+		Task:         stringOr(body["task"], ""),
+		Layers:       layers,
+		CPU:          floatOr(body["cpu"], 2),
+		MemoryMB:     intOr(body["memory_mb"], 1024),
 		MaxLifetimeS: intOr(body["max_lifetime_s"], 0),
 	}
 	if allow, ok := body["allow_net"].([]any); ok {
@@ -216,6 +232,28 @@ func (h *Handler) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	opts.GUI = gui
 
+	if h.cp != nil {
+		estimate := opts.MaxLifetimeS
+		if estimate <= 0 {
+			estimate = 3600
+		}
+		decision, err := h.cp.AdmitCreate(r.Context(), controlplane.AdmissionRequest{
+			OrgID:               controlplane.DefaultOrgID,
+			SandboxID:           id,
+			Features:            opts.Features,
+			MaxLifetimeSeconds:  opts.MaxLifetimeS,
+			EstimatedRunSeconds: estimate,
+		})
+		if err != nil {
+			jsonError(w, "admission failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !decision.Allowed {
+			jsonError(w, decision.Reason, admissionStatus(decision.Code))
+			return
+		}
+	}
+
 	info, err := h.mgr.Create(id, opts)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
@@ -228,6 +266,27 @@ func (h *Handler) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if h.cp != nil {
+		createdAt, _ := time.Parse(time.RFC3339, info.CreatedAt)
+		lastActiveAt, _ := time.Parse(time.RFC3339, info.LastActiveAt)
+		if err := h.cp.Store().RecordSandboxStarted(r.Context(), controlplane.SandboxRecord{
+			ID:           info.ID,
+			OrgID:        controlplane.DefaultOrgID,
+			Owner:        info.Owner,
+			State:        info.State,
+			Features:     info.Features,
+			CPU:          info.CPULimit,
+			MemoryMB:     info.MemoryMB,
+			CreatedAt:    createdAt,
+			StartedAt:    createdAt,
+			LastActiveAt: lastActiveAt,
+			MaxLifetimeS: info.MaxLifetimeS,
+		}); err != nil {
+			_ = h.mgr.Destroy(id)
+			jsonError(w, "record sandbox start: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	jsonCreated(w, info)
 }
@@ -246,6 +305,10 @@ func (h *Handler) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	id := sandboxID(r)
+	var info manager.SandboxInfo
+	if h.cp != nil {
+		info, _ = h.mgr.Get(id)
+	}
 	if err := h.mgr.Destroy(id); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			jsonError(w, err.Error(), http.StatusNotFound)
@@ -253,6 +316,12 @@ func (h *Handler) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if h.cp != nil && info.ID != "" {
+		if _, err := h.cp.Store().RecordSandboxStopped(r.Context(), controlplane.DefaultOrgID, id, time.Now()); err != nil {
+			jsonError(w, "record sandbox stop: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	jsonNoContent(w)
 }

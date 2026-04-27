@@ -13,7 +13,8 @@ import (
 
 // Sandbox represents a running sandbox instance.
 type Sandbox struct {
-	mu sync.Mutex // protects per-sandbox mutable state (LastActiveAt, ExecCount)
+	mu    sync.Mutex // protects per-sandbox mutable state (LastActiveAt, ExecCount)
+	guiMu sync.Mutex // serializes GUI enable/disable lifecycle operations
 
 	ID           string
 	State        string // "creating", "ready", "destroying", "destroyed"
@@ -31,7 +32,7 @@ type Sandbox struct {
 	LastActiveAt time.Time
 	Dir          string // abs path to sandbox directory
 	ExecCount    int
-	CID          int    // Firecracker vsock CID (0 if unused)
+	CID          int // Firecracker vsock CID (0 if unused)
 
 	// snapshotMounted tracks whether a snapshot squashfs is currently
 	// loop-mounted at images/_snapshot (chroot backend only).

@@ -248,8 +248,10 @@ Authentication is split:
   *except* the `/novnc/` subtree.
 - A per-sandbox `session_token` — fresh hex generated at `/gui/enable` time,
   rotated on every re-enable — protects the `/novnc/` subtree.
-  Browsers pass it as `?_token=…`; HTTP/WS clients can use either the
-  query param or `Authorization: Bearer <session_token>`.
+  Browsers use `?_token=…` on the first noVNC URL; squashd then sets a
+  scoped noVNC cookie so static assets and the WebSocket authenticate
+  without copying the token into every subrequest. HTTP/WS clients can use
+  either the query param or `Authorization: Bearer <session_token>`.
 
 Leaking a noVNC URL exposes one sandbox's desktop, never the API. The
 proxy also caps each sandbox at 4 concurrent noVNC connections, so a

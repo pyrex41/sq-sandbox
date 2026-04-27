@@ -155,6 +155,42 @@ func TestNewSessionTokenIsDistinct(t *testing.T) {
 	}
 }
 
+func TestPollPIDZeroTimeoutReadsOnce(t *testing.T) {
+	path := filepathJoin(t.TempDir(), "gui.pid")
+	if err := os.WriteFile(path, []byte("12345\n"), 0644); err != nil {
+		t.Fatalf("write pidfile: %v", err)
+	}
+	if got := pollPID(path, 0); got != 12345 {
+		t.Errorf("pollPID zero timeout = %d, want 12345", got)
+	}
+}
+
+func TestWriteGUIConfigQuotesPassword(t *testing.T) {
+	dir := t.TempDir()
+	s := &Sandbox{Dir: dir}
+	password := "pa'ss; rm -rf / $(echo bad)"
+	if err := writeGUIConfig(s, "xfce", "1280x720", password); err != nil {
+		t.Fatalf("writeGUIConfig: %v", err)
+	}
+	b, err := os.ReadFile(filepathJoin(dir, "upper/data/etc/sq-gui.conf"))
+	if err != nil {
+		t.Fatalf("read gui config: %v", err)
+	}
+	want := "VNC_PASSWORD=" + shellSingleQuote(password) + "\n"
+	if !strings.Contains(string(b), want) {
+		t.Fatalf("gui config missing quoted password %q:\n%s", want, string(b))
+	}
+}
+
+func TestCreateSandboxRejectsInvalidGUIModule(t *testing.T) {
+	cfg := &config.Config{DataDir: t.TempDir(), Backend: "chroot", GUIModule: "../bad"}
+	mgr := New(cfg)
+	_, err := mgr.createSandbox("demo", CreateOpts{Features: []string{"gui"}})
+	if err == nil || !strings.Contains(err.Error(), "invalid module") {
+		t.Fatalf("createSandbox invalid gui module err = %v, want invalid module", err)
+	}
+}
+
 func mkdirP(base, sub string) error {
 	return os.MkdirAll(filepathJoin(base, sub), 0755)
 }

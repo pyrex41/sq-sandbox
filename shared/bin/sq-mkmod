@@ -340,7 +340,6 @@ case "${1:-help}" in
     tailscale)   preset_tailscale ;;
   sqlite-libs) preset_sqlite_libs ;;
   nullclaw)    preset_nullclaw ;;
-  nullclaw)    preset_nullclaw ;;
             gui|gui-base) preset_gui_base ;;
 
             *)           die "unknown preset: ${2:-}. Run '$0 list'" ;;

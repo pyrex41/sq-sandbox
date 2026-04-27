@@ -16,6 +16,7 @@ import (
 // itself only needs one (HTML + WebSocket); the headroom covers reconnects
 // and asset preloads. A misbehaving client cannot starve daemon goroutines.
 const maxNoVNCPerSandbox = 4
+const noVNCTokenCookie = "sq_novnc_token"
 
 // guiProxy holds the shared httputil.ReverseProxy plus a per-sandbox
 // connection-limit semaphore map. Built once at handler-init time so the
@@ -79,6 +80,7 @@ func (g *guiProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session token", http.StatusUnauthorized)
 		return
 	}
+	setNoVNCTokenCookie(w, id, target.SessionToken)
 
 	release, ok := g.acquire(id)
 	if !ok {
@@ -97,8 +99,8 @@ func (g *guiProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// httputil.ReverseProxy needs a target URL; the host is unused once we
 	// install our own DialContext, but the scheme matters for upgrade
 	// handling. Use http — TLS is terminated at the edge.
-	target_url, _ := url.Parse("http://novnc.invalid")
-	proxy := httputil.NewSingleHostReverseProxy(target_url)
+	targetURL := &url.URL{Scheme: "http", Host: "novnc.invalid"}
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
 	// Strip the /cgi-bin/api/sandboxes/{id}/novnc prefix so the upstream
 	// (websockify serving the noVNC web UI) sees the path it expects:
@@ -112,8 +114,9 @@ func (g *guiProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.URL.Path = "/"
 		}
 		req.Host = upstream
-		// Don't forward the session token to the upstream — websockify
-		// would otherwise see it in its query string.
+		// Don't forward proxy-only auth material to websockify.
+		req.Header.Del("Authorization")
+		req.Header.Del("Cookie")
 		stripQueryParam(req.URL, "_token")
 	}
 
@@ -151,7 +154,22 @@ func checkSessionToken(r *http.Request, expected string) bool {
 			return true
 		}
 	}
+	if cookie, err := r.Cookie(noVNCTokenCookie); err == nil {
+		if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(expected)) == 1 {
+			return true
+		}
+	}
 	return false
+}
+
+func setNoVNCTokenCookie(w http.ResponseWriter, sandboxID, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     noVNCTokenCookie,
+		Value:    token,
+		Path:     "/cgi-bin/api/sandboxes/" + sandboxID + "/novnc",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // stripQueryParam removes a single query-string key from u.RawQuery in place.

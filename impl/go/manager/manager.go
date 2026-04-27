@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	sqexec "squashd/exec"
 	"squashd/config"
+	sqexec "squashd/exec"
 	"squashd/store"
 )
 
@@ -52,10 +52,10 @@ type CreateOpts struct {
 // GUIOpts is the user-supplied GUI configuration (from the create body or
 // gui/enable endpoint). All fields are optional; missing values use defaults.
 type GUIOpts struct {
-	Desktop     string `json:"desktop,omitempty"`     // "xfce" (default), "minimal"
-	Resolution  string `json:"resolution,omitempty"`  // "1920x1080" (default)
+	Desktop     string `json:"desktop,omitempty"`      // "xfce" (default), "minimal"
+	Resolution  string `json:"resolution,omitempty"`   // "1920x1080" (default)
 	VNCPassword string `json:"vnc_password,omitempty"` // unset = no password
-	Module      string `json:"module,omitempty"`      // override default GUI layer
+	Module      string `json:"module,omitempty"`       // override default GUI layer
 }
 
 // GUIState reflects the runtime state of GUI mode for a sandbox.
@@ -89,16 +89,16 @@ type ExecOpts struct {
 
 // ExecResult is the stored record of a command execution.
 type ExecResult struct {
-	Seq       int    `json:"seq"`
-	Cmd       string `json:"cmd"`
-	WorkDir   string `json:"workdir"`
-	ExitCode  int    `json:"exit_code"`
-	Started   int64  `json:"started"`   // Unix timestamp (matches Janet/shell format)
-	Finished  int64  `json:"finished"`  // Unix timestamp
-	DurMS     int64  `json:"duration_ms"`
-	Stdout    string `json:"stdout"`
-	Stderr    string `json:"stderr"`
-	TimedOut  bool   `json:"timed_out"`
+	Seq      int    `json:"seq"`
+	Cmd      string `json:"cmd"`
+	WorkDir  string `json:"workdir"`
+	ExitCode int    `json:"exit_code"`
+	Started  int64  `json:"started"`  // Unix timestamp (matches Janet/shell format)
+	Finished int64  `json:"finished"` // Unix timestamp
+	DurMS    int64  `json:"duration_ms"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	TimedOut bool   `json:"timed_out"`
 }
 
 // SnapshotResult is returned after a snapshot operation.
@@ -612,10 +612,10 @@ func (m *Manager) SetupWireGuard(id string, peers []map[string]any) (map[string]
 	pubKey := strings.TrimSpace(string(pubKeyBytes))
 
 	return map[string]any{
-		"status":      "ok",
-		"publicKey":   pubKey,
-		"listenPort":  51820,
-		"peersAdded":  len(peers),
+		"status":     "ok",
+		"publicKey":  pubKey,
+		"listenPort": 51820,
+		"peersAdded": len(peers),
 	}, nil
 }
 
@@ -651,6 +651,9 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 	// of the initial overlay (no second remount needed at startup).
 	if hasFeature(opts.Features, "gui") {
 		mod := guiModule(m.cfg, opts.GUI)
+		if !validModuleName(mod) {
+			return nil, fmt.Errorf("invalid module: %s", mod)
+		}
 		if !contains(opts.Layers, mod) {
 			opts.Layers = append(opts.Layers, mod)
 		}
@@ -744,9 +747,17 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 	// Auto-start GUI if requested. Failures are non-fatal — the sandbox is
 	// usable without the desktop, and /gui/enable can retry.
 	if hasFeature(opts.Features, "gui") {
+		m.mu.Lock()
+		if current, exists := m.sandboxes[id]; exists && current == nil {
+			m.sandboxes[id] = s
+		}
+		m.mu.Unlock()
+
+		s.guiMu.Lock()
 		if err := m.startGUI(s, opts.GUI); err != nil {
 			slog.Warn("gui auto-start failed", "id", id, "err", err)
 		}
+		s.guiMu.Unlock()
 	}
 
 	return s, nil

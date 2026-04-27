@@ -33,6 +33,9 @@ func (m *Manager) EnableGUI(id string, opts *GUIOpts) (*GUIState, error) {
 		return nil, fmt.Errorf("sandbox not found: %s", id)
 	}
 
+	s.guiMu.Lock()
+	defer s.guiMu.Unlock()
+
 	s.mu.Lock()
 	if s.GUI != nil && s.GUI.Enabled {
 		state := *s.GUI
@@ -63,6 +66,9 @@ func (m *Manager) DisableGUI(id string) error {
 	if !exists || s == nil {
 		return fmt.Errorf("sandbox not found: %s", id)
 	}
+
+	s.guiMu.Lock()
+	defer s.guiMu.Unlock()
 
 	s.mu.Lock()
 	gui := s.GUI
@@ -153,7 +159,7 @@ func (m *Manager) GUITarget(id string) (*GUITarget, error) {
 
 // startGUI mounts the GUI module if needed, writes /etc/sq-gui.conf into the
 // upper layer, and launches sq-gui-start as a background job. Caller must NOT
-// hold s.mu.
+// hold s.mu, and should hold s.guiMu if the sandbox is visible in the registry.
 func (m *Manager) startGUI(s *Sandbox, opts *GUIOpts) error {
 	if opts == nil {
 		opts = &GUIOpts{}
@@ -260,16 +266,27 @@ func newSessionToken() (string, error) {
 // Returns 0 on timeout; callers treat 0 as "not yet known" rather than fatal.
 func pollPID(path string, timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		b, err := os.ReadFile(path)
-		if err == nil {
-			if pid, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && pid > 0 {
-				return pid
-			}
+	for {
+		if pid := readPID(path); pid > 0 {
+			return pid
+		}
+		if timeout <= 0 || !time.Now().Before(deadline) {
+			return 0
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return 0
+}
+
+func readPID(path string) int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
 }
 
 // writeGUIConfig writes /etc/sq-gui.conf into the sandbox upper layer. The
@@ -286,13 +303,17 @@ func writeGUIConfig(s *Sandbox, desktop, resolution, vncPassword string) error {
 	fmt.Fprintf(&b, "NOVNC_PORT=%d\n", defaultGUINoVNCPort)
 	fmt.Fprintf(&b, "VNC_PORT=%d\n", defaultGUIVNCPort)
 	if vncPassword != "" {
-		fmt.Fprintf(&b, "VNC_PASSWORD=%s\n", vncPassword)
+		fmt.Fprintf(&b, "VNC_PASSWORD=%s\n", shellSingleQuote(vncPassword))
 	}
 	mode := os.FileMode(0644)
 	if vncPassword != "" {
 		mode = 0600
 	}
 	return os.WriteFile(filepath.Join(dir, "sq-gui.conf"), []byte(b.String()), mode)
+}
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // guiModule returns the module name to use for the GUI layer, falling back

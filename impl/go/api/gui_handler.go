@@ -70,8 +70,8 @@ func (h *Handler) handleGUIStatus(w http.ResponseWriter, r *http.Request) {
 // noVNC URL when the GUI is enabled. The URL is the in-daemon reverse-proxy
 // path that crosses into the sandbox netns and forwards to the in-sandbox
 // websockify on port 6080. The session token is appended as `?_token=` so
-// the URL is directly browser-pasteable for the noVNC web UI; for raw
-// HTTP/WS clients, the same token can be supplied as Authorization: Bearer.
+// the first browser request can establish a scoped noVNC cookie; raw HTTP/WS
+// clients can also supply the same token as Authorization: Bearer.
 func guiResp(id string, state *manager.GUIState) guiResponse {
 	resp := guiResponse{GUIState: state}
 	if state != nil && state.Enabled && state.SessionToken != "" {

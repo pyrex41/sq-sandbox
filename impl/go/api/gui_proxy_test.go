@@ -13,17 +13,19 @@ import (
 
 func TestCheckSessionTokenHeaderAndQuery(t *testing.T) {
 	cases := []struct {
-		name, header, query, expected string
-		want                          bool
+		name, header, query, cookie, expected string
+		want                                  bool
 	}{
-		{"empty expected always rejected", "Bearer x", "", "", false},
-		{"bearer header match", "Bearer abc", "", "abc", true},
-		{"bearer header mismatch", "Bearer wrong", "", "abc", false},
-		{"query param match", "", "abc", "abc", true},
-		{"query param mismatch", "", "wrong", "abc", false},
-		{"missing both", "", "", "abc", false},
-		{"non-bearer authz ignored", "Basic abc", "", "abc", false},
-		{"header preferred but query also valid", "Bearer abc", "abc", "abc", true},
+		{"empty expected always rejected", "Bearer x", "", "", "", false},
+		{"bearer header match", "Bearer abc", "", "", "abc", true},
+		{"bearer header mismatch", "Bearer wrong", "", "", "abc", false},
+		{"query param match", "", "abc", "", "abc", true},
+		{"query param mismatch", "", "wrong", "", "abc", false},
+		{"cookie match", "", "", "abc", "abc", true},
+		{"cookie mismatch", "", "", "wrong", "abc", false},
+		{"missing all", "", "", "", "abc", false},
+		{"non-bearer authz ignored", "Basic abc", "", "", "abc", false},
+		{"header preferred but query also valid", "Bearer abc", "abc", "", "abc", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -31,10 +33,32 @@ func TestCheckSessionTokenHeaderAndQuery(t *testing.T) {
 			if c.header != "" {
 				req.Header.Set("Authorization", c.header)
 			}
+			if c.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: noVNCTokenCookie, Value: c.cookie})
+			}
 			if got := checkSessionToken(req, c.expected); got != c.want {
 				t.Errorf("checkSessionToken(%+v) = %v, want %v", c, got, c.want)
 			}
 		})
+	}
+}
+
+func TestSetNoVNCTokenCookieScopesToSandboxProxy(t *testing.T) {
+	w := httptest.NewRecorder()
+	setNoVNCTokenCookie(w, "abc", "tok")
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies = %d, want 1", len(cookies))
+	}
+	c := cookies[0]
+	if c.Name != noVNCTokenCookie || c.Value != "tok" {
+		t.Fatalf("cookie = %s=%s, want %s=tok", c.Name, c.Value, noVNCTokenCookie)
+	}
+	if c.Path != "/cgi-bin/api/sandboxes/abc/novnc" {
+		t.Fatalf("cookie path = %q", c.Path)
+	}
+	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("cookie flags: HttpOnly=%v SameSite=%v", c.HttpOnly, c.SameSite)
 	}
 }
 

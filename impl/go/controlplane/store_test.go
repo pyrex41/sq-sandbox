@@ -120,3 +120,67 @@ WHERE id = ?;
 		t.Fatalf("decision = %+v, want insufficient credits", decision)
 	}
 }
+
+func TestParseUSDCMicros(t *testing.T) {
+	cases := map[string]int64{
+		"1":        1_000_000,
+		"1.25":     1_250_000,
+		"0.000001": 1,
+		"$10.5":    10_500_000,
+	}
+	for raw, want := range cases {
+		got, err := ParseUSDCMicros(raw)
+		if err != nil {
+			t.Fatalf("ParseUSDCMicros(%q): %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("ParseUSDCMicros(%q) = %d, want %d", raw, got, want)
+		}
+	}
+	for _, raw := range []string{"", "0", "-1", "1.0000001", "abc"} {
+		if _, err := ParseUSDCMicros(raw); err == nil {
+			t.Fatalf("ParseUSDCMicros(%q) succeeded, want error", raw)
+		}
+	}
+}
+
+func TestConfirmUSDCDepositCreditsOncePerTxHash(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestControlPlane(t)
+
+	first, err := store.ConfirmUSDCDeposit(ctx, USDCDeposit{
+		OrgID:        DefaultOrgID,
+		TxHash:       "0xabc",
+		AmountMicros: 25_000_000,
+		Network:      "base",
+		ToAddress:    "0xreceive",
+	})
+	if err != nil {
+		t.Fatalf("confirm first deposit: %v", err)
+	}
+	if !first.Credited || first.CreditBalanceMicros != 35_000_000 {
+		t.Fatalf("first result = %+v, want credited balance 35000000", first)
+	}
+
+	second, err := store.ConfirmUSDCDeposit(ctx, USDCDeposit{
+		OrgID:        DefaultOrgID,
+		TxHash:       "0xabc",
+		AmountMicros: 25_000_000,
+		Network:      "base",
+		ToAddress:    "0xreceive",
+	})
+	if err != nil {
+		t.Fatalf("confirm duplicate deposit: %v", err)
+	}
+	if second.Credited || second.CreditBalanceMicros != 35_000_000 {
+		t.Fatalf("duplicate result = %+v, want not credited same balance", second)
+	}
+
+	var rows int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM credit_ledger WHERE reason = 'usdc_deposit';`).Scan(&rows); err != nil {
+		t.Fatalf("count credit rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("usdc credit rows = %d, want 1", rows)
+	}
+}

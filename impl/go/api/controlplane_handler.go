@@ -87,6 +87,70 @@ func (h *Handler) handleBillingWebhook(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]any{"received": true})
 }
 
+func (h *Handler) handleUSDCInstructions(w http.ResponseWriter, r *http.Request) {
+	if !h.requireControlPlane(w) {
+		return
+	}
+	jsonOK(w, h.usdcInstructions(orgIDFromRequest(r)))
+}
+
+func (h *Handler) handleUSDCConfirm(w http.ResponseWriter, r *http.Request) {
+	if !h.requireControlPlane(w) {
+		return
+	}
+	var body struct {
+		OrgID        string `json:"org_id"`
+		TxHash       string `json:"tx_hash"`
+		AmountUSDC   string `json:"amount_usdc"`
+		AmountMicros int64  `json:"amount_micros"`
+		Network      string `json:"network"`
+		TokenAddress string `json:"token_address"`
+		FromAddress  string `json:"from_address"`
+		ToAddress    string `json:"to_address"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if h.cfg.USDCReceiveAddress == "" {
+		jsonError(w, "SQUASH_USDC_RECEIVE_ADDRESS is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if body.OrgID == "" {
+		body.OrgID = controlplane.DefaultOrgID
+	}
+	if body.Network == "" {
+		body.Network = h.cfg.USDCNetwork
+	}
+	if body.TokenAddress == "" {
+		body.TokenAddress = h.cfg.USDCTokenAddress
+	}
+	if body.ToAddress == "" {
+		body.ToAddress = h.cfg.USDCReceiveAddress
+	}
+	if body.AmountMicros == 0 {
+		amount, err := controlplane.ParseUSDCMicros(body.AmountUSDC)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.AmountMicros = amount
+	}
+	result, err := h.cp.Store().ConfirmUSDCDeposit(r.Context(), controlplane.USDCDeposit{
+		OrgID:        body.OrgID,
+		TxHash:       body.TxHash,
+		AmountMicros: body.AmountMicros,
+		Network:      body.Network,
+		TokenAddress: body.TokenAddress,
+		FromAddress:  body.FromAddress,
+		ToAddress:    body.ToAddress,
+	})
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	jsonOK(w, result)
+}
+
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if !h.requireControlPlane(w) {
 		return
@@ -115,13 +179,14 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 </head>
 <body>
   <h1>sq-sandbox</h1>
-  <p class="muted">Hosted sandbox control plane MVP. Billing is stubbed until Stripe products are configured.</p>
+  <p class="muted">Hosted sandbox control plane MVP. USDC top-ups are manually confirmed for beta users.</p>
   <div class="cards">
     <div class="card"><strong>Credits</strong><br>%s</div>
     <div class="card"><strong>Monthly usage</strong><br>%s / %s</div>
     <div class="card"><strong>Active sandboxes</strong><br>%d / %d</div>
     <div class="card"><strong>Plan</strong><br>%s</div>
   </div>
+  %s
   <h2>Recent sandboxes</h2>
   <table><thead><tr><th>ID</th><th>State</th><th>Owner</th><th>Features</th><th>Created</th></tr></thead><tbody>`,
 		formatMicros(dash.Org.CreditBalanceMicros),
@@ -130,6 +195,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		dash.Org.ActiveSandboxes,
 		dash.Org.MaxConcurrentSandboxes,
 		html.EscapeString(dash.Org.Plan),
+		h.usdcTopUpHTML(),
 	)
 	for _, sb := range dash.RecentSandboxes {
 		fmt.Fprintf(w, `<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
@@ -181,6 +247,42 @@ func admissionStatus(code string) int {
 	default:
 		return http.StatusForbidden
 	}
+}
+
+func (h *Handler) usdcInstructions(orgID string) map[string]any {
+	if orgID == "" {
+		orgID = controlplane.DefaultOrgID
+	}
+	return map[string]any{
+		"mode":                 "manual_usdc_topup",
+		"org_id":               orgID,
+		"configured":           h.cfg.USDCReceiveAddress != "",
+		"network":              h.cfg.USDCNetwork,
+		"chain_id":             h.cfg.USDCChainID,
+		"token":                "USDC",
+		"token_address":        h.cfg.USDCTokenAddress,
+		"receive_address":      h.cfg.USDCReceiveAddress,
+		"explorer_tx_base_url": h.cfg.USDCExplorerTxBaseURL,
+		"confirm_endpoint":     "/cgi-bin/api/billing/usdc/confirm",
+		"note":                 "Send native USDC on the configured network, then submit the tx hash for manual admin confirmation.",
+	}
+}
+
+func (h *Handler) usdcTopUpHTML() string {
+	if h.cfg.USDCReceiveAddress == "" {
+		return `<div class="card"><strong>USDC top-up</strong><br><span class="muted">Set <code>SQUASH_USDC_RECEIVE_ADDRESS</code> to enable manual deposits.</span></div>`
+	}
+	return fmt.Sprintf(`<div class="card">
+    <strong>USDC top-up</strong><br>
+    <span class="muted">Send native USDC on %s (chain %s), then submit the tx hash for manual credit.</span><br>
+    <code>%s</code><br>
+    <span class="muted">Token: <code>%s</code></span>
+  </div>`,
+		html.EscapeString(h.cfg.USDCNetwork),
+		html.EscapeString(h.cfg.USDCChainID),
+		html.EscapeString(h.cfg.USDCReceiveAddress),
+		html.EscapeString(h.cfg.USDCTokenAddress),
+	)
 }
 
 func formatMicros(v int64) string {

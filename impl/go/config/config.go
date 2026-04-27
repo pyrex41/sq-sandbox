@@ -35,6 +35,11 @@ type Config struct {
 	PublicBaseURL         string
 	ShenAdmissionCommand  string
 	ShenPolicyPath        string
+	USDCNetwork           string
+	USDCChainID           string
+	USDCTokenAddress      string
+	USDCReceiveAddress    string
+	USDCExplorerTxBaseURL string
 }
 
 // FromEnv builds a Config from environment variables.
@@ -66,6 +71,11 @@ func FromEnv() Config {
 	c.PublicBaseURL = envOr("SQUASH_PUBLIC_BASE_URL", "http://localhost:8080")
 	c.ShenAdmissionCommand = os.Getenv("SQUASH_SHEN_ADMISSION_CMD")
 	c.ShenPolicyPath = envOr("SQUASH_SHEN_POLICY", filepath.Join(dataDir, "shen-backpressure.shen"))
+	c.USDCNetwork = envOr("SQUASH_USDC_NETWORK", "base")
+	c.USDCChainID = envOr("SQUASH_USDC_CHAIN_ID", "8453")
+	c.USDCTokenAddress = envOr("SQUASH_USDC_TOKEN_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+	c.USDCReceiveAddress = os.Getenv("SQUASH_USDC_RECEIVE_ADDRESS")
+	c.USDCExplorerTxBaseURL = envOr("SQUASH_USDC_EXPLORER_TX_BASE_URL", "https://basescan.org/tx/")
 	if v := os.Getenv("SQUASH_DEFAULT_FEATURES"); v != "" {
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p != "" {

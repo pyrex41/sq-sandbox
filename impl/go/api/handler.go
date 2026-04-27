@@ -50,6 +50,8 @@ func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *co
 	mux.HandleFunc("GET /cgi-bin/api/control-plane/usage", h.handleControlPlaneUsage)
 	mux.HandleFunc("POST /cgi-bin/api/billing/checkout", h.handleBillingCheckout)
 	mux.HandleFunc("POST /cgi-bin/api/billing/webhook", h.handleBillingWebhook)
+	mux.HandleFunc("GET /cgi-bin/api/billing/usdc", h.handleUSDCInstructions)
+	mux.HandleFunc("POST /cgi-bin/api/billing/usdc/confirm", h.handleUSDCConfirm)
 
 	// Sandboxes collection
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes", h.handleListSandboxes)

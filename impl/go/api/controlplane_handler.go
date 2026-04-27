@@ -135,7 +135,7 @@ func (h *Handler) handleUSDCConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 		body.AmountMicros = amount
 	}
-	result, err := h.cp.Store().ConfirmUSDCDeposit(r.Context(), controlplane.USDCDeposit{
+	deposit := controlplane.USDCDeposit{
 		OrgID:        body.OrgID,
 		TxHash:       body.TxHash,
 		AmountMicros: body.AmountMicros,
@@ -143,7 +143,12 @@ func (h *Handler) handleUSDCConfirm(w http.ResponseWriter, r *http.Request) {
 		TokenAddress: body.TokenAddress,
 		FromAddress:  body.FromAddress,
 		ToAddress:    body.ToAddress,
-	})
+	}
+	if err := controlplane.ValidateManualUSDCDeposit(deposit, h.cfg.USDCNetwork, h.cfg.USDCTokenAddress, h.cfg.USDCReceiveAddress); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	result, err := h.cp.Store().ConfirmUSDCDeposit(r.Context(), deposit)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
@@ -173,8 +178,11 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; background: #fafafa; }
     table { border-collapse: collapse; width: 100%%; margin-top: 1rem; }
     th, td { border-bottom: 1px solid #eee; padding: .55rem; text-align: left; }
+    input { display: block; box-sizing: border-box; margin: .35rem 0 .75rem; padding: .5rem; width: 100%%; max-width: 44rem; }
+    button { padding: .55rem .8rem; cursor: pointer; }
     .muted { color: #666; }
     code { background: #f1f1f1; padding: .15rem .3rem; border-radius: 4px; }
+    #usdc-confirm-result { margin-top: .75rem; }
   </style>
 </head>
 <body>
@@ -187,6 +195,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
     <div class="card"><strong>Plan</strong><br>%s</div>
   </div>
   %s
+  %s
   <h2>Recent sandboxes</h2>
   <table><thead><tr><th>ID</th><th>State</th><th>Owner</th><th>Features</th><th>Created</th></tr></thead><tbody>`,
 		formatMicros(dash.Org.CreditBalanceMicros),
@@ -196,6 +205,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		dash.Org.MaxConcurrentSandboxes,
 		html.EscapeString(dash.Org.Plan),
 		h.usdcTopUpHTML(),
+		h.usdcAdminHTML(),
 	)
 	for _, sb := range dash.RecentSandboxes {
 		fmt.Fprintf(w, `<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
@@ -282,6 +292,62 @@ func (h *Handler) usdcTopUpHTML() string {
 		html.EscapeString(h.cfg.USDCChainID),
 		html.EscapeString(h.cfg.USDCReceiveAddress),
 		html.EscapeString(h.cfg.USDCTokenAddress),
+	)
+}
+
+func (h *Handler) usdcAdminHTML() string {
+	if h.cfg.USDCReceiveAddress == "" {
+		return ""
+	}
+	return fmt.Sprintf(`<h2>Admin: confirm USDC deposit</h2>
+  <div class="card">
+    <p class="muted">Verify the transfer on the explorer first. This records credits idempotently by tx hash.</p>
+    <label>Transaction hash
+      <input id="usdc-tx-hash" placeholder="0x..." autocomplete="off">
+    </label>
+    <label>Amount USDC
+      <input id="usdc-amount" placeholder="25.00" inputmode="decimal">
+    </label>
+    <label>Sender address (optional)
+      <input id="usdc-from-address" placeholder="0x..." autocomplete="off">
+    </label>
+    <button type="button" onclick="confirmUSDCDeposit()">Confirm deposit</button>
+    <div id="usdc-confirm-result" class="muted"></div>
+  </div>
+  <script>
+  async function confirmUSDCDeposit() {
+    const out = document.getElementById('usdc-confirm-result');
+    out.textContent = 'Confirming...';
+    const payload = {
+      tx_hash: document.getElementById('usdc-tx-hash').value.trim(),
+      amount_usdc: document.getElementById('usdc-amount').value.trim(),
+      network: %q,
+      token_address: %q,
+      to_address: %q,
+      from_address: document.getElementById('usdc-from-address').value.trim()
+    };
+    try {
+      const res = await fetch('/cgi-bin/api/billing/usdc/confirm', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || 'confirmation failed');
+      out.textContent = body.credited ? 'Credited. New balance: ' + formatMicros(body.credit_balance_micros) : 'Already confirmed. Balance: ' + formatMicros(body.credit_balance_micros);
+    } catch (err) {
+      out.textContent = err.message;
+    }
+  }
+  function formatMicros(v) {
+    const sign = v < 0 ? '-' : '';
+    v = Math.abs(v);
+    return sign + '$' + Math.floor(v / 1000000) + '.' + String(v %% 1000000).padStart(6, '0');
+  }
+  </script>`,
+		h.cfg.USDCNetwork,
+		h.cfg.USDCTokenAddress,
+		h.cfg.USDCReceiveAddress,
 	)
 }
 

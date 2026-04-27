@@ -78,6 +78,22 @@ VALUES (?, ?, ?, ?, ?);
 	return USDCDepositResult{Credited: true, CreditBalanceMicros: balance}, tx.Commit()
 }
 
+func ValidateManualUSDCDeposit(dep USDCDeposit, expectedNetwork, expectedTokenAddress, expectedReceiveAddress string) error {
+	if !validTxHash(dep.TxHash) {
+		return fmt.Errorf("tx_hash must be a 0x-prefixed 32-byte hash")
+	}
+	if expectedNetwork != "" && !strings.EqualFold(strings.TrimSpace(dep.Network), strings.TrimSpace(expectedNetwork)) {
+		return fmt.Errorf("network mismatch: got %q, want %q", dep.Network, expectedNetwork)
+	}
+	if expectedTokenAddress != "" && !strings.EqualFold(strings.TrimSpace(dep.TokenAddress), strings.TrimSpace(expectedTokenAddress)) {
+		return fmt.Errorf("token_address mismatch")
+	}
+	if expectedReceiveAddress != "" && !strings.EqualFold(strings.TrimSpace(dep.ToAddress), strings.TrimSpace(expectedReceiveAddress)) {
+		return fmt.Errorf("to_address mismatch")
+	}
+	return nil
+}
+
 func ParseUSDCMicros(raw string) (int64, error) {
 	s := strings.TrimSpace(raw)
 	s = strings.TrimPrefix(s, "$")
@@ -124,6 +140,19 @@ func ParseUSDCMicros(raw string) (int64, error) {
 		return 0, fmt.Errorf("amount must be positive")
 	}
 	return out, nil
+}
+
+func validTxHash(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 66 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	for _, r := range s[2:] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func digitsOnly(s string) bool {

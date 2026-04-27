@@ -184,3 +184,31 @@ func TestConfirmUSDCDepositCreditsOncePerTxHash(t *testing.T) {
 		t.Fatalf("usdc credit rows = %d, want 1", rows)
 	}
 }
+
+func TestValidateManualUSDCDeposit(t *testing.T) {
+	txHash := "0x" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	dep := USDCDeposit{
+		TxHash:       txHash,
+		Network:      "base",
+		TokenAddress: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+		ToAddress:    "0x1111111111111111111111111111111111111111",
+	}
+	if err := ValidateManualUSDCDeposit(dep, "base", "0x833589fcD6EdB6E08F4C7C32D4F71B54BDA02913", "0x1111111111111111111111111111111111111111"); err != nil {
+		t.Fatalf("valid deposit rejected: %v", err)
+	}
+	bad := dep
+	bad.TxHash = "0xabc"
+	if err := ValidateManualUSDCDeposit(bad, "base", dep.TokenAddress, dep.ToAddress); err == nil {
+		t.Fatalf("short tx hash accepted")
+	}
+	bad = dep
+	bad.Network = "ethereum"
+	if err := ValidateManualUSDCDeposit(bad, "base", dep.TokenAddress, dep.ToAddress); err == nil {
+		t.Fatalf("wrong network accepted")
+	}
+	bad = dep
+	bad.ToAddress = "0x2222222222222222222222222222222222222222"
+	if err := ValidateManualUSDCDeposit(bad, "base", dep.TokenAddress, dep.ToAddress); err == nil {
+		t.Fatalf("wrong recipient accepted")
+	}
+}

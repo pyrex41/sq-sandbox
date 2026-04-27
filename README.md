@@ -410,74 +410,20 @@ snapshots created with either backend can coexist for the same sandbox.
 
 Not for untrusted multi-tenant. No GPU passthrough. No live migration between backends.
 
-## Language Implementations
+## Implementation
 
-The sandbox daemon is implemented in five languages on parallel branches. All
-share the same core model (squashfs + overlayfs, cgroups, netns, secrets
-injection) and expose the same HTTP API, but differ in runtime, dependencies,
-and how much is implemented in-language vs. delegated to external tools.
+The daemon lives in `impl/go/`. Single Go binary (`squashd`) plus a set of
+shell utilities under `bin/` and `cgi-bin/` for things best left to shell
+(squashfs build, S3 sync). The Go side handles the HTTP API, sandbox
+lifecycle, exec/job manager, autonomous task runner, and event streaming.
 
-| Implementation | Branch | LOC (src) | Runtime | HTTP Stack |
-|----------------|--------|-----------|---------|------------|
-| **Rust** | `feat/rust` | ~11k | Async (Tokio) | Axum + Tower |
-| **Zig** | `feat/zig` | ~10k | Sync, thread pool | std.http (custom routing) |
-| **Odin** | `feat/odin` | ~5k | Sync, thread pool | Custom (worker pool + bounded channels) |
-| **Common Lisp** | `feat/cl` | ~3.5k | SBCL + bordeaux-threads | Clack/Woo (libev) + Ningle |
-| **Janet** | `feat/janet` | ~1.9k | Fibers (ev/go) | net/server (stdlib) |
-
-### Feature Matrix
-
-| Feature | Rust | Zig | Odin | CL | Janet |
-|---------|------|-----|------|----|-------|
-| Chroot backend | ✓ | ✓ | ✓ | ✓ | ✓ |
-| gVisor backend | — | — | — | ✓ | — |
-| Firecracker backend | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Native S3 (in-language) | ✓ | ✓ | — | ✓ | — |
-| S3 via shell (`sq-s3`) | — | — | ✓ | — | ✓ |
-| Native HTTPS proxy | ✓ | — | — | — | — |
-| HTTPS proxy (Go sidecar) | — | ✓ | ✓ | ✓ | ✓ |
-| Auth middleware | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Cgroup v2 limits | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Network namespace | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Egress filtering | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Init/recovery | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Reaper | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Graceful shutdown | ✓ | ✓ | — | ✓ | — |
-| Request body limits | ✓ | ✓ | — | ✓ | ✓ |
-| SigV4 signing (in-lang) | — | ✓ | ✓ | ✓ | — |
-
-### S3 Integration
-
-| Impl | Approach | Notes |
-|------|----------|-------|
-| Rust | Native | aws-sdk-s3, async |
-| Zig | Native | Custom SigV4 + std.http, atomic pulls, flock |
-| CL | Native | Ironclad (SHA256/HMAC) + Dexador, SigV4 |
-| Odin | Shell | Delegates to `sq-s3` script (sigv4.odin exists but unwired) |
-| Janet | Shell | Delegates to `sq-s3` via `os/execute` / `os/spawn` |
-
-### Binary Sizes (measured)
-
-| Language | Binary | Stripped | Notes |
-|----------|--------|---------|-------|
-| Odin | 838 KB | — | ELF aarch64-linux, not yet stripped |
-| Zig | 2.7 MB | 2.3 MB | Mach-O arm64 |
-| Rust | 22 MB | 17 MB | Mach-O arm64, many deps (tokio, aws-sdk, rustls) |
-| CL | ~20 MB | N/A | SBCL image (runtime + compiler + libs, zstd compressed) |
-| Janet | 71 KB src | N/A | Interpreted; requires ~1MB Janet runtime |
-
-### Trade-offs
-
-| Criterion | Best fit |
-|-----------|----------|
-| Smallest codebase | Janet (~1.9k LOC, 71KB source) |
-| Smallest binary | Odin (838KB), Zig (2.3MB stripped) |
-| Most self-contained | Rust (native S3 + native HTTPS proxy) |
-| Lowest dependency surface | Zig, Odin |
-| Fastest iteration / REPL | Common Lisp (Swank + live image) |
-| Strongest typing | Rust, Zig |
-| Simplest deployment | Janet (single interpreter) |
-| Production hardening | Rust (tracing, error types, async, RAII) |
+Earlier in the project, the same daemon was prototyped in Rust, Zig, Odin,
+Common Lisp, and Janet on parallel branches (`feat/rust`, `feat/zig`,
+`feat/odin`, `feat/cl`, `feat/janet`) and a Nix-based monorepo
+(`feat/nix-monorepo`) attempted to unify the builds. Those branches are
+left intact as a reference for the polyglot exploration but are not
+maintained — `main` is Go-only, and new features (background exec,
+job streaming, autonomous task runner) ship there.
 
 ## Advanced Networking & Storage
 

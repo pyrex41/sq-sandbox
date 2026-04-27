@@ -85,6 +85,54 @@ type Dashboard struct {
 	RecentUsage     []UsageEvent     `json:"recent_usage"`
 }
 
+type USDCDetectedDeposit struct {
+	ID            int64  `json:"id"`
+	OrgID         string `json:"org_id"`
+	TxHash        string `json:"tx_hash"`
+	LogIndex      uint64 `json:"log_index"`
+	BlockNumber   uint64 `json:"block_number"`
+	BlockHash     string `json:"block_hash"`
+	Network       string `json:"network"`
+	TokenAddress  string `json:"token_address"`
+	FromAddress   string `json:"from_address"`
+	ToAddress     string `json:"to_address"`
+	AmountMicros  int64  `json:"amount_micros"`
+	Confirmations uint64 `json:"confirmations"`
+	Credited      bool   `json:"credited"`
+	DuplicateTx   bool   `json:"duplicate_tx"`
+	Status        string `json:"status"`
+	DetectedAt    string `json:"detected_at"`
+	CreditedAt    string `json:"credited_at,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+type USDCDepositRecordResult struct {
+	Deposit  USDCDetectedDeposit
+	Inserted bool
+}
+
+type USDCWatcherHealth struct {
+	Network                  string `json:"network"`
+	Enabled                  bool   `json:"enabled"`
+	Running                  bool   `json:"running"`
+	RPCURLConfigured         bool   `json:"rpc_url_configured"`
+	ReceiveAddressConfigured bool   `json:"receive_address_configured"`
+	LastScannedBlock         uint64 `json:"last_scanned_block"`
+	LatestBlock              uint64 `json:"latest_block"`
+	ConfirmedBlock           uint64 `json:"confirmed_block"`
+	Confirmations            uint64 `json:"confirmations"`
+	WatchIntervalSeconds     int64  `json:"watch_interval_seconds"`
+	LastCheckedAt            string `json:"last_checked_at,omitempty"`
+	LastSuccessAt            string `json:"last_success_at,omitempty"`
+	LastError                string `json:"last_error,omitempty"`
+}
+
+type USDCAdminDeposits struct {
+	RecentDetectedDeposits []USDCDetectedDeposit `json:"recent_detected_deposits"`
+	DuplicateTxs           []USDCDetectedDeposit `json:"duplicate_txs"`
+	WatcherHealth          USDCWatcherHealth     `json:"watcher_health"`
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("control db path is required")
@@ -391,6 +439,205 @@ VALUES (?, ?, ?, ?, ?);
 	return tx.Commit()
 }
 
+func (s *Store) RecordUSDCDetectedDeposit(ctx context.Context, dep USDCDetectedDeposit) (USDCDepositRecordResult, error) {
+	if dep.OrgID == "" {
+		dep.OrgID = DefaultOrgID
+	}
+	if dep.Status == "" {
+		dep.Status = "detected"
+	}
+	if dep.DetectedAt == "" {
+		dep.DetectedAt = nowString()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return USDCDepositRecordResult{}, err
+	}
+	defer rollback(tx)
+
+	existing, ok, err := usdcDepositByLog(ctx, tx, dep.TxHash, dep.LogIndex)
+	if err != nil {
+		return USDCDepositRecordResult{}, err
+	}
+	if ok {
+		return USDCDepositRecordResult{Deposit: existing, Inserted: false}, tx.Commit()
+	}
+
+	var matchingRows int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM usdc_deposits WHERE tx_hash = ?;`, dep.TxHash).Scan(&matchingRows); err != nil {
+		return USDCDepositRecordResult{}, err
+	}
+	var creditedRows int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_events WHERE provider = 'usdc' AND provider_event_id = ?;`, dep.TxHash).Scan(&creditedRows); err != nil {
+		return USDCDepositRecordResult{}, err
+	}
+	dep.DuplicateTx = dep.DuplicateTx || matchingRows > 0 || creditedRows > 0
+	if dep.DuplicateTx && dep.Status == "detected" {
+		dep.Status = "duplicate_tx"
+	}
+
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO usdc_deposits (
+	org_id, tx_hash, log_index, block_number, block_hash, network, token_address,
+	from_address, to_address, amount_micros, confirmations, credited, duplicate_tx,
+	status, detected_at, credited_at, error
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+`, dep.OrgID, dep.TxHash, dep.LogIndex, dep.BlockNumber, dep.BlockHash, dep.Network,
+		dep.TokenAddress, dep.FromAddress, dep.ToAddress, dep.AmountMicros, dep.Confirmations,
+		boolInt(dep.Credited), boolInt(dep.DuplicateTx), dep.Status, dep.DetectedAt,
+		nullable(dep.CreditedAt), nullable(dep.Error))
+	if err != nil {
+		return USDCDepositRecordResult{}, err
+	}
+	dep.ID, _ = res.LastInsertId()
+	return USDCDepositRecordResult{Deposit: dep, Inserted: true}, tx.Commit()
+}
+
+func (s *Store) MarkUSDCDetectedDeposit(ctx context.Context, txHash string, logIndex uint64, credited bool, status, errMsg string) error {
+	if status == "" {
+		if credited {
+			status = "credited"
+		} else {
+			status = "detected"
+		}
+	}
+	creditedAt := ""
+	if credited {
+		creditedAt = nowString()
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE usdc_deposits
+SET credited = ?, status = ?, credited_at = CASE WHEN ? = '' THEN credited_at ELSE ? END, error = ?
+WHERE tx_hash = ? AND log_index = ?;
+`, boolInt(credited), status, creditedAt, creditedAt, errMsg, txHash, logIndex)
+	return err
+}
+
+func (s *Store) USDCWatcherCursor(ctx context.Context, network string) (uint64, bool, error) {
+	if network == "" {
+		network = "base"
+	}
+	var last uint64
+	err := s.db.QueryRowContext(ctx, `SELECT last_scanned_block FROM usdc_watcher_state WHERE network = ?;`, network).Scan(&last)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return last, true, nil
+}
+
+func (s *Store) UpdateUSDCWatcherHealth(ctx context.Context, health USDCWatcherHealth) error {
+	if health.Network == "" {
+		health.Network = "base"
+	}
+	if health.LastCheckedAt == "" {
+		health.LastCheckedAt = nowString()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO usdc_watcher_state (
+	network, enabled, running, rpc_url_configured, receive_address_configured,
+	last_scanned_block, latest_block, confirmed_block, confirmations,
+	watch_interval_seconds, last_checked_at, last_success_at, last_error
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(network) DO UPDATE SET
+	enabled = excluded.enabled,
+	running = excluded.running,
+	rpc_url_configured = excluded.rpc_url_configured,
+	receive_address_configured = excluded.receive_address_configured,
+	last_scanned_block = CASE WHEN excluded.last_scanned_block = 0 THEN usdc_watcher_state.last_scanned_block ELSE excluded.last_scanned_block END,
+	latest_block = CASE WHEN excluded.latest_block = 0 THEN usdc_watcher_state.latest_block ELSE excluded.latest_block END,
+	confirmed_block = CASE WHEN excluded.confirmed_block = 0 THEN usdc_watcher_state.confirmed_block ELSE excluded.confirmed_block END,
+	confirmations = excluded.confirmations,
+	watch_interval_seconds = excluded.watch_interval_seconds,
+	last_checked_at = excluded.last_checked_at,
+	last_success_at = CASE WHEN excluded.last_success_at = '' THEN usdc_watcher_state.last_success_at ELSE excluded.last_success_at END,
+	last_error = excluded.last_error;
+`, health.Network, boolInt(health.Enabled), boolInt(health.Running), boolInt(health.RPCURLConfigured),
+		boolInt(health.ReceiveAddressConfigured), health.LastScannedBlock, health.LatestBlock,
+		health.ConfirmedBlock, health.Confirmations, health.WatchIntervalSeconds,
+		health.LastCheckedAt, health.LastSuccessAt, health.LastError)
+	return err
+}
+
+func (s *Store) USDCWatcherHealth(ctx context.Context, network string) (USDCWatcherHealth, error) {
+	if network == "" {
+		network = "base"
+	}
+	var h USDCWatcherHealth
+	var enabled, running, rpcConfigured, receiveConfigured int
+	err := s.db.QueryRowContext(ctx, `
+SELECT network, enabled, running, rpc_url_configured, receive_address_configured,
+       last_scanned_block, latest_block, confirmed_block, confirmations,
+       watch_interval_seconds, COALESCE(last_checked_at, ''), COALESCE(last_success_at, ''),
+       COALESCE(last_error, '')
+FROM usdc_watcher_state
+WHERE network = ?;
+`, network).Scan(&h.Network, &enabled, &running, &rpcConfigured, &receiveConfigured,
+		&h.LastScannedBlock, &h.LatestBlock, &h.ConfirmedBlock, &h.Confirmations,
+		&h.WatchIntervalSeconds, &h.LastCheckedAt, &h.LastSuccessAt, &h.LastError)
+	if errors.Is(err, sql.ErrNoRows) {
+		return USDCWatcherHealth{Network: network}, nil
+	}
+	if err != nil {
+		return USDCWatcherHealth{}, err
+	}
+	h.Enabled = enabled != 0
+	h.Running = running != 0
+	h.RPCURLConfigured = rpcConfigured != 0
+	h.ReceiveAddressConfigured = receiveConfigured != 0
+	return h, nil
+}
+
+func (s *Store) RecentUSDCDetectedDeposits(ctx context.Context, limit int, duplicatesOnly bool) ([]USDCDetectedDeposit, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	where := ""
+	if duplicatesOnly {
+		where = "WHERE duplicate_tx = 1"
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, org_id, tx_hash, log_index, block_number, block_hash, network, token_address,
+       from_address, to_address, amount_micros, confirmations, credited, duplicate_tx,
+       status, detected_at, COALESCE(credited_at, ''), COALESCE(error, '')
+FROM usdc_deposits
+`+where+`
+ORDER BY block_number DESC, log_index DESC, id DESC
+LIMIT ?;
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []USDCDetectedDeposit
+	for rows.Next() {
+		dep, err := scanUSDCDeposit(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, dep)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) USDCAdminDeposits(ctx context.Context, network string, limit int) (USDCAdminDeposits, error) {
+	recent, err := s.RecentUSDCDetectedDeposits(ctx, limit, false)
+	if err != nil {
+		return USDCAdminDeposits{}, err
+	}
+	duplicates, err := s.RecentUSDCDetectedDeposits(ctx, limit, true)
+	if err != nil {
+		return USDCAdminDeposits{}, err
+	}
+	health, err := s.USDCWatcherHealth(ctx, network)
+	if err != nil {
+		return USDCAdminDeposits{}, err
+	}
+	return USDCAdminDeposits{RecentDetectedDeposits: recent, DuplicateTxs: duplicates, WatcherHealth: health}, nil
+}
+
 func RuntimeChargeMicros(seconds int64, features []string) int64 {
 	if seconds <= 0 {
 		return 0
@@ -451,6 +698,48 @@ func nullable(s string) any {
 		return nil
 	}
 	return s
+}
+
+type usdcDepositScanner interface {
+	Scan(dest ...any) error
+}
+
+func usdcDepositByLog(ctx context.Context, tx *sql.Tx, txHash string, logIndex uint64) (USDCDetectedDeposit, bool, error) {
+	dep, err := scanUSDCDeposit(tx.QueryRowContext(ctx, `
+SELECT id, org_id, tx_hash, log_index, block_number, block_hash, network, token_address,
+       from_address, to_address, amount_micros, confirmations, credited, duplicate_tx,
+       status, detected_at, COALESCE(credited_at, ''), COALESCE(error, '')
+FROM usdc_deposits
+WHERE tx_hash = ? AND log_index = ?;
+`, txHash, logIndex))
+	if errors.Is(err, sql.ErrNoRows) {
+		return USDCDetectedDeposit{}, false, nil
+	}
+	if err != nil {
+		return USDCDetectedDeposit{}, false, err
+	}
+	return dep, true, nil
+}
+
+func scanUSDCDeposit(scanner usdcDepositScanner) (USDCDetectedDeposit, error) {
+	var dep USDCDetectedDeposit
+	var credited, duplicate int
+	if err := scanner.Scan(&dep.ID, &dep.OrgID, &dep.TxHash, &dep.LogIndex, &dep.BlockNumber,
+		&dep.BlockHash, &dep.Network, &dep.TokenAddress, &dep.FromAddress, &dep.ToAddress,
+		&dep.AmountMicros, &dep.Confirmations, &credited, &duplicate, &dep.Status,
+		&dep.DetectedAt, &dep.CreditedAt, &dep.Error); err != nil {
+		return USDCDetectedDeposit{}, err
+	}
+	dep.Credited = credited != 0
+	dep.DuplicateTx = duplicate != 0
+	return dep, nil
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func nowString() string {
@@ -535,5 +824,46 @@ CREATE TABLE IF NOT EXISTS billing_events (
 	amount_micros INTEGER NOT NULL DEFAULT 0,
 	metadata_json TEXT NOT NULL DEFAULT '{}',
 	created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS usdc_deposits (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	org_id TEXT NOT NULL REFERENCES organizations(id),
+	tx_hash TEXT NOT NULL,
+	log_index INTEGER NOT NULL,
+	block_number INTEGER NOT NULL,
+	block_hash TEXT NOT NULL,
+	network TEXT NOT NULL,
+	token_address TEXT NOT NULL,
+	from_address TEXT NOT NULL,
+	to_address TEXT NOT NULL,
+	amount_micros INTEGER NOT NULL,
+	confirmations INTEGER NOT NULL DEFAULT 0,
+	credited INTEGER NOT NULL DEFAULT 0,
+	duplicate_tx INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL,
+	detected_at TEXT NOT NULL,
+	credited_at TEXT,
+	error TEXT,
+	UNIQUE(tx_hash, log_index)
+);
+
+CREATE INDEX IF NOT EXISTS usdc_deposits_detected_idx ON usdc_deposits(detected_at);
+CREATE INDEX IF NOT EXISTS usdc_deposits_tx_idx ON usdc_deposits(tx_hash);
+
+CREATE TABLE IF NOT EXISTS usdc_watcher_state (
+	network TEXT PRIMARY KEY,
+	enabled INTEGER NOT NULL DEFAULT 0,
+	running INTEGER NOT NULL DEFAULT 0,
+	rpc_url_configured INTEGER NOT NULL DEFAULT 0,
+	receive_address_configured INTEGER NOT NULL DEFAULT 0,
+	last_scanned_block INTEGER NOT NULL DEFAULT 0,
+	latest_block INTEGER NOT NULL DEFAULT 0,
+	confirmed_block INTEGER NOT NULL DEFAULT 0,
+	confirmations INTEGER NOT NULL DEFAULT 0,
+	watch_interval_seconds INTEGER NOT NULL DEFAULT 0,
+	last_checked_at TEXT,
+	last_success_at TEXT,
+	last_error TEXT
 );
 `

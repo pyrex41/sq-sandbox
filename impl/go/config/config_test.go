@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestFromEnvDefaults(t *testing.T) {
@@ -21,6 +22,12 @@ func TestFromEnvDefaults(t *testing.T) {
 	}
 	if c.SnapshotBackend != "squashfs" {
 		t.Errorf("SnapshotBackend = %q, want squashfs", c.SnapshotBackend)
+	}
+	if c.USDCWatchInterval != 30*time.Second {
+		t.Errorf("USDCWatchInterval = %s, want 30s", c.USDCWatchInterval)
+	}
+	if c.USDCConfirmations != 12 {
+		t.Errorf("USDCConfirmations = %d, want 12", c.USDCConfirmations)
 	}
 }
 
@@ -72,10 +79,14 @@ func TestGUIModuleDefault(t *testing.T) {
 	os.Setenv("SQUASH_DATA", "/data")
 	defer os.Unsetenv("SQUASH_DATA")
 	os.Unsetenv("SQUASH_GUI_MODULE")
+	os.Unsetenv("SQUASH_BROWSER_MODULE")
 	os.Unsetenv("SQUASH_DEFAULT_FEATURES")
 	c := FromEnv()
 	if c.GUIModule != "500-gui-base" {
 		t.Errorf("GUIModule default = %q, want 500-gui-base", c.GUIModule)
+	}
+	if c.BrowserModule != "510-browser-base" {
+		t.Errorf("BrowserModule default = %q, want 510-browser-base", c.BrowserModule)
 	}
 	if len(c.DefaultFeatures) != 0 {
 		t.Errorf("DefaultFeatures default = %v, want empty", c.DefaultFeatures)
@@ -86,16 +97,48 @@ func TestDefaultFeaturesParsesCommaList(t *testing.T) {
 	os.Setenv("SQUASH_DATA", "/data")
 	os.Setenv("SQUASH_DEFAULT_FEATURES", "gui, secret-proxy")
 	os.Setenv("SQUASH_GUI_MODULE", "510-gui-minimal")
+	os.Setenv("SQUASH_BROWSER_MODULE", "520-browser-custom")
 	defer os.Unsetenv("SQUASH_DATA")
 	defer os.Unsetenv("SQUASH_DEFAULT_FEATURES")
 	defer os.Unsetenv("SQUASH_GUI_MODULE")
+	defer os.Unsetenv("SQUASH_BROWSER_MODULE")
 
 	c := FromEnv()
 	if c.GUIModule != "510-gui-minimal" {
 		t.Errorf("GUIModule = %q, want 510-gui-minimal", c.GUIModule)
 	}
+	if c.BrowserModule != "520-browser-custom" {
+		t.Errorf("BrowserModule = %q, want 520-browser-custom", c.BrowserModule)
+	}
 	if len(c.DefaultFeatures) != 2 || c.DefaultFeatures[0] != "gui" ||
 		c.DefaultFeatures[1] != "secret-proxy" {
 		t.Errorf("DefaultFeatures = %v, want [gui secret-proxy]", c.DefaultFeatures)
+	}
+}
+
+func TestUSDCWatcherConfigFromEnv(t *testing.T) {
+	os.Setenv("SQUASH_DATA", "/data")
+	os.Setenv("SQUASH_BASE_RPC_URL", "https://base.example")
+	os.Setenv("SQUASH_USDC_WATCH_INTERVAL", "45s")
+	os.Setenv("SQUASH_USDC_CONFIRMATIONS", "8")
+	os.Setenv("SQUASH_USDC_START_BLOCK", "123")
+	defer os.Unsetenv("SQUASH_DATA")
+	defer os.Unsetenv("SQUASH_BASE_RPC_URL")
+	defer os.Unsetenv("SQUASH_USDC_WATCH_INTERVAL")
+	defer os.Unsetenv("SQUASH_USDC_CONFIRMATIONS")
+	defer os.Unsetenv("SQUASH_USDC_START_BLOCK")
+
+	c := FromEnv()
+	if c.BaseRPCURL != "https://base.example" {
+		t.Errorf("BaseRPCURL = %q", c.BaseRPCURL)
+	}
+	if c.USDCWatchInterval != 45*time.Second {
+		t.Errorf("USDCWatchInterval = %s, want 45s", c.USDCWatchInterval)
+	}
+	if c.USDCConfirmations != 8 {
+		t.Errorf("USDCConfirmations = %d, want 8", c.USDCConfirmations)
+	}
+	if c.USDCStartBlock != 123 {
+		t.Errorf("USDCStartBlock = %d, want 123", c.USDCStartBlock)
 	}
 }

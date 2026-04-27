@@ -98,6 +98,9 @@ func (h *Handler) handleUSDCConfirm(w http.ResponseWriter, r *http.Request) {
 	if !h.requireControlPlane(w) {
 		return
 	}
+	if !h.requireAdmin(w, r) {
+		return
+	}
 	var body struct {
 		OrgID        string `json:"org_id"`
 		TxHash       string `json:"tx_hash"`
@@ -113,6 +116,10 @@ func (h *Handler) handleUSDCConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.cfg.USDCReceiveAddress == "" {
 		jsonError(w, "SQUASH_USDC_RECEIVE_ADDRESS is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if h.cfg.BaseRPCURL == "" {
+		jsonError(w, "SQUASH_BASE_RPC_URL is not configured", http.StatusServiceUnavailable)
 		return
 	}
 	if body.OrgID == "" {
@@ -144,16 +151,55 @@ func (h *Handler) handleUSDCConfirm(w http.ResponseWriter, r *http.Request) {
 		FromAddress:  body.FromAddress,
 		ToAddress:    body.ToAddress,
 	}
-	if err := controlplane.ValidateManualUSDCDeposit(deposit, h.cfg.USDCNetwork, h.cfg.USDCTokenAddress, h.cfg.USDCReceiveAddress); err != nil {
-		jsonError(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	result, err := h.cp.Store().ConfirmUSDCDeposit(r.Context(), deposit)
+	verified, err := controlplane.VerifyUSDCDepositTx(r.Context(), h.usdcWatcherConfig(), deposit)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	jsonOK(w, result)
+	recorded, err := h.cp.Store().RecordUSDCDetectedDeposit(r.Context(), verified)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !recorded.Inserted && recorded.Deposit.Credited {
+		summary, err := h.cp.Store().OrgSummary(r.Context(), recorded.Deposit.OrgID)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		jsonOK(w, map[string]any{
+			"credited":              false,
+			"credit_balance_micros": summary.CreditBalanceMicros,
+			"detected_deposit":      recorded.Deposit,
+		})
+		return
+	}
+	result, err := h.cp.Store().ConfirmUSDCDeposit(r.Context(), controlplane.USDCDeposit{
+		OrgID:        verified.OrgID,
+		TxHash:       verified.TxHash,
+		AmountMicros: verified.AmountMicros,
+		Network:      verified.Network,
+		TokenAddress: verified.TokenAddress,
+		FromAddress:  verified.FromAddress,
+		ToAddress:    verified.ToAddress,
+	})
+	if err != nil {
+		_ = h.cp.Store().MarkUSDCDetectedDeposit(r.Context(), verified.TxHash, verified.LogIndex, false, "error", err.Error())
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	status := "credited"
+	if !result.Credited {
+		status = "duplicate_tx"
+	}
+	_ = h.cp.Store().MarkUSDCDetectedDeposit(r.Context(), verified.TxHash, verified.LogIndex, result.Credited, status, "")
+	recorded.Deposit.Credited = result.Credited
+	recorded.Deposit.Status = status
+	jsonOK(w, map[string]any{
+		"credited":              result.Credited,
+		"credit_balance_micros": result.CreditBalanceMicros,
+		"detected_deposit":      recorded.Deposit,
+	})
 }
 
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -187,7 +233,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 </head>
 <body>
   <h1>sq-sandbox</h1>
-  <p class="muted">Hosted sandbox control plane MVP. USDC top-ups are manually confirmed for beta users.</p>
+  <p class="muted">Hosted sandbox control plane MVP. USDC top-ups are watched on-chain before credits are confirmed.</p>
   <div class="cards">
     <div class="card"><strong>Credits</strong><br>%s</div>
     <div class="card"><strong>Monthly usage</strong><br>%s / %s</div>
@@ -205,7 +251,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		dash.Org.MaxConcurrentSandboxes,
 		html.EscapeString(dash.Org.Plan),
 		h.usdcTopUpHTML(),
-		h.usdcAdminHTML(),
+		h.adminDepositLinkHTML(r),
 	)
 	for _, sb := range dash.RecentSandboxes {
 		fmt.Fprintf(w, `<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
@@ -241,6 +287,25 @@ func (h *Handler) requireControlPlane(w http.ResponseWriter) bool {
 	return true
 }
 
+func (h *Handler) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if h.cfg.AdminToken == "" {
+		jsonError(w, "SQUASH_ADMIN_TOKEN is not configured", http.StatusServiceUnavailable)
+		return false
+	}
+	if !h.isAdminRequest(r) {
+		jsonError(w, "admin token required", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) isAdminRequest(r *http.Request) bool {
+	if h.cfg.AdminToken == "" {
+		return false
+	}
+	return r.Header.Get("Authorization") == "Bearer "+h.cfg.AdminToken
+}
+
 func orgIDFromRequest(r *http.Request) string {
 	if orgID := r.URL.Query().Get("org_id"); orgID != "" {
 		return orgID
@@ -274,7 +339,7 @@ func (h *Handler) usdcInstructions(orgID string) map[string]any {
 		"receive_address":      h.cfg.USDCReceiveAddress,
 		"explorer_tx_base_url": h.cfg.USDCExplorerTxBaseURL,
 		"confirm_endpoint":     "/cgi-bin/api/billing/usdc/confirm",
-		"note":                 "Send native USDC on the configured network, then submit the tx hash for manual admin confirmation.",
+		"note":                 "Send native USDC on the configured network. Confirmed transfers to this address are detected on-chain.",
 	}
 }
 
@@ -284,7 +349,7 @@ func (h *Handler) usdcTopUpHTML() string {
 	}
 	return fmt.Sprintf(`<div class="card">
     <strong>USDC top-up</strong><br>
-    <span class="muted">Send native USDC on %s (chain %s), then submit the tx hash for manual credit.</span><br>
+    <span class="muted">Send native USDC on %s (chain %s). Confirmed transfers to this address are detected on-chain.</span><br>
     <code>%s</code><br>
     <span class="muted">Token: <code>%s</code></span>
   </div>`,
@@ -295,13 +360,23 @@ func (h *Handler) usdcTopUpHTML() string {
 	)
 }
 
+func (h *Handler) adminDepositLinkHTML(r *http.Request) string {
+	if h.cfg.USDCReceiveAddress == "" || !h.isAdminRequest(r) {
+		return ""
+	}
+	return `<div class="card"><strong>Admin deposits</strong><br><a href="/app/admin/deposits">Review detected USDC deposits and watcher health</a></div>`
+}
+
 func (h *Handler) usdcAdminHTML() string {
 	if h.cfg.USDCReceiveAddress == "" {
 		return ""
 	}
 	return fmt.Sprintf(`<h2>Admin: confirm USDC deposit</h2>
   <div class="card">
-    <p class="muted">Verify the transfer on the explorer first. This records credits idempotently by tx hash.</p>
+    <p class="muted">The server verifies the transaction on Base before recording credits idempotently by tx hash.</p>
+    <label>Admin bearer token
+      <input id="usdc-admin-token" placeholder="SQUASH_ADMIN_TOKEN" autocomplete="off" type="password">
+    </label>
     <label>Transaction hash
       <input id="usdc-tx-hash" placeholder="0x..." autocomplete="off">
     </label>
@@ -329,7 +404,7 @@ func (h *Handler) usdcAdminHTML() string {
     try {
       const res = await fetch('/cgi-bin/api/billing/usdc/confirm', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + document.getElementById('usdc-admin-token').value.trim()},
         body: JSON.stringify(payload)
       });
       const body = await res.json();
@@ -349,6 +424,133 @@ func (h *Handler) usdcAdminHTML() string {
 		h.cfg.USDCTokenAddress,
 		h.cfg.USDCReceiveAddress,
 	)
+}
+
+func (h *Handler) handleAdminUSDCDeposits(w http.ResponseWriter, r *http.Request) {
+	if !h.requireControlPlane(w) {
+		return
+	}
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	data, err := h.cp.Store().USDCAdminDeposits(r.Context(), h.cfg.USDCNetwork, 50)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, data)
+}
+
+func (h *Handler) handleAdminDeposits(w http.ResponseWriter, r *http.Request) {
+	if !h.requireControlPlane(w) {
+		return
+	}
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	data, err := h.cp.Store().USDCAdminDeposits(r.Context(), h.cfg.USDCNetwork, 50)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	health := data.WatcherHealth
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sq-sandbox admin deposits</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #111; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 1rem 0; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; background: #fafafa; }
+    table { border-collapse: collapse; width: 100%%; margin-top: 1rem; }
+    th, td { border-bottom: 1px solid #eee; padding: .55rem; text-align: left; }
+    input { display: block; box-sizing: border-box; margin: .35rem 0 .75rem; padding: .5rem; width: 100%%; max-width: 44rem; }
+    button { padding: .55rem .8rem; cursor: pointer; }
+    .muted { color: #666; }
+    code { background: #f1f1f1; padding: .15rem .3rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>USDC deposits</h1>
+  <p class="muted"><a href="/app">Dashboard</a></p>
+  <div class="cards">
+    <div class="card"><strong>Watcher</strong><br>%s</div>
+    <div class="card"><strong>Latest block</strong><br>%d</div>
+    <div class="card"><strong>Confirmed through</strong><br>%d</div>
+    <div class="card"><strong>Cursor</strong><br>%d</div>
+    <div class="card"><strong>Last success</strong><br>%s</div>
+    <div class="card"><strong>Last error</strong><br>%s</div>
+  </div>
+  %s
+  <h2>Recent detected deposits</h2>
+  %s
+  <h2>Duplicate txs</h2>
+  %s
+</body>
+</html>`,
+		boolStatus(health.Enabled && health.Running),
+		health.LatestBlock,
+		health.ConfirmedBlock,
+		health.LastScannedBlock,
+		html.EscapeString(health.LastSuccessAt),
+		html.EscapeString(health.LastError),
+		h.usdcAdminHTML(),
+		depositTableHTML(data.RecentDetectedDeposits),
+		depositTableHTML(data.DuplicateTxs),
+	)
+}
+
+func (h *Handler) usdcWatcherConfig() controlplane.USDCWatcherConfig {
+	return controlplane.USDCWatcherConfig{
+		RPCURL:          h.cfg.BaseRPCURL,
+		Network:         h.cfg.USDCNetwork,
+		ChainID:         h.cfg.USDCChainID,
+		TokenAddress:    h.cfg.USDCTokenAddress,
+		ReceiveAddress:  h.cfg.USDCReceiveAddress,
+		Confirmations:   h.cfg.USDCConfirmations,
+		WatchInterval:   h.cfg.USDCWatchInterval,
+		StartBlock:      h.cfg.USDCStartBlock,
+		ExplorerBaseURL: h.cfg.USDCExplorerTxBaseURL,
+	}
+}
+
+func depositTableHTML(deposits []controlplane.USDCDetectedDeposit) string {
+	if len(deposits) == 0 {
+		return `<p class="muted">No deposits found.</p>`
+	}
+	var b strings.Builder
+	b.WriteString(`<table><thead><tr><th>When</th><th>Tx</th><th>Block</th><th>From</th><th>Amount</th><th>Status</th><th>Credited</th><th>Duplicate</th></tr></thead><tbody>`)
+	for _, dep := range deposits {
+		fmt.Fprintf(&b, `<tr><td>%s</td><td><code>%s</code></td><td>%d</td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
+			html.EscapeString(dep.DetectedAt),
+			html.EscapeString(shortHash(dep.TxHash)),
+			dep.BlockNumber,
+			html.EscapeString(shortHash(dep.FromAddress)),
+			formatMicros(dep.AmountMicros),
+			html.EscapeString(dep.Status),
+			boolStatus(dep.Credited),
+			boolStatus(dep.DuplicateTx),
+		)
+	}
+	b.WriteString(`</tbody></table>`)
+	return b.String()
+}
+
+func boolStatus(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func shortHash(s string) string {
+	if len(s) <= 18 {
+		return s
+	}
+	return s[:10] + "..." + s[len(s)-6:]
 }
 
 func formatMicros(v int64) string {

@@ -8,22 +8,24 @@ import (
 const maxBodySize = 64 * 1024 * 1024 // 64 MiB — matches Go proxy limit
 
 // authMiddleware wraps a handler with Bearer token authentication.
-// Routes under /cgi-bin/api/ and /app require the token; health stays public.
-// If authToken is empty, all requests pass through.
+// Routes under /cgi-bin/api/ and /app require the normal or admin token; health
+// stays public. If authToken is empty, non-admin requests pass through.
 //
 // The noVNC reverse-proxy subtree (/cgi-bin/api/sandboxes/.../novnc/...) is
 // exempted: it authenticates with a per-sandbox session token issued at
 // /gui/enable time, not the daemon-wide token. Mixing the two would force
 // the daemon-wide token into shareable URLs.
-func authMiddleware(authToken string, next http.Handler) http.Handler {
+func authMiddleware(authToken, adminToken string, next http.Handler) http.Handler {
 	if authToken == "" {
 		return next
 	}
 	expected := "Bearer " + authToken
+	adminExpected := "Bearer " + adminToken
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		protected := strings.HasPrefix(r.URL.Path, "/cgi-bin/api/") || strings.HasPrefix(r.URL.Path, "/app")
 		if protected && !isNoVNCPath(r.URL.Path) {
-			if r.Header.Get("Authorization") != expected {
+			auth := r.Header.Get("Authorization")
+			if auth != expected && (adminToken == "" || auth != adminExpected) {
 				jsonError(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}

@@ -3,11 +3,13 @@ package manager
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"squashd/config"
@@ -20,6 +22,8 @@ const (
 	defaultGUIResolution = "1920x1080"
 	defaultGUINoVNCPort  = 6080
 	defaultGUIVNCPort    = 5900
+	defaultBrowserFIFO   = "/var/lib/sq-gui/browser-open.fifo"
+	browserOpenCommand   = "/usr/local/bin/sq-browser-open"
 )
 
 // EnableGUI ensures the GUI layer is mounted and starts the in-sandbox GUI
@@ -84,7 +88,7 @@ func (m *Manager) DisableGUI(id string) error {
 
 	// Best-effort cleanup of stragglers (Xvfb / x11vnc / websockify) inside
 	// the sandbox. Non-fatal on failure.
-	cleanup := "pkill -TERM -f 'Xvfb|x11vnc|websockify|startxfce4|sq-gui-start' 2>/dev/null; sleep 1; pkill -KILL -f 'Xvfb|x11vnc|websockify|startxfce4|sq-gui-start' 2>/dev/null; true"
+	cleanup := "pkill -TERM -f 'Xvfb|x11vnc|websockify|startxfce4|sq-gui-start|sq-browser-open|chromium|firefox|dbus-daemon' 2>/dev/null; sleep 1; pkill -KILL -f 'Xvfb|x11vnc|websockify|startxfce4|sq-gui-start|sq-browser-open|chromium|firefox|dbus-daemon' 2>/dev/null; true"
 	_, _ = sqexec.Run(s.mergedDir(), cleanup, "/", 10)
 
 	s.mu.Lock()
@@ -155,6 +159,63 @@ func (m *Manager) GUITarget(id string) (*GUITarget, error) {
 		NoVNCPort:    s.GUI.NoVNCPort,
 		SessionToken: s.GUI.SessionToken,
 	}, nil
+}
+
+// OpenGUIBrowser asks the already-running GUI session to open url. It does not
+// use normal sandbox exec: sq-gui-start owns a small FIFO command channel, so
+// browsers inherit the same DISPLAY, DBus, XDG runtime, and namespace context as
+// the long-lived desktop session.
+func (m *Manager) OpenGUIBrowser(id, url string) error {
+	m.mu.Lock()
+	s, exists := m.sandboxes[id]
+	m.mu.Unlock()
+	if !exists || s == nil {
+		return fmt.Errorf("sandbox not found: %s", id)
+	}
+
+	s.guiMu.Lock()
+	defer s.guiMu.Unlock()
+
+	s.mu.Lock()
+	gui := s.GUI
+	s.mu.Unlock()
+	if gui == nil || !gui.Enabled {
+		return fmt.Errorf("gui not enabled: %s", id)
+	}
+
+	cmdPath := filepath.Join(s.mergedDir(), strings.TrimPrefix(browserOpenCommand, "/"))
+	if _, err := os.Stat(cmdPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("browser module not active: %s", id)
+		}
+		return fmt.Errorf("check browser opener: %w", err)
+	}
+
+	fifoPath := filepath.Join(s.mergedDir(), strings.TrimPrefix(defaultBrowserFIFO, "/"))
+	info, err := os.Stat(fifoPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("gui browser channel not ready: %s", id)
+		}
+		return fmt.Errorf("stat browser channel: %w", err)
+	}
+	if info.Mode()&os.ModeNamedPipe == 0 {
+		return fmt.Errorf("gui browser channel not ready: %s", id)
+	}
+	f, err := os.OpenFile(fifoPath, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENXIO) {
+			return fmt.Errorf("gui browser channel not ready: %s", id)
+		}
+		return fmt.Errorf("open browser channel: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := fmt.Fprintln(f, url); err != nil {
+		return fmt.Errorf("write browser command: %w", err)
+	}
+	s.updateLastActive()
+	return nil
 }
 
 // startGUI mounts the GUI module if needed, writes /etc/sq-gui.conf into the
@@ -289,10 +350,10 @@ func readPID(path string) int {
 	return pid
 }
 
-// writeGUIConfig writes /etc/sq-gui.conf into the sandbox upper layer. The
-// in-sandbox sq-gui-start script sources this file to pick up parameters.
+// writeGUIConfig writes /etc/sq-gui.conf through the merged overlay so
+// fuse-overlayfs sees the change immediately and persists it into upper.
 func writeGUIConfig(s *Sandbox, desktop, resolution, vncPassword string) error {
-	dir := filepath.Join(s.upperDataDir(), "etc")
+	dir := filepath.Join(s.mergedDir(), "etc")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -326,6 +387,14 @@ func guiModule(cfg *config.Config, opts *GUIOpts) string {
 		return cfg.GUIModule
 	}
 	return "500-gui-base"
+}
+
+// browserModule returns the module name to use for the browser support layer.
+func browserModule(cfg *config.Config) string {
+	if cfg != nil && cfg.BrowserModule != "" {
+		return cfg.BrowserModule
+	}
+	return "510-browser-base"
 }
 
 // hasFeature returns true if name is in the features slice (case-insensitive).

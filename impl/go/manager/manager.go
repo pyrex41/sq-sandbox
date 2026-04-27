@@ -646,11 +646,23 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 	// Merge daemon-wide default features (e.g. SQUASH_DEFAULT_FEATURES=gui) into
 	// the per-sandbox features list.
 	opts.Features = mergeFeatures(opts.Features, m.cfg.DefaultFeatures)
+	if hasFeature(opts.Features, "browser") {
+		opts.Features = mergeFeatures(opts.Features, []string{"gui"})
+	}
 
 	// If "gui" is in features, auto-append the GUI module so it mounts as part
 	// of the initial overlay (no second remount needed at startup).
 	if hasFeature(opts.Features, "gui") {
 		mod := guiModule(m.cfg, opts.GUI)
+		if !validModuleName(mod) {
+			return nil, fmt.Errorf("invalid module: %s", mod)
+		}
+		if !contains(opts.Layers, mod) {
+			opts.Layers = append(opts.Layers, mod)
+		}
+	}
+	if hasFeature(opts.Features, "browser") {
+		mod := browserModule(m.cfg)
 		if !validModuleName(mod) {
 			return nil, fmt.Errorf("invalid module: %s", mod)
 		}

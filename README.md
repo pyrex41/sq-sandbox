@@ -202,7 +202,7 @@ curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/enable \
 #     "desktop": "xfce",
 #     "novnc_port": 6080,
 #     "session_token": "a1b2…(32 hex chars)",
-#     "novnc_url": "/cgi-bin/api/sandboxes/user-123/novnc/vnc.html?_token=a1b2…"
+#     "novnc_url": "/cgi-bin/api/sandboxes/user-123/novnc/vnc.html?_token=a1b2…&autoconnect=true&path=..."
 #   }
 
 curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/disable \
@@ -222,7 +222,8 @@ The GUI module ships a `/usr/local/bin/sq-gui-start` script that reads
 GUI is enabled) for `DESKTOP`, `RESOLUTION`, `VNC_PORT`, `NOVNC_PORT`,
 and `VNC_PASSWORD`. Set `SQUASH_DEFAULT_FEATURES=gui` to make every new
 sandbox boot with GUI enabled, or `SQUASH_GUI_MODULE=510-gui-minimal` to
-swap the default desktop layer.
+swap the default desktop layer. Add `browser` to the features list when
+you want an in-desktop browser.
 
 #### How the desktop reaches the browser
 
@@ -263,6 +264,40 @@ Build the GUI layer once, then S3-sync makes it available everywhere:
 sq-mkmod preset gui-base                 # → 500-gui-base.squashfs (~120 MB)
 # pushed to S3 automatically when SQUASH_S3_BUCKET is set
 ```
+
+#### Browser Launches Inside GUI
+
+Browser support is a separate layer because Chromium is large. Build it once:
+
+```sh
+sq-mkmod preset browser-base             # → 510-browser-base.squashfs
+```
+
+Create sandboxes with both features so the browser layer is activated into
+the same live desktop root:
+
+```json
+{
+    "id": "user-123",
+    "layers": "000-base-alpine",
+    "features": ["gui", "browser"]
+}
+```
+
+Open a URL in the running desktop:
+
+```sh
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/browser/open \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com"}'
+```
+
+The API does not run a post-hoc sandbox exec for this. `sq-gui-start` owns
+`/var/lib/sq-gui/browser-open.fifo` inside the long-lived desktop session, and
+squashd writes browser-open requests into that channel. The browser inherits
+the GUI session's `DISPLAY`, DBus session, XDG runtime directory, and mounted
+rootfs.
 
 ### Autonomous Task Runner
 
@@ -442,6 +477,7 @@ etc. — anything that supports privileged containers.
 | `SQUASH_DATA`         | `/data`                       | Root directory for all state         |
 | `SQUASH_PORT`         | `8080`                        | HTTP API listen port                 |
 | `SQUASH_AUTH_TOKEN`   | `""` (no auth)                | Bearer token for API authentication  |
+| `SQUASH_ADMIN_TOKEN`  | `""`                          | Separate bearer token for admin-only credit confirmation and deposit views |
 | `SQUASH_S3_BUCKET`    | `""` (disabled)               | S3 bucket for module/snapshot sync   |
 | `SQUASH_S3_ENDPOINT`  | `""` (AWS default)            | Custom endpoint for R2/MinIO/B2      |
 | `SQUASH_S3_REGION`    | `us-east-1`                   | AWS region                           |
@@ -455,7 +491,13 @@ etc. — anything that supports privileged containers.
 | `SQUASH_STORE_SOCK`   | `$SQUASH_DATA/.sq-store.sock` | sq-store sidecar socket path         |
 | `SQUASH_STORE_DIR`    | `$SQUASH_DATA/.sq-store/`     | Irmin pack data directory            |
 | `SQUASH_GUI_MODULE`   | `500-gui-base`                | Default layer used when `features:["gui"]` is set |
+| `SQUASH_BROWSER_MODULE` | `510-browser-base`          | Default browser layer used when `features:["browser"]` is set |
 | `SQUASH_DEFAULT_FEATURES` | `""`                      | Comma-separated features applied to every new sandbox (e.g. `gui`) |
+| `SQUASH_BASE_RPC_URL` | `""`                          | Base JSON-RPC URL used to verify and watch USDC transfers |
+| `SQUASH_USDC_WATCH_INTERVAL` | `30s`                  | Interval between Base USDC watcher polls; accepts Go durations or seconds |
+| `SQUASH_USDC_CONFIRMATIONS` | `12`                    | Confirmation depth required before USDC deposits are credited |
+| `SQUASH_USDC_START_BLOCK` | `0`                       | Initial Base block for the USDC watcher when no SQLite cursor exists |
+| `SQUASH_USDC_RECEIVE_ADDRESS` | `""`                  | Receive address for native USDC top-ups |
 
 ### Irmin Snapshot Backend
 

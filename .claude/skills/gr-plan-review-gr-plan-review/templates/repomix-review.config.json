@@ -1,0 +1,34 @@
+{
+  "output": {
+    "style": "xml",
+    "filePath": ".gr-packed.xml",
+    "removeComments": true,
+    "removeEmptyLines": true
+  },
+  "include": [
+    "**/*"
+  ],
+  "ignore": {
+    "defaultPatterns": true,
+    "customPatterns": [
+      ".git/**",
+      ".claude/**",
+      "node_modules/**",
+      "build/**",
+      "dist/**",
+      "target/**",
+      "bin/**",
+      "*.log",
+      "coverage/**",
+      "docs/**",
+      "README.md",
+      "LICENSE",
+      "**/*_test.go",
+      "**/*.test.*",
+      "go.sum",
+      "**/vendor/**",
+      "**/*.min.*"
+    ]
+  },
+  "compress": true
+}

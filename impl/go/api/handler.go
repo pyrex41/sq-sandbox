@@ -39,6 +39,7 @@ func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *co
 	// Health — public
 	mux.HandleFunc("GET /cgi-bin/health", h.handleHealth)
 	mux.HandleFunc("/cgi-bin/health", h.handleHealth) // method-agnostic fallback
+	mux.HandleFunc("GET /app/admin/deposits", h.handleAdminDeposits)
 	mux.HandleFunc("GET /app", h.handleDashboard)
 	mux.HandleFunc("GET /app/", h.handleDashboard)
 
@@ -52,6 +53,7 @@ func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *co
 	mux.HandleFunc("POST /cgi-bin/api/billing/webhook", h.handleBillingWebhook)
 	mux.HandleFunc("GET /cgi-bin/api/billing/usdc", h.handleUSDCInstructions)
 	mux.HandleFunc("POST /cgi-bin/api/billing/usdc/confirm", h.handleUSDCConfirm)
+	mux.HandleFunc("GET /cgi-bin/api/admin/usdc/deposits", h.handleAdminUSDCDeposits)
 
 	// Sandboxes collection
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes", h.handleListSandboxes)
@@ -80,6 +82,7 @@ func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *co
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/enable", h.handleGUIEnable)
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/disable", h.handleGUIDisable)
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/gui/status", h.handleGUIStatus)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/browser/open", h.handleGUIBrowserOpen)
 
 	// /novnc/ reverse-proxy. Authenticated by the per-sandbox session token
 	// (NOT the daemon-wide auth token), so we mount it on the proxy directly.
@@ -106,7 +109,7 @@ func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *co
 		bodyLimitMiddleware,
 		contentTypeMiddleware,
 		func(next http.Handler) http.Handler {
-			return authMiddleware(cfg.AuthToken, next)
+			return authMiddleware(cfg.AuthToken, cfg.AdminToken, next)
 		},
 	)
 }

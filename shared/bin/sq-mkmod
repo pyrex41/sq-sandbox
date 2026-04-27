@@ -185,6 +185,7 @@ preset_tailscale() {
 #   - XFCE desktop (or set DESKTOP=minimal for a bare X session)
 #   - x11vnc + websockify + noVNC (browser-accessible desktop on :6080)
 #   - /usr/local/bin/sq-gui-start — the entrypoint squashd execs to start it
+#   - /var/lib/sq-gui/browser-open.fifo — in-session browser command channel
 #
 # Runtime config is read from /etc/sq-gui.conf (DESKTOP, RESOLUTION,
 # VNC_PORT, NOVNC_PORT, optional VNC_PASSWORD). squashd writes that file
@@ -198,6 +199,9 @@ preset_gui_base() {
 
     if command -v apk >/dev/null 2>&1; then
         log "using apk (Alpine) to populate rootfs"
+        mkdir -p "$root/etc/apk"
+        cp /etc/apk/repositories "$root/etc/apk/repositories" 2>/dev/null || true
+        cp -a /etc/apk/keys "$root/etc/apk/" 2>/dev/null || true
         # --initdb so the result is self-contained; --no-cache to avoid leaking
         # the host's package index. The package list mirrors the README.
         apk add --root "$root" --initdb --no-cache \
@@ -209,7 +213,7 @@ preset_gui_base() {
             websockify \
             dbus-x11 \
             xauth \
-            ttf-dejavu \
+            font-dejavu \
             >/dev/null 2>&1 || die "apk add failed (need root or fakeroot)"
     elif command -v debootstrap >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
         log "Debian/Ubuntu host — recommended path is build-in-sandbox:"
@@ -249,20 +253,62 @@ fi
 export DISPLAY=":${DISPLAY_NUM}"
 export HOME="${HOME:-/root}"
 mkdir -p "$HOME"
+mkdir -p /tmp/.X11-unix /var/log
+chmod 1777 /tmp /tmp/.X11-unix 2>/dev/null || true
 
 log() { echo "[sq-gui] $*"; }
 
+uid="$(id -u 2>/dev/null || echo 0)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/sq-runtime-$uid}"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/bus" ]; then
+    dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" \
+        --print-pid >"$XDG_RUNTIME_DIR/dbus.pid" 2>/var/log/dbus.log || true
+fi
+
+start_browser_agent() {
+    GUI_DIR="/var/lib/sq-gui"
+    BROWSER_FIFO="$GUI_DIR/browser-open.fifo"
+    mkdir -p "$GUI_DIR"
+    rm -f "$BROWSER_FIFO"
+    mkfifo "$BROWSER_FIFO" 2>/dev/null || {
+        log "browser command channel unavailable"
+        return 0
+    }
+    chmod 600 "$BROWSER_FIFO" 2>/dev/null || true
+    (
+        exec 3<>"$BROWSER_FIFO" || exit 0
+        while :; do
+            if IFS= read -r url <&3; then
+                [ -n "$url" ] || continue
+                if command -v sq-browser-open >/dev/null 2>&1; then
+                    sq-browser-open "$url" >>/var/log/sq-browser-open.log 2>&1 &
+                else
+                    echo "[sq-gui] sq-browser-open not found; mount browser-base" >>/var/log/sq-browser-open.log
+                fi
+            else
+                sleep 1
+            fi
+        done
+    ) &
+    log "browser command channel ready at $BROWSER_FIFO"
+}
+
 # Xvfb — virtual framebuffer
 log "Xvfb $DISPLAY ${RESOLUTION}x24"
-Xvfb "$DISPLAY" -screen 0 "${RESOLUTION}x24" -nolisten tcp >/var/log/xvfb.log 2>&1 &
+Xvfb "$DISPLAY" -screen 0 "${RESOLUTION}x24" -nolisten tcp -ac >/var/log/xvfb.log 2>&1 &
 XVFB_PID=$!
-sleep 1
+sleep 2
 
 # Window manager / desktop session
 case "$DESKTOP" in
     xfce|xfce4)
         log "starting XFCE"
-        if command -v dbus-launch >/dev/null 2>&1; then
+        if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+            startxfce4 >/var/log/xfce.log 2>&1 &
+        elif command -v dbus-launch >/dev/null 2>&1; then
             dbus-launch --exit-with-session startxfce4 >/var/log/xfce.log 2>&1 &
         else
             startxfce4 >/var/log/xfce.log 2>&1 &
@@ -294,6 +340,8 @@ x11vnc -display "$DISPLAY" -forever -shared -rfbport "$VNC_PORT" $VNC_AUTH_ARGS 
     >/var/log/x11vnc.log 2>&1 &
 VNC_PID=$!
 
+start_browser_agent
+
 # websockify + noVNC. The novnc package usually drops files at /usr/share/novnc.
 NOVNC_DIR="/usr/share/novnc"
 if [ ! -d "$NOVNC_DIR" ] && [ -d "/usr/share/webapps/novnc" ]; then
@@ -307,6 +355,102 @@ GUI_START_EOF
     # Marker so sandboxes can detect the GUI layer is present.
     mkdir -p "$root/etc"
     echo "$name" > "$root/etc/sq-gui-module"
+
+    squash_it "$root" "$name"
+}
+
+# ── Browser base (Chromium + desktop runtime glue) ──────────────────────
+#
+# Builds 510-browser-base.squashfs. Stack it with 500-gui-base and create the
+# sandbox with features ["gui","browser"] so browser launches happen inside the
+# same long-lived desktop session through sq-gui-start's FIFO command channel.
+
+preset_browser_base() {
+    local root="$WORK/rootfs" name="510-browser-base"
+    mkdir -p "$root"
+
+    log "building browser base module ($name)"
+
+    if command -v apk >/dev/null 2>&1; then
+        log "using apk (Alpine) to populate rootfs"
+        mkdir -p "$root/etc/apk"
+        cp /etc/apk/repositories "$root/etc/apk/repositories" 2>/dev/null || true
+        cp -a /etc/apk/keys "$root/etc/apk/" 2>/dev/null || true
+        apk add --root "$root" --initdb --no-cache \
+            chromium \
+            ca-certificates \
+            nss \
+            dbus \
+            dbus-x11 \
+            xdg-utils \
+            font-dejavu \
+            font-noto \
+            mesa-dri-gallium \
+            >/dev/null 2>&1 || die "apk add failed (need root or fakeroot)"
+    elif command -v debootstrap >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
+        log "Debian/Ubuntu host — recommended path is build-in-sandbox:"
+        log "  1. sq-ctl create browser-builder anon 000-base-debian"
+        log "  2. sq-ctl exec browser-builder 'apt-get update && apt-get install -y \\"
+        log "       chromium ca-certificates fonts-dejavu fonts-noto dbus-x11 xdg-utils'"
+        log "  3. sq-mkmod from-sandbox browser-builder $name"
+        log "  4. sq-ctl destroy browser-builder"
+        die "no automated apt path; use build-in-sandbox"
+    else
+        die "no supported package manager found (apk or apt)"
+    fi
+
+    mkdir -p "$root/usr/local/bin" "$root/etc"
+    cat > "$root/usr/local/bin/sq-browser-open" <<'BROWSER_OPEN_EOF'
+#!/bin/sh
+# sq-browser-open — run a browser inside the existing sq-gui-start session.
+set -eu
+
+URL="${1:-about:blank}"
+case "$URL" in
+    http://*|https://*|about:blank) ;;
+    *) echo "unsupported browser URL: $URL" >&2; exit 64 ;;
+esac
+
+export DISPLAY="${DISPLAY:-:99}"
+export HOME="${HOME:-/root}"
+uid="$(id -u 2>/dev/null || echo 0)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/sq-runtime-$uid}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HOME/Downloads"
+chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/bus" ]; then
+    dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" \
+        --print-pid >"$XDG_RUNTIME_DIR/dbus-browser.pid" 2>/tmp/sq-browser-dbus.log || true
+fi
+
+CHROME_FLAGS="
+--user-data-dir=$XDG_CONFIG_HOME/sq-chromium
+--disk-cache-dir=$XDG_CACHE_HOME/sq-chromium
+--no-first-run
+--no-default-browser-check
+--disable-dev-shm-usage
+--disable-gpu
+--no-sandbox
+"
+
+if command -v chromium-browser >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    exec chromium-browser $CHROME_FLAGS "$URL"
+elif command -v chromium >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    exec chromium $CHROME_FLAGS "$URL"
+elif command -v firefox >/dev/null 2>&1; then
+    exec firefox --no-remote --new-window "$URL"
+fi
+
+echo "no supported browser found (expected chromium-browser, chromium, or firefox)" >&2
+exit 127
+BROWSER_OPEN_EOF
+    chmod +x "$root/usr/local/bin/sq-browser-open"
+    echo "$name" > "$root/etc/sq-browser-module"
 
     squash_it "$root" "$name"
 }
@@ -341,6 +485,7 @@ case "${1:-help}" in
   sqlite-libs) preset_sqlite_libs ;;
   nullclaw)    preset_nullclaw ;;
             gui|gui-base) preset_gui_base ;;
+            browser|browser-base) preset_browser_base ;;
 
             *)           die "unknown preset: ${2:-}. Run '$0 list'" ;;
         esac
@@ -363,6 +508,7 @@ presets:
   golang       → 100-golang.squashfs       Go (latest)
   tailscale    → 200-tailscale.squashfs    Tailscale client
   gui-base     → 500-gui-base.squashfs     XFCE + x11vnc + noVNC desktop
+  browser-base → 510-browser-base.squashfs Chromium + browser launch helper
 
 build-in-sandbox (recommended for base-specific packages):
   1. sq-ctl create builder anon 000-base-alpine

@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"squashd/config"
+	"squashd/controlplane"
 	"squashd/manager"
 )
 
@@ -38,6 +42,7 @@ func TestAuthMiddleware(t *testing.T) {
 		DataDir: "/data", Port: 8080, Backend: "chroot",
 		SnapshotBackend: "squashfs",
 		AuthToken:       "secret",
+		AdminToken:      "admin-secret",
 	}
 	h := newTestHandler(cfg)
 
@@ -64,6 +69,43 @@ func TestAuthMiddleware(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code == 401 {
 		t.Errorf("api with token = 401, expected pass-through")
+	}
+
+	req = httptest.NewRequest("GET", "/cgi-bin/api/sandboxes", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code == 401 {
+		t.Errorf("api with admin token = 401, expected pass-through")
+	}
+}
+
+func TestUSDCConfirmRequiresAdminToken(t *testing.T) {
+	store, err := controlplane.Open(context.Background(), filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	cfg := &config.Config{
+		DataDir:            "/data",
+		Port:               8080,
+		Backend:            "chroot",
+		SnapshotBackend:    "squashfs",
+		AuthToken:          "user-secret",
+		AdminToken:         "admin-secret",
+		USDCNetwork:        "base",
+		USDCChainID:        "8453",
+		USDCTokenAddress:   "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+		USDCReceiveAddress: "0x1111111111111111111111111111111111111111",
+	}
+	h := NewHandlerWithControlPlane(cfg, manager.New(cfg), controlplane.New(store, "", ""))
+	req := httptest.NewRequest("POST", "/cgi-bin/api/billing/usdc/confirm", strings.NewReader(`{"tx_hash":"0xabc","amount_usdc":"1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer user-secret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("confirm with user token = %d, want 403; body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -186,5 +228,70 @@ func TestGUIDisableForUnknownSandbox(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != 404 {
 		t.Errorf("gui disable missing sandbox = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestGUIRespNoVNCURLParameters(t *testing.T) {
+	resp := guiResp("demo", &manager.GUIState{
+		Enabled:      true,
+		SessionToken: "tok",
+	})
+	if resp.NoVNCURL == "" {
+		t.Fatal("NoVNCURL is empty")
+	}
+	u, err := url.Parse(resp.NoVNCURL)
+	if err != nil {
+		t.Fatalf("parse NoVNCURL: %v", err)
+	}
+	if u.Path != "/cgi-bin/api/sandboxes/demo/novnc/vnc.html" {
+		t.Fatalf("path = %q", u.Path)
+	}
+	q := u.Query()
+	if q.Get("_token") != "tok" {
+		t.Errorf("_token = %q", q.Get("_token"))
+	}
+	if q.Get("autoconnect") != "true" {
+		t.Errorf("autoconnect = %q, want true", q.Get("autoconnect"))
+	}
+	if q.Get("path") != "cgi-bin/api/sandboxes/demo/novnc/websockify" {
+		t.Errorf("path param = %q", q.Get("path"))
+	}
+	if q.Get("resize") != "scale" {
+		t.Errorf("resize = %q, want scale", q.Get("resize"))
+	}
+}
+
+func TestValidGUIBrowserURL(t *testing.T) {
+	for _, raw := range []string{"http://example.com", "https://example.com/path?q=1", "about:blank"} {
+		if !validGUIBrowserURL(raw) {
+			t.Errorf("validGUIBrowserURL(%q) = false, want true", raw)
+		}
+	}
+	for _, raw := range []string{"", "about:config", "ftp://example.com", "https://", "https://user@example.com", "javascript:alert(1)"} {
+		if validGUIBrowserURL(raw) {
+			t.Errorf("validGUIBrowserURL(%q) = true, want false", raw)
+		}
+	}
+}
+
+func TestGUIBrowserOpenRejectsInvalidURL(t *testing.T) {
+	h := newTestHandler(nil)
+	req := httptest.NewRequest("POST", "/cgi-bin/api/sandboxes/missing/gui/browser/open", strings.NewReader(`{"url":"javascript:alert(1)"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("browser open invalid url = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestGUIBrowserOpenUnknownSandbox(t *testing.T) {
+	h := newTestHandler(nil)
+	req := httptest.NewRequest("POST", "/cgi-bin/api/sandboxes/missing/gui/browser/open", strings.NewReader(`{"url":"https://example.com"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("browser open missing sandbox = %d, want 404; body=%s", w.Code, w.Body.String())
 	}
 }

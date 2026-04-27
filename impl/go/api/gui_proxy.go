@@ -82,12 +82,16 @@ func (g *guiProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	setNoVNCTokenCookie(w, id, target.SessionToken)
 
-	release, ok := g.acquire(id)
-	if !ok {
-		http.Error(w, "too many concurrent gui sessions", http.StatusServiceUnavailable)
-		return
+	var release func()
+	if isWebSocketUpgrade(r) {
+		var ok bool
+		release, ok = g.acquire(id)
+		if !ok {
+			http.Error(w, "too many concurrent gui sessions", http.StatusServiceUnavailable)
+			return
+		}
+		defer release()
 	}
-	defer release()
 
 	pid := target.BwrapPID
 	port := target.NoVNCPort
@@ -134,6 +138,11 @@ func (g *guiProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy.ServeHTTP(w, r)
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
 // checkSessionToken returns true if the request supplied the expected token

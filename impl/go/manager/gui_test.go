@@ -3,7 +3,9 @@ package manager
 import (
 	"os"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"squashd/config"
 )
@@ -82,6 +84,16 @@ func TestGUIModuleResolution(t *testing.T) {
 	}
 }
 
+func TestBrowserModuleResolution(t *testing.T) {
+	cfg := &config.Config{BrowserModule: "520-browser-custom"}
+	if got := browserModule(cfg); got != "520-browser-custom" {
+		t.Errorf("browserModule cfg: got %q", got)
+	}
+	if got := browserModule(nil); got != "510-browser-base" {
+		t.Errorf("browserModule default: got %q", got)
+	}
+}
+
 func TestEnableGUIUnknownSandbox(t *testing.T) {
 	mgr := New(&config.Config{})
 	if _, err := mgr.EnableGUI("missing", nil); err == nil {
@@ -141,6 +153,71 @@ func TestGUITargetRejectsDisabled(t *testing.T) {
 	}
 }
 
+func TestOpenGUIBrowserWritesFIFO(t *testing.T) {
+	mgr := New(&config.Config{})
+	dir := t.TempDir()
+	for _, sub := range []string{
+		"merged/usr/local/bin",
+		"merged/var/lib/sq-gui",
+		"upper/data",
+		"upper/work",
+		".meta",
+	} {
+		if err := mkdirP(dir, sub); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	cmdPath := filepathJoin(dir, "merged/"+strings.TrimPrefix(browserOpenCommand, "/"))
+	if err := os.WriteFile(cmdPath, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("write browser opener: %v", err)
+	}
+	fifoPath := filepathJoin(dir, "merged/"+strings.TrimPrefix(defaultBrowserFIFO, "/"))
+	if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	reader, err := os.OpenFile(fifoPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatalf("open fifo reader: %v", err)
+	}
+	defer reader.Close()
+
+	mgr.Register(&Sandbox{
+		ID:    "demo",
+		Dir:   dir,
+		State: "ready",
+		GUI:   &GUIState{Enabled: true},
+	})
+	if err := mgr.OpenGUIBrowser("demo", "https://example.com"); err != nil {
+		t.Fatalf("OpenGUIBrowser: %v", err)
+	}
+
+	buf := make([]byte, 128)
+	var got string
+	deadline := time.Now().Add(time.Second)
+	for got == "" && time.Now().Before(deadline) {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			got = string(buf[:n])
+			break
+		}
+		if err != nil && !strings.Contains(err.Error(), "resource temporarily unavailable") {
+			t.Fatalf("read fifo: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != "https://example.com\n" {
+		t.Fatalf("fifo command = %q, want URL newline", got)
+	}
+}
+
+func TestOpenGUIBrowserRejectsDisabled(t *testing.T) {
+	mgr := New(&config.Config{})
+	mgr.Register(&Sandbox{ID: "demo", State: "ready", GUI: &GUIState{Enabled: false}})
+	if err := mgr.OpenGUIBrowser("demo", "https://example.com"); err == nil {
+		t.Errorf("OpenGUIBrowser disabled GUI: want error, got nil")
+	}
+}
+
 func TestNewSessionTokenIsDistinct(t *testing.T) {
 	a, err := newSessionToken()
 	if err != nil {
@@ -172,7 +249,7 @@ func TestWriteGUIConfigQuotesPassword(t *testing.T) {
 	if err := writeGUIConfig(s, "xfce", "1280x720", password); err != nil {
 		t.Fatalf("writeGUIConfig: %v", err)
 	}
-	b, err := os.ReadFile(filepathJoin(dir, "upper/data/etc/sq-gui.conf"))
+	b, err := os.ReadFile(filepathJoin(dir, "merged/etc/sq-gui.conf"))
 	if err != nil {
 		t.Fatalf("read gui config: %v", err)
 	}

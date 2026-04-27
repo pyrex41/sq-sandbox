@@ -162,6 +162,35 @@ func TestGUIProxyAcquireRespectsCap(t *testing.T) {
 	}
 }
 
+func TestIsWebSocketUpgrade(t *testing.T) {
+	cases := []struct {
+		name       string
+		upgrade    string
+		connection string
+		want       bool
+	}{
+		{"websocket upgrade", "websocket", "Upgrade", true},
+		{"case insensitive", "WebSocket", "keep-alive, upgrade", true},
+		{"plain asset request", "", "", false},
+		{"connection upgrade without websocket", "", "upgrade", false},
+		{"websocket without connection upgrade", "websocket", "keep-alive", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/cgi-bin/api/sandboxes/s/novnc/vnc.html", nil)
+			if c.upgrade != "" {
+				req.Header.Set("Upgrade", c.upgrade)
+			}
+			if c.connection != "" {
+				req.Header.Set("Connection", c.connection)
+			}
+			if got := isWebSocketUpgrade(req); got != c.want {
+				t.Errorf("isWebSocketUpgrade = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 // Smoke test: many concurrent acquire/release cycles never deadlock or
 // over-allocate.
 func TestGUIProxyAcquireConcurrency(t *testing.T) {

@@ -185,6 +185,179 @@ func TestConfirmUSDCDepositCreditsOncePerTxHash(t *testing.T) {
 	}
 }
 
+func TestRecordUSDCDetectedDepositMarksDuplicateTxs(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestControlPlane(t)
+
+	first, err := store.RecordUSDCDetectedDeposit(ctx, USDCDetectedDeposit{
+		OrgID:        DefaultOrgID,
+		TxHash:       "0xabc",
+		LogIndex:     1,
+		BlockNumber:  100,
+		BlockHash:    "0xblock",
+		Network:      "base",
+		TokenAddress: "0xtoken",
+		FromAddress:  "0xfrom",
+		ToAddress:    "0xto",
+		AmountMicros: 1_000_000,
+	})
+	if err != nil {
+		t.Fatalf("record first deposit: %v", err)
+	}
+	if !first.Inserted || first.Deposit.DuplicateTx {
+		t.Fatalf("first record = %+v, want inserted non-duplicate", first)
+	}
+
+	second, err := store.RecordUSDCDetectedDeposit(ctx, USDCDetectedDeposit{
+		OrgID:        DefaultOrgID,
+		TxHash:       "0xabc",
+		LogIndex:     2,
+		BlockNumber:  100,
+		BlockHash:    "0xblock",
+		Network:      "base",
+		TokenAddress: "0xtoken",
+		FromAddress:  "0xfrom",
+		ToAddress:    "0xto",
+		AmountMicros: 1_000_000,
+	})
+	if err != nil {
+		t.Fatalf("record duplicate tx deposit: %v", err)
+	}
+	if !second.Inserted || !second.Deposit.DuplicateTx || second.Deposit.Status != "duplicate_tx" {
+		t.Fatalf("second record = %+v, want inserted duplicate_tx", second)
+	}
+
+	admin, err := store.USDCAdminDeposits(ctx, "base", 10)
+	if err != nil {
+		t.Fatalf("admin deposits: %v", err)
+	}
+	if len(admin.RecentDetectedDeposits) != 2 || len(admin.DuplicateTxs) != 1 {
+		t.Fatalf("admin deposits = %+v, want 2 recent and 1 duplicate", admin)
+	}
+}
+
+func TestUSDCWatcherCursorAndHealth(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestControlPlane(t)
+	if _, ok, err := store.USDCWatcherCursor(ctx, "base"); err != nil || ok {
+		t.Fatalf("empty cursor = ok:%v err:%v, want missing without error", ok, err)
+	}
+	if err := store.UpdateUSDCWatcherHealth(ctx, USDCWatcherHealth{
+		Network:                  "base",
+		Enabled:                  true,
+		Running:                  true,
+		RPCURLConfigured:         true,
+		ReceiveAddressConfigured: true,
+		LastScannedBlock:         123,
+		LatestBlock:              130,
+		ConfirmedBlock:           119,
+		Confirmations:            12,
+		WatchIntervalSeconds:     30,
+	}); err != nil {
+		t.Fatalf("update watcher health: %v", err)
+	}
+	cursor, ok, err := store.USDCWatcherCursor(ctx, "base")
+	if err != nil || !ok || cursor != 123 {
+		t.Fatalf("cursor = %d ok:%v err:%v, want 123 true nil", cursor, ok, err)
+	}
+	health, err := store.USDCWatcherHealth(ctx, "base")
+	if err != nil {
+		t.Fatalf("watcher health: %v", err)
+	}
+	if !health.Enabled || !health.Running || health.LastScannedBlock != 123 || health.Confirmations != 12 {
+		t.Fatalf("health = %+v", health)
+	}
+	if err := store.UpdateUSDCWatcherHealth(ctx, USDCWatcherHealth{
+		Network:              "base",
+		Enabled:              true,
+		Running:              true,
+		Confirmations:        12,
+		WatchIntervalSeconds: 30,
+		LastError:            "rpc unavailable",
+	}); err != nil {
+		t.Fatalf("update watcher error health: %v", err)
+	}
+	cursor, ok, err = store.USDCWatcherCursor(ctx, "base")
+	if err != nil || !ok || cursor != 123 {
+		t.Fatalf("cursor after zero-block health = %d ok:%v err:%v, want preserved 123", cursor, ok, err)
+	}
+}
+
+func TestUSDCWatcherCreditVerifiedDepositIsReplaySafe(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestControlPlane(t)
+	watcher := NewUSDCWatcher(store, USDCWatcherConfig{
+		RPCURL:         "http://example.invalid",
+		TokenAddress:   "0xtoken",
+		ReceiveAddress: "0xto",
+	})
+	dep := USDCDetectedDeposit{
+		OrgID:        DefaultOrgID,
+		TxHash:       "0xabc",
+		LogIndex:     1,
+		BlockNumber:  100,
+		BlockHash:    "0xblock",
+		Network:      "base",
+		TokenAddress: "0xtoken",
+		FromAddress:  "0xfrom",
+		ToAddress:    "0xto",
+		AmountMicros: 1_000_000,
+	}
+	if err := watcher.creditVerifiedDeposit(ctx, dep); err != nil {
+		t.Fatalf("credit first deposit: %v", err)
+	}
+	if err := watcher.creditVerifiedDeposit(ctx, dep); err != nil {
+		t.Fatalf("replay credited deposit: %v", err)
+	}
+	admin, err := store.USDCAdminDeposits(ctx, "base", 10)
+	if err != nil {
+		t.Fatalf("admin deposits: %v", err)
+	}
+	if len(admin.RecentDetectedDeposits) != 1 {
+		t.Fatalf("detected deposits = %d, want 1", len(admin.RecentDetectedDeposits))
+	}
+	got := admin.RecentDetectedDeposits[0]
+	if !got.Credited || got.Status != "credited" || got.DuplicateTx {
+		t.Fatalf("replayed deposit = %+v, want still credited and non-duplicate", got)
+	}
+}
+
+func TestUSDCWatcherRetriesDetectedUncreditedDeposit(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestControlPlane(t)
+	dep := USDCDetectedDeposit{
+		OrgID:        DefaultOrgID,
+		TxHash:       "0xabc",
+		LogIndex:     1,
+		BlockNumber:  100,
+		BlockHash:    "0xblock",
+		Network:      "base",
+		TokenAddress: "0xtoken",
+		FromAddress:  "0xfrom",
+		ToAddress:    "0xto",
+		AmountMicros: 1_000_000,
+	}
+	if _, err := store.RecordUSDCDetectedDeposit(ctx, dep); err != nil {
+		t.Fatalf("record detected deposit: %v", err)
+	}
+	watcher := NewUSDCWatcher(store, USDCWatcherConfig{
+		RPCURL:         "http://example.invalid",
+		TokenAddress:   "0xtoken",
+		ReceiveAddress: "0xto",
+	})
+	if err := watcher.creditVerifiedDeposit(ctx, dep); err != nil {
+		t.Fatalf("retry detected deposit: %v", err)
+	}
+	admin, err := store.USDCAdminDeposits(ctx, "base", 10)
+	if err != nil {
+		t.Fatalf("admin deposits: %v", err)
+	}
+	got := admin.RecentDetectedDeposits[0]
+	if !got.Credited || got.Status != "credited" {
+		t.Fatalf("retried deposit = %+v, want credited", got)
+	}
+}
+
 func TestValidateManualUSDCDeposit(t *testing.T) {
 	txHash := "0x" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	dep := USDCDeposit{

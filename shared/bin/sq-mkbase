@@ -71,6 +71,7 @@ build_alpine() {
 https://dl-cdn.alpinelinux.org/alpine/v${version}/main
 https://dl-cdn.alpinelinux.org/alpine/v${version}/community
 EOF
+    cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
     # Pre-install essentials that every sandbox needs
     # (We can do this because Alpine minirootfs includes apk)

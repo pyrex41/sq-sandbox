@@ -50,6 +50,19 @@ func main() {
 	// Recover any sandboxes that were running before the last restart.
 	mgr.Recover()
 
+	// Watch confirmed Base USDC transfers to the configured receive address.
+	go controlplane.NewUSDCWatcher(cpStore, controlplane.USDCWatcherConfig{
+		RPCURL:          cfg.BaseRPCURL,
+		Network:         cfg.USDCNetwork,
+		ChainID:         cfg.USDCChainID,
+		TokenAddress:    cfg.USDCTokenAddress,
+		ReceiveAddress:  cfg.USDCReceiveAddress,
+		WatchInterval:   cfg.USDCWatchInterval,
+		Confirmations:   cfg.USDCConfirmations,
+		StartBlock:      cfg.USDCStartBlock,
+		ExplorerBaseURL: cfg.USDCExplorerTxBaseURL,
+	}).Run(ctx)
+
 	// Launch HTTPS MITM proxy (checks for secrets.json internally).
 	go proxy.Run(ctx, ":8888", cfg.DataDir)
 

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration derived from environment variables.
@@ -16,6 +17,7 @@ type Config struct {
 	UpperLimitMB          int
 	Backend               string // "chroot", "firecracker", "gvisor"
 	AuthToken             string // empty = no auth
+	AdminToken            string // required for billing/admin operations
 	S3Bucket              string
 	S3Endpoint            string
 	S3Region              string
@@ -27,6 +29,7 @@ type Config struct {
 	SnapshotBackend       string // "squashfs", "irmin"
 	StoreSockPath         string
 	GUIModule             string   // default GUI layer (e.g. "500-gui-base")
+	BrowserModule         string   // default browser layer (e.g. "510-browser-base")
 	DefaultFeatures       []string // features auto-applied to every new sandbox
 	ControlDBPath         string   // SQLite control-plane DB path
 	StripeSecretKey       string
@@ -40,6 +43,10 @@ type Config struct {
 	USDCTokenAddress      string
 	USDCReceiveAddress    string
 	USDCExplorerTxBaseURL string
+	BaseRPCURL            string
+	USDCWatchInterval     time.Duration
+	USDCConfirmations     uint64
+	USDCStartBlock        uint64
 }
 
 // FromEnv builds a Config from environment variables.
@@ -52,6 +59,7 @@ func FromEnv() Config {
 		UpperLimitMB:    envInt("SQUASH_UPPER_LIMIT_MB", 512),
 		Backend:         envOr("SQUASH_BACKEND", "chroot"),
 		AuthToken:       os.Getenv("SQUASH_AUTH_TOKEN"),
+		AdminToken:      os.Getenv("SQUASH_ADMIN_TOKEN"),
 		S3Bucket:        os.Getenv("SQUASH_S3_BUCKET"),
 		S3Endpoint:      os.Getenv("SQUASH_S3_ENDPOINT"),
 		S3Region:        envOr("SQUASH_S3_REGION", "us-east-1"),
@@ -64,6 +72,7 @@ func FromEnv() Config {
 	c.BusSockPath = envOr("SQUASH_BUS_SOCK", filepath.Join(dataDir, ".sq-bus.sock"))
 	c.StoreSockPath = envOr("SQUASH_STORE_SOCK", filepath.Join(dataDir, ".sq-store.sock"))
 	c.GUIModule = envOr("SQUASH_GUI_MODULE", "500-gui-base")
+	c.BrowserModule = envOr("SQUASH_BROWSER_MODULE", "510-browser-base")
 	c.ControlDBPath = envOr("SQUASH_CONTROL_DB", filepath.Join(dataDir, "app.db"))
 	c.StripeSecretKey = os.Getenv("STRIPE_SECRET_KEY")
 	c.StripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
@@ -76,6 +85,10 @@ func FromEnv() Config {
 	c.USDCTokenAddress = envOr("SQUASH_USDC_TOKEN_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
 	c.USDCReceiveAddress = os.Getenv("SQUASH_USDC_RECEIVE_ADDRESS")
 	c.USDCExplorerTxBaseURL = envOr("SQUASH_USDC_EXPLORER_TX_BASE_URL", "https://basescan.org/tx/")
+	c.BaseRPCURL = os.Getenv("SQUASH_BASE_RPC_URL")
+	c.USDCWatchInterval = envDuration("SQUASH_USDC_WATCH_INTERVAL", 30*time.Second)
+	c.USDCConfirmations = envUint64("SQUASH_USDC_CONFIRMATIONS", 12)
+	c.USDCStartBlock = envUint64("SQUASH_USDC_START_BLOCK", 0)
 	if v := os.Getenv("SQUASH_DEFAULT_FEATURES"); v != "" {
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p != "" {
@@ -144,6 +157,33 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envUint64(key string, def uint64) uint64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	seconds, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || seconds <= 0 {
+		return def
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func envBool(key string) bool {

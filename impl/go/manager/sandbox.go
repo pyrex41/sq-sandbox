@@ -25,6 +25,8 @@ type Sandbox struct {
 	MemoryMB     int
 	MaxLifetimeS int
 	AllowNet     []string
+	Features     []string
+	GUI          *GUIState
 	CreatedAt    time.Time
 	LastActiveAt time.Time
 	Dir          string // abs path to sandbox directory
@@ -40,6 +42,12 @@ type Sandbox struct {
 func (s *Sandbox) ToInfo() SandboxInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var gui *GUIState
+	if s.GUI != nil {
+		copy := *s.GUI
+		gui = &copy
+	}
+	features := append([]string(nil), s.Features...)
 	return SandboxInfo{
 		ID:           s.ID,
 		State:        s.State,
@@ -53,6 +61,8 @@ func (s *Sandbox) ToInfo() SandboxInfo {
 		MemoryMB:     s.MemoryMB,
 		MaxLifetimeS: s.MaxLifetimeS,
 		AllowNet:     s.AllowNet,
+		Features:     features,
+		GUI:          gui,
 	}
 }
 
@@ -104,6 +114,24 @@ func writeMeta(sdir string, s *Sandbox) error {
 		if err := os.WriteFile(filepath.Join(m, "allow_net"), b, 0644); err != nil {
 			return fmt.Errorf("write meta allow_net: %w", err)
 		}
+	}
+	// features as JSON array
+	if len(s.Features) > 0 {
+		b, _ := json.Marshal(s.Features)
+		if err := os.WriteFile(filepath.Join(m, "features"), b, 0644); err != nil {
+			return fmt.Errorf("write meta features: %w", err)
+		}
+	} else {
+		_ = os.Remove(filepath.Join(m, "features"))
+	}
+	// gui state as JSON object
+	if s.GUI != nil {
+		b, _ := json.Marshal(s.GUI)
+		if err := os.WriteFile(filepath.Join(m, "gui"), b, 0644); err != nil {
+			return fmt.Errorf("write meta gui: %w", err)
+		}
+	} else {
+		_ = os.Remove(filepath.Join(m, "gui"))
 	}
 	return nil
 }
@@ -178,6 +206,19 @@ func readMeta(id, sdir string) (*Sandbox, error) {
 	// allow_net: JSON array
 	if b, err := os.ReadFile(filepath.Join(m, "allow_net")); err == nil {
 		json.Unmarshal(b, &s.AllowNet)
+	}
+
+	// features: JSON array
+	if b, err := os.ReadFile(filepath.Join(m, "features")); err == nil {
+		json.Unmarshal(b, &s.Features)
+	}
+
+	// gui: JSON object
+	if b, err := os.ReadFile(filepath.Join(m, "gui")); err == nil {
+		gs := &GUIState{}
+		if json.Unmarshal(b, gs) == nil {
+			s.GUI = gs
+		}
 	}
 
 	// ExecCount: count log files

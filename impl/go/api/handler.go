@@ -58,6 +58,11 @@ func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/logs", h.handleLogs)
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/wg/peers", h.handleWGPeers)
 
+	// GUI mode — native desktop toggle (noVNC + websockify + Xvfb)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/enable", h.handleGUIEnable)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/disable", h.handleGUIDisable)
+	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/gui/status", h.handleGUIStatus)
+
 	// Task runner — autonomous agent execution
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task", h.handleStartTask)
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/task", h.handleGetTask)
@@ -182,6 +187,26 @@ func (h *Handler) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	features, fok := parseFeatures(body["features"])
+	if !fok {
+		jsonError(w, "features must be an array of strings", http.StatusBadRequest)
+		return
+	}
+	for _, f := range features {
+		if !validFeature(f) {
+			jsonError(w, "invalid feature: "+f, http.StatusBadRequest)
+			return
+		}
+	}
+	opts.Features = features
+
+	gui, gerr := parseGUIOpts(body["gui"])
+	if gerr != nil {
+		jsonError(w, "invalid gui: "+gerr.Error(), http.StatusBadRequest)
+		return
+	}
+	opts.GUI = gui
 
 	info, err := h.mgr.Create(id, opts)
 	if err != nil {
@@ -681,6 +706,78 @@ func clampTimeout(v int, min, max int) int {
 		return max
 	}
 	return v
+}
+
+// parseFeatures accepts a JSON array of strings or a comma-separated string.
+// Returns (nil, true) when the field is missing.
+func parseFeatures(raw any) ([]string, bool) {
+	switch v := raw.(type) {
+	case nil:
+		return nil, true
+	case string:
+		if v == "" {
+			return nil, true
+		}
+		out := make([]string, 0, 4)
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out, true
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// validFeature constrains feature names to short alphanumeric tokens.
+func validFeature(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// parseGUIOpts pulls the optional "gui" object out of a create-body map.
+func parseGUIOpts(raw any) (*manager.GUIOpts, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	g := &manager.GUIOpts{}
+	if v, ok := m["desktop"].(string); ok {
+		g.Desktop = strings.TrimSpace(v)
+	}
+	if v, ok := m["resolution"].(string); ok {
+		g.Resolution = strings.TrimSpace(v)
+	}
+	if v, ok := m["vnc_password"].(string); ok {
+		g.VNCPassword = v
+	}
+	if v, ok := m["module"].(string); ok {
+		g.Module = strings.TrimSpace(v)
+	}
+	return g, nil
 }
 
 // parseLayers accepts either a comma-separated string or a JSON array

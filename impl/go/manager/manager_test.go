@@ -5,9 +5,55 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"squashd/config"
 )
+
+func TestWriteAndReadMetaWithFeaturesAndGUI(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".meta"), 0755); err != nil {
+		t.Fatalf("mkdir meta: %v", err)
+	}
+	original := &Sandbox{
+		ID:           "demo",
+		Dir:          dir,
+		Owner:        "alice",
+		Layers:       []string{"000-base-alpine", "500-gui-base"},
+		Backend:      "chroot",
+		CPU:          2,
+		MemoryMB:     1024,
+		MaxLifetimeS: 600,
+		AllowNet:     []string{"api.anthropic.com"},
+		Features:     []string{"gui"},
+		GUI: &GUIState{
+			Enabled:    true,
+			Desktop:    "xfce",
+			Resolution: "1280x720",
+			Module:     "500-gui-base",
+			JobID:      7,
+			NoVNCPort:  6080,
+			VNCPort:    5900,
+			StartedAt:  time.Now().UTC().Format(time.RFC3339),
+		},
+		CreatedAt:    time.Now(),
+		LastActiveAt: time.Now(),
+	}
+	if err := writeMeta(dir, original); err != nil {
+		t.Fatalf("writeMeta: %v", err)
+	}
+	loaded, err := readMeta("demo", dir)
+	if err != nil {
+		t.Fatalf("readMeta: %v", err)
+	}
+	if len(loaded.Features) != 1 || loaded.Features[0] != "gui" {
+		t.Errorf("features round-trip: %v", loaded.Features)
+	}
+	if loaded.GUI == nil || !loaded.GUI.Enabled || loaded.GUI.Desktop != "xfce" ||
+		loaded.GUI.Resolution != "1280x720" || loaded.GUI.JobID != 7 {
+		t.Errorf("gui round-trip: %+v", loaded.GUI)
+	}
+}
 
 func TestInjectSecretsWritesPlaceholderExportsAndCABundle(t *testing.T) {
 	dataDir := t.TempDir()

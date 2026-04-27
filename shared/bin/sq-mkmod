@@ -378,6 +378,9 @@ preset_browser_base() {
         cp -a /etc/apk/keys "$root/etc/apk/" 2>/dev/null || true
         apk add --root "$root" --initdb --no-cache \
             chromium \
+            dillo \
+            firefox \
+            firefox-esr \
             ca-certificates \
             nss \
             dbus \
@@ -385,6 +388,13 @@ preset_browser_base() {
             xdg-utils \
             font-dejavu \
             font-noto \
+            eudev-libs \
+            libssh \
+            libtheora \
+            libxcb \
+            libxshmfence \
+            numactl \
+            xcb-util \
             mesa-dri-gallium \
             >/dev/null 2>&1 || die "apk add failed (need root or fakeroot)"
     elif command -v debootstrap >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
@@ -426,6 +436,24 @@ if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/bus" ]; th
         --print-pid >"$XDG_RUNTIME_DIR/dbus-browser.pid" 2>/tmp/sq-browser-dbus.log || true
 fi
 
+# Alpine's Chromium stack has a few musl-era libraries whose optional symbols
+# are resolved only when their extension libraries are already in the process.
+# Preload the small set Chromium commonly needs in this minimal live root.
+preload=""
+for lib in \
+    /usr/lib/libxcb-shm.so.0 \
+    /usr/lib/libxcb-sync.so.1 \
+    /usr/lib/libxcb-xfixes.so.0 \
+    /usr/lib/libnuma.so.1 \
+    /usr/lib/libssh.so.4 \
+    /usr/lib/libtheoraenc.so.1 \
+    /usr/lib/libudev.so.1 \
+    /usr/lib/libxkbcommon.so.0; do
+    [ -e "$lib" ] || continue
+    preload="${preload:+$preload:}$lib"
+done
+[ -n "$preload" ] && export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$preload"
+
 CHROME_FLAGS="
 --user-data-dir=$XDG_CONFIG_HOME/sq-chromium
 --disk-cache-dir=$XDG_CACHE_HOME/sq-chromium
@@ -436,17 +464,21 @@ CHROME_FLAGS="
 --no-sandbox
 "
 
-if command -v chromium-browser >/dev/null 2>&1; then
+if command -v dillo >/dev/null 2>&1; then
+    exec dillo "$URL"
+elif command -v firefox >/dev/null 2>&1; then
+    exec firefox --no-remote --new-window "$URL"
+elif command -v firefox-esr >/dev/null 2>&1; then
+    exec firefox-esr --no-remote --new-window "$URL"
+elif command -v chromium-browser >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     exec chromium-browser $CHROME_FLAGS "$URL"
 elif command -v chromium >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     exec chromium $CHROME_FLAGS "$URL"
-elif command -v firefox >/dev/null 2>&1; then
-    exec firefox --no-remote --new-window "$URL"
 fi
 
-echo "no supported browser found (expected chromium-browser, chromium, or firefox)" >&2
+echo "no supported browser found (expected firefox-esr, firefox, chromium-browser, or chromium)" >&2
 exit 127
 BROWSER_OPEN_EOF
     chmod +x "$root/usr/local/bin/sq-browser-open"

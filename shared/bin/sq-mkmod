@@ -15,23 +15,123 @@ set -eu
 DATA="${SQUASH_DATA:-/data}"
 MODULES="$DATA/modules"
 WORK="/tmp/sq-mkmod.$$"
+API="${SQUASH_API:-http://localhost:${SQUASH_PORT:-8080}}"
+TOKEN="${SQUASH_AUTH_TOKEN:-}"
 
 log() { echo "[sq-mkmod] $*"; }
 die() { echo "[sq-mkmod] ERROR: $*" >&2; cleanup; exit 1; }
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
+api_curl() {
+    local method="$1" path="$2" body="${3:-}"
+    local args="-fsS -X $method -H 'Content-Type: application/json'"
+    [ -n "$TOKEN" ] && args="$args -H 'Authorization: Bearer $TOKEN'"
+    [ -n "$body" ] && args="$args -d '$body'"
+    eval "curl $args '$API/cgi-bin/api/$path'"
+}
+
+api_available() {
+    curl -fsS "$API/cgi-bin/health" >/dev/null 2>&1
+}
+
+sha256_file() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    else
+        echo ""
+    fi
+}
+
+module_ref() {
+    local name="$1" path="$MODULES/$name.squashfs"
+    if [ "$name" = "000-base-alpine" ] && [ -f "$MODULES/000-base-alpine.version" ]; then
+        printf '%s@v%s' "$name" "$(cat "$MODULES/000-base-alpine.version" 2>/dev/null || echo unknown)"
+        return
+    fi
+    if [ -f "$path" ]; then
+        local sha
+        sha="$(sha256_file "$path")"
+        [ -n "$sha" ] && { printf '%s@sha256:%s' "$name" "$sha"; return; }
+    fi
+    printf '%s@missing' "$name"
+}
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_words_array() {
+    local first=1 item
+    printf '['
+    for item in $1; do
+        [ "$first" = 1 ] || printf ','
+        first=0
+        printf '"%s"' "$(json_escape "$item")"
+    done
+    printf ']'
+}
+
+json_apk_repos_array() {
+    local repos="${1:-/etc/apk/repositories}" first=1 line
+    printf '['
+    if [ -r "$repos" ]; then
+        while IFS= read -r line; do
+            case "$line" in ""|\#*) continue ;; esac
+            [ "$first" = 1 ] || printf ','
+            first=0
+            printf '"%s"' "$(json_escape "$line")"
+        done < "$repos"
+    fi
+    printf ']'
+}
+
+write_module_manifest() {
+    local dest="$1" name="$2" squashfs_sha="${3:-}"
+    local built_at base version
+    built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    base="${SQ_MODULE_BASE:-$(module_ref 000-base-alpine 2>/dev/null || true)}"
+    version="${SQ_MODULE_VERSION:-}"
+    mkdir -p "$(dirname "$dest")"
+    {
+        printf '{\n'
+        printf '  "schema": 1,\n'
+        printf '  "name": "%s",\n' "$(json_escape "$name")"
+        [ -n "$version" ] && printf '  "version": "%s",\n' "$(json_escape "$version")"
+        printf '  "built_at": "%s",\n' "$built_at"
+        printf '  "builder": "sq-mkmod",\n'
+        printf '  "base": "%s",\n' "$(json_escape "$base")"
+        printf '  "built_against": '
+        json_words_array "${SQ_MODULE_BUILT_AGAINST:-}"
+        printf ',\n'
+        printf '  "apk_repos": '
+        json_apk_repos_array "${SQ_MODULE_APK_REPOS:-/etc/apk/repositories}"
+        printf ',\n'
+        printf '  "apk_added": '
+        json_words_array "${SQ_MODULE_APK_ADDED:-}"
+        printf ',\n'
+        printf '  "squashfs_sha256": "%s"\n' "$(json_escape "$squashfs_sha")"
+        printf '}\n'
+    } > "$dest"
+}
+
 squash_it() {
     local src="$1" name="$2" out="$MODULES/$name.squashfs"
     mkdir -p "$MODULES"
+    write_module_manifest "$src/etc/sq-module/$name.manifest.json" "$name" ""
     local comp_args="-comp gzip -b 256K"
     if zgrep -q CONFIG_SQUASHFS_ZSTD=y /proc/config.gz 2>/dev/null; then
         comp_args="-comp zstd -Xcompression-level 15 -b 128K"
     fi
     mksquashfs "$src" "$out" $comp_args -noappend -quiet -no-xattrs -no-exports
+    write_module_manifest "$out.manifest.json" "$name" "$(sha256_file "$out")"
     log "built: $name.squashfs ($(du -sh "$out" | cut -f1))"
     if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
         sq-s3 push-bg "$out" "modules/$name.squashfs"
+        sq-s3 push-bg "$out.manifest.json" "modules/$name.squashfs.manifest.json"
     fi
 }
 
@@ -361,54 +461,15 @@ GUI_START_EOF
 
 # ── Browser base (Chromium + desktop runtime glue) ──────────────────────
 #
-# Builds 510-browser-base.squashfs. Stack it with 500-gui-base and create the
-# sandbox with features ["gui","browser"] so browser launches happen inside the
-# same long-lived desktop session through sq-gui-start's FIFO command channel.
+# Builds 510-browser-base.squashfs. The default path is PorteuX-style: create a
+# temporary live sandbox from 000-base-alpine + 500-gui-base, install browser
+# packages into that merged root, then package only the upper delta. This avoids
+# stacking a second empty-root Alpine closure above the GUI layer.
 
-preset_browser_base() {
-    local root="$WORK/rootfs" name="510-browser-base"
-    mkdir -p "$root"
+BROWSER_PACKAGES="chromium dillo ca-certificates nss dbus dbus-x11 xdg-utils font-dejavu font-noto eudev-libs libssh libtheora libxcb libxshmfence numactl xcb-util mesa-dri-gallium"
 
-    log "building browser base module ($name)"
-
-    if command -v apk >/dev/null 2>&1; then
-        log "using apk (Alpine) to populate rootfs"
-        mkdir -p "$root/etc/apk"
-        cp /etc/apk/repositories "$root/etc/apk/repositories" 2>/dev/null || true
-        cp -a /etc/apk/keys "$root/etc/apk/" 2>/dev/null || true
-        apk add --root "$root" --initdb --no-cache \
-            chromium \
-            dillo \
-            firefox \
-            firefox-esr \
-            ca-certificates \
-            nss \
-            dbus \
-            dbus-x11 \
-            xdg-utils \
-            font-dejavu \
-            font-noto \
-            eudev-libs \
-            libssh \
-            libtheora \
-            libxcb \
-            libxshmfence \
-            numactl \
-            xcb-util \
-            mesa-dri-gallium \
-            >/dev/null 2>&1 || die "apk add failed (need root or fakeroot)"
-    elif command -v debootstrap >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
-        log "Debian/Ubuntu host — recommended path is build-in-sandbox:"
-        log "  1. sq-ctl create browser-builder anon 000-base-debian"
-        log "  2. sq-ctl exec browser-builder 'apt-get update && apt-get install -y \\"
-        log "       chromium ca-certificates fonts-dejavu fonts-noto dbus-x11 xdg-utils'"
-        log "  3. sq-mkmod from-sandbox browser-builder $name"
-        log "  4. sq-ctl destroy browser-builder"
-        die "no automated apt path; use build-in-sandbox"
-    else
-        die "no supported package manager found (apk or apt)"
-    fi
-
+install_browser_opener() {
+    local root="$1" name="510-browser-base"
     mkdir -p "$root/usr/local/bin" "$root/etc"
     cat > "$root/usr/local/bin/sq-browser-open" <<'BROWSER_OPEN_EOF'
 #!/bin/sh
@@ -436,24 +497,6 @@ if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/bus" ]; th
         --print-pid >"$XDG_RUNTIME_DIR/dbus-browser.pid" 2>/tmp/sq-browser-dbus.log || true
 fi
 
-# Alpine's Chromium stack has a few musl-era libraries whose optional symbols
-# are resolved only when their extension libraries are already in the process.
-# Preload the small set Chromium commonly needs in this minimal live root.
-preload=""
-for lib in \
-    /usr/lib/libxcb-shm.so.0 \
-    /usr/lib/libxcb-sync.so.1 \
-    /usr/lib/libxcb-xfixes.so.0 \
-    /usr/lib/libnuma.so.1 \
-    /usr/lib/libssh.so.4 \
-    /usr/lib/libtheoraenc.so.1 \
-    /usr/lib/libudev.so.1 \
-    /usr/lib/libxkbcommon.so.0; do
-    [ -e "$lib" ] || continue
-    preload="${preload:+$preload:}$lib"
-done
-[ -n "$preload" ] && export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$preload"
-
 CHROME_FLAGS="
 --user-data-dir=$XDG_CONFIG_HOME/sq-chromium
 --disk-cache-dir=$XDG_CACHE_HOME/sq-chromium
@@ -464,27 +507,89 @@ CHROME_FLAGS="
 --no-sandbox
 "
 
-if command -v dillo >/dev/null 2>&1; then
-    exec dillo "$URL"
-elif command -v firefox >/dev/null 2>&1; then
-    exec firefox --no-remote --new-window "$URL"
-elif command -v firefox-esr >/dev/null 2>&1; then
-    exec firefox-esr --no-remote --new-window "$URL"
-elif command -v chromium-browser >/dev/null 2>&1; then
+if command -v chromium-browser >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     exec chromium-browser $CHROME_FLAGS "$URL"
 elif command -v chromium >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     exec chromium $CHROME_FLAGS "$URL"
+elif command -v dillo >/dev/null 2>&1; then
+    exec dillo "$URL"
 fi
 
-echo "no supported browser found (expected firefox-esr, firefox, chromium-browser, or chromium)" >&2
+echo "no supported browser found (expected chromium-browser, chromium, or dillo)" >&2
 exit 127
 BROWSER_OPEN_EOF
     chmod +x "$root/usr/local/bin/sq-browser-open"
     echo "$name" > "$root/etc/sq-browser-module"
+}
 
-    squash_it "$root" "$name"
+preset_browser_base() {
+    local name="510-browser-base" builder="sq-browser-builder-$$"
+
+    log "building browser base module ($name) from live GUI root"
+    if ! api_available; then
+        log "daemon not reachable at $API"
+        log "Start squashd and ensure 000-base-alpine + 500-gui-base exist, or run:"
+        log "  sq-mkmod preset browser-base-raw"
+        die "browser-base live build requires running daemon"
+    fi
+    [ -f "$MODULES/000-base-alpine.squashfs" ] || die "missing 000-base-alpine.squashfs"
+    [ -f "$MODULES/500-gui-base.squashfs" ] || die "missing 500-gui-base.squashfs"
+
+    api_curl DELETE "sandboxes/$builder" >/dev/null 2>&1 || true
+    if ! api_curl POST sandboxes "{\"id\":\"$builder\",\"owner\":\"sq-mkmod\",\"layers\":\"000-base-alpine,500-gui-base\",\"task\":\"build $name\"}" >/dev/null; then
+        die "create builder sandbox failed"
+    fi
+
+    local cmd="apk add --no-cache $BROWSER_PACKAGES"
+    if ! api_curl POST "sandboxes/$builder/exec" "{\"cmd\":\"$cmd\",\"timeout\":1800}" >/dev/null; then
+        api_curl DELETE "sandboxes/$builder" >/dev/null 2>&1 || true
+        die "install browser packages in builder failed"
+    fi
+
+    install_browser_opener "$DATA/sandboxes/$builder/merged"
+    if ! SQ_MODULE_BUILT_AGAINST="$(module_ref 000-base-alpine) $(module_ref 500-gui-base)" \
+        SQ_MODULE_APK_ADDED="$BROWSER_PACKAGES" \
+        from_sandbox "$builder" "$name"; then
+        api_curl DELETE "sandboxes/$builder" >/dev/null 2>&1 || true
+        die "package browser builder upper failed"
+    fi
+    api_curl DELETE "sandboxes/$builder" >/dev/null 2>&1 || true
+}
+
+preset_browser_base_raw() {
+    local root="$WORK/rootfs" name="510-browser-base"
+    mkdir -p "$root"
+
+    log "building raw browser base module ($name)"
+    log "NOTE: raw browser-base uses an empty-root apk closure; live browser-base is preferred."
+
+    if command -v apk >/dev/null 2>&1; then
+        log "using apk (Alpine) to populate rootfs"
+        mkdir -p "$root/etc/apk"
+        cp /etc/apk/repositories "$root/etc/apk/repositories" 2>/dev/null || true
+        cp -a /etc/apk/keys "$root/etc/apk/" 2>/dev/null || true
+        apk add --root "$root" --initdb --no-cache \
+            $BROWSER_PACKAGES \
+            >/dev/null 2>&1 || die "apk add failed (need root or fakeroot)"
+    elif command -v debootstrap >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
+        log "Debian/Ubuntu host — recommended path is build-in-sandbox:"
+        log "  1. sq-ctl create browser-builder anon 000-base-debian"
+        log "  2. sq-ctl exec browser-builder 'apt-get update && apt-get install -y \\"
+        log "       chromium ca-certificates fonts-dejavu fonts-noto dbus-x11 xdg-utils'"
+        log "  3. sq-mkmod from-sandbox browser-builder $name"
+        log "  4. sq-ctl destroy browser-builder"
+        die "no automated apt path; use build-in-sandbox"
+    else
+        die "no supported package manager found (apk or apt)"
+    fi
+
+    install_browser_opener "$root"
+
+    SQ_MODULE_BUILT_AGAINST="$(module_ref 000-base-alpine) $(module_ref 500-gui-base)" \
+        SQ_MODULE_APK_ADDED="$BROWSER_PACKAGES" \
+        squash_it "$root" "$name"
 }
 
 # ── From directory or sandbox ──────────────────────────────────────────
@@ -497,7 +602,8 @@ from_dir() {
 
 from_sandbox() {
     local id="$1" name="$2"
-    local upper="$DATA/sandboxes/$id/upper"
+    local upper="$DATA/sandboxes/$id/upper/data"
+    [ -d "$upper" ] || upper="$DATA/sandboxes/$id/upper"
     [ -d "$upper" ] || die "sandbox not found or empty upper: $id"
     squash_it "$upper" "$name"
 }
@@ -518,6 +624,7 @@ case "${1:-help}" in
   nullclaw)    preset_nullclaw ;;
             gui|gui-base) preset_gui_base ;;
             browser|browser-base) preset_browser_base ;;
+            browser-base-raw|browser-raw) preset_browser_base_raw ;;
 
             *)           die "unknown preset: ${2:-}. Run '$0 list'" ;;
         esac
@@ -539,8 +646,9 @@ presets:
   nodejs20     → 100-nodejs20.squashfs     Node.js 20 LTS
   golang       → 100-golang.squashfs       Go (latest)
   tailscale    → 200-tailscale.squashfs    Tailscale client
-  gui-base     → 500-gui-base.squashfs     XFCE + x11vnc + noVNC desktop
-  browser-base → 510-browser-base.squashfs Chromium + browser launch helper
+  gui-base         → 500-gui-base.squashfs XFCE + x11vnc + noVNC desktop
+  browser-base     → 510-browser-base.squashfs live-built browser delta (requires daemon)
+  browser-base-raw → 510-browser-base.squashfs empty-root fallback/debug build
 
 build-in-sandbox (recommended for base-specific packages):
   1. sq-ctl create builder anon 000-base-alpine

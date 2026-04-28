@@ -2,8 +2,10 @@ package manager
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -720,6 +722,10 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 				return nil, fmt.Errorf("module not found: %s", layer)
 			}
 		}
+		manifestPath := modPath + ".manifest.json"
+		if _, err := os.Stat(manifestPath); os.IsNotExist(err) && m.cfg.S3Bucket != "" {
+			_ = s3Pull(m.cfg, "modules/"+layer+".squashfs.manifest.json", manifestPath)
+		}
 		mp := filepath.Join(sdir, "images", layer+".squashfs")
 		if err := os.MkdirAll(mp, 0755); err != nil {
 			rollback()
@@ -731,6 +737,7 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		}
 		mountedLayers = append(mountedLayers, mp)
 	}
+	m.warnModuleManifestCompatibility(opts.Layers)
 
 	// Build lower dirs (highest numeric prefix = highest priority).
 	lower, err := buildLowerDirs(s.imagesDir())
@@ -897,6 +904,121 @@ func s3Pull(cfg *config.Config, s3Key, localPath string) error {
 		return fmt.Errorf("sq-s3 pull %s: %w: %s", s3Key, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+type moduleManifest struct {
+	Name           string   `json:"name"`
+	Version        string   `json:"version,omitempty"`
+	BuiltAgainst   []string `json:"built_against,omitempty"`
+	SquashFSSHA256 string   `json:"squashfs_sha256,omitempty"`
+}
+
+func (m *Manager) warnModuleManifestCompatibility(layers []string) {
+	active := make(map[string]bool, len(layers))
+	refs := make(map[string]string, len(layers))
+	manifests := make(map[string]moduleManifest, len(layers))
+
+	for _, layer := range layers {
+		active[layer] = true
+		modPath := filepath.Join(m.cfg.ModulesDir(), layer+".squashfs")
+		ref := computedModuleRef(m.cfg.ModulesDir(), layer, modPath)
+		manifest, ok := readModuleManifest(modPath + ".manifest.json")
+		if !ok {
+			slog.Info("module manifest missing; compatibility check is best-effort", "module", layer)
+			refs[layer] = ref
+			continue
+		}
+		if manifest.Name == "" {
+			manifest.Name = layer
+		}
+		if manifest.Name != layer {
+			slog.Warn("module manifest name mismatch", "module", layer, "manifest_name", manifest.Name)
+		}
+		refs[layer] = moduleManifestRef(layer, manifest, ref)
+		manifests[layer] = manifest
+	}
+
+	for layer, manifest := range manifests {
+		for _, expected := range manifest.BuiltAgainst {
+			dep := moduleRefName(expected)
+			if dep == "" {
+				continue
+			}
+			current, ok := refs[dep]
+			if !ok {
+				if active[dep] {
+					slog.Info("module dependency manifest missing; compatibility check is best-effort", "module", layer, "dependency", dep)
+				} else {
+					slog.Warn("module built against dependency that is not active", "module", layer, "expected", expected)
+				}
+				continue
+			}
+			if expected != current {
+				slog.Warn("module compatibility mismatch", "module", layer, "expected", expected, "current", current)
+			}
+		}
+	}
+}
+
+func readModuleManifest(path string) (moduleManifest, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return moduleManifest{}, false
+	}
+	var manifest moduleManifest
+	if err := json.Unmarshal(b, &manifest); err != nil {
+		slog.Warn("module manifest unreadable", "path", path, "err", err)
+		return moduleManifest{}, false
+	}
+	return manifest, true
+}
+
+func moduleManifestRef(layer string, manifest moduleManifest, fallback string) string {
+	if manifest.Version != "" {
+		return layer + "@v" + manifest.Version
+	}
+	if manifest.SquashFSSHA256 != "" {
+		return layer + "@sha256:" + manifest.SquashFSSHA256
+	}
+	return fallback
+}
+
+func computedModuleRef(modulesDir, layer, modPath string) string {
+	if layer == "000-base-alpine" {
+		if b, err := os.ReadFile(filepath.Join(modulesDir, "000-base-alpine.version")); err == nil {
+			v := strings.TrimSpace(string(b))
+			if v != "" {
+				return layer + "@v" + v
+			}
+		}
+	}
+	if sha, err := fileSHA256(modPath); err == nil && sha != "" {
+		return layer + "@sha256:" + sha
+	}
+	return layer + "@unknown"
+}
+
+func moduleRefName(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	if i := strings.IndexByte(ref, '@'); i >= 0 {
+		return ref[:i]
+	}
+	return ref
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // injectSecrets writes placeholder env vars to the sandbox upper layer.

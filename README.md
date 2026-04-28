@@ -273,6 +273,13 @@ Browser support is a separate layer because Chromium is large. Build it once:
 sq-mkmod preset browser-base             # → 510-browser-base.squashfs
 ```
 
+`browser-base` is built PorteuX-style: `sq-mkmod` creates a temporary builder
+sandbox from `000-base-alpine + 500-gui-base`, installs browser packages into
+that live merged root, then packages only the upper-layer delta. This requires a
+running local squashd API with `000-base-alpine` and `500-gui-base` available.
+For debugging or offline hosts, `sq-mkmod preset browser-base-raw` keeps the old
+empty-root apk closure path.
+
 Create sandboxes with both features so the browser layer is activated into
 the same live desktop root:
 
@@ -298,6 +305,12 @@ The API does not run a post-hoc sandbox exec for this. `sq-gui-start` owns
 squashd writes browser-open requests into that channel. The browser inherits
 the GUI session's `DISPLAY`, DBus session, XDG runtime directory, and mounted
 rootfs.
+
+Modules also carry manifests in two places: inside the layer at
+`/etc/sq-module/<name>.manifest.json`, and next to the squashfs as
+`<name>.squashfs.manifest.json`. The daemon uses the sidecar manifests for
+warn-only compatibility checks when composing layers, so stale S3-cached browser
+layers can be detected when their `500-gui-base` dependency changes.
 
 ### Autonomous Task Runner
 

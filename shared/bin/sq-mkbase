@@ -25,11 +25,65 @@ die() { echo "[sq-mkbase] ERROR: $*" >&2; cleanup; exit 1; }
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
+sha256_file() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    else
+        echo ""
+    fi
+}
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_apk_repos_array() {
+    local repos="$1" first=1 line
+    printf '['
+    if [ -r "$repos" ]; then
+        while IFS= read -r line; do
+            case "$line" in ""|\#*) continue ;; esac
+            [ "$first" = 1 ] || printf ','
+            first=0
+            printf '"%s"' "$(json_escape "$line")"
+        done < "$repos"
+    fi
+    printf ']'
+}
+
+write_module_manifest() {
+    local dest="$1" name="$2" version="${3:-}" squashfs_sha="${4:-}" repos="${5:-/etc/apk/repositories}"
+    local built_at
+    built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$(dirname "$dest")"
+    {
+        printf '{\n'
+        printf '  "schema": 1,\n'
+        printf '  "name": "%s",\n' "$(json_escape "$name")"
+        [ -n "$version" ] && printf '  "version": "%s",\n' "$(json_escape "$version")"
+        printf '  "built_at": "%s",\n' "$built_at"
+        printf '  "builder": "sq-mkbase",\n'
+        printf '  "base": "",\n'
+        printf '  "built_against": [],\n'
+        printf '  "apk_repos": '
+        json_apk_repos_array "$repos"
+        printf ',\n'
+        printf '  "apk_added": [],\n'
+        printf '  "squashfs_sha256": "%s"\n' "$(json_escape "$squashfs_sha")"
+        printf '}\n'
+    } > "$dest"
+}
+
 squash_it() {
     local src="$1" name="$2"
+    local version="${3:-}"
     local out="$MODULES/$name.squashfs"
     mkdir -p "$MODULES"
     log "compressing $name ($(du -sh "$src" | cut -f1) → squashfs)"
+    write_module_manifest "$src/etc/sq-module/$name.manifest.json" "$name" "$version" "" "$src/etc/apk/repositories"
     # Use zstd if kernel supports it, otherwise fall back to gzip
     local comp_args="-comp gzip -b 256K"
     if zgrep -q CONFIG_SQUASHFS_ZSTD=y /proc/config.gz 2>/dev/null; then
@@ -37,9 +91,11 @@ squash_it() {
     fi
     mksquashfs "$src" "$out" $comp_args -noappend -quiet \
         -no-xattrs -no-exports
+    write_module_manifest "$out.manifest.json" "$name" "$version" "$(sha256_file "$out")" "$src/etc/apk/repositories"
     log "done: $out ($(du -sh "$out" | cut -f1))"
     if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
         sq-s3 push-bg "$out" "modules/$name.squashfs"
+        sq-s3 push-bg "$out.manifest.json" "modules/$name.squashfs.manifest.json"
     fi
 }
 
@@ -82,7 +138,7 @@ EOF
         log "sandbox will need 'apk add' after creation"
     }
 
-    squash_it "$rootfs" "000-base-alpine"
+    squash_it "$rootfs" "000-base-alpine" "2"
     echo "2" > "$MODULES/000-base-alpine.version"
 }
 

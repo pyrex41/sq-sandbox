@@ -132,3 +132,41 @@ func TestInjectSecretsWritesPlaceholderExportsAndCABundle(t *testing.T) {
 		}
 	}
 }
+
+func TestModuleManifestRefs(t *testing.T) {
+	if got := moduleRefName("500-gui-base@sha256:abc"); got != "500-gui-base" {
+		t.Fatalf("moduleRefName = %q", got)
+	}
+	if got := moduleManifestRef("000-base-alpine", moduleManifest{Version: "2"}, "fallback"); got != "000-base-alpine@v2" {
+		t.Fatalf("moduleManifestRef version = %q", got)
+	}
+	if got := moduleManifestRef("500-gui-base", moduleManifest{SquashFSSHA256: "abc"}, "fallback"); got != "500-gui-base@sha256:abc" {
+		t.Fatalf("moduleManifestRef sha = %q", got)
+	}
+}
+
+func TestComputedModuleRefPrefersBaseVersion(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "000-base-alpine.version"), []byte("2\n"), 0644); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	if got := computedModuleRef(dir, "000-base-alpine", filepath.Join(dir, "000-base-alpine.squashfs")); got != "000-base-alpine@v2" {
+		t.Fatalf("computed base ref = %q", got)
+	}
+}
+
+func TestReadModuleManifest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "510-browser-base.squashfs.manifest.json")
+	if err := os.WriteFile(path, []byte(`{"name":"510-browser-base","built_against":["500-gui-base@sha256:abc"],"squashfs_sha256":"def"}`), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	manifest, ok := readModuleManifest(path)
+	if !ok {
+		t.Fatal("readModuleManifest ok=false")
+	}
+	if manifest.Name != "510-browser-base" || len(manifest.BuiltAgainst) != 1 ||
+		manifest.BuiltAgainst[0] != "500-gui-base@sha256:abc" ||
+		manifest.SquashFSSHA256 != "def" {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+}

@@ -313,7 +313,7 @@ sync_modules() {
     _detect_transport
 
     # Push local-only modules
-    for f in "$MODULES"/*.squashfs; do
+    for f in "$MODULES"/*.squashfs "$MODULES"/*.squashfs.manifest.json; do
         [ ! -f "$f" ] && continue
         local name=$(basename "$f")
         local key="modules/$name"

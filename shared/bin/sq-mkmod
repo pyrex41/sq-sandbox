@@ -47,7 +47,8 @@ sha256_file() {
 }
 
 module_ref() {
-    local name="$1" path="$MODULES/$name.squashfs"
+    local name="$1"
+    local path="$MODULES/$name.squashfs"
     if [ "$name" = "000-base-alpine" ] && [ -f "$MODULES/000-base-alpine.version" ]; then
         printf '%s@v%s' "$name" "$(cat "$MODULES/000-base-alpine.version" 2>/dev/null || echo unknown)"
         return

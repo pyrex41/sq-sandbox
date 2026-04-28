@@ -6,9 +6,9 @@ branch: pr-7-fixes
 repository: pyrex41/sq-sandbox
 topic: "Does a PorteuX-style solid-layer build for browser-base make sense for sq-sandbox?"
 tags: [research, codebase, sq-mkmod, modules, browser-base, gui-base, overlayfs, porteux]
-status: complete
+status: implemented
 last_updated: 2026-04-27
-last_updated_by: Reuben Brooks
+last_updated_by: Cursor Agent
 ---
 
 # Research: PorteuX-style "solid layer" approach for sq-sandbox modules
@@ -33,6 +33,27 @@ Three sub-questions:
 3. Add `/etc/sq-module-manifest` pinning?
 
 ## Summary
+
+### Post-Implementation Update
+
+The recommended path from this note has now been implemented on branch
+`pr-7-fixes`:
+
+- `sq-mkmod preset browser-base` is now the PorteuX-style live builder path. It
+  creates a temporary sandbox from `000-base-alpine + 500-gui-base`, installs the
+  browser packages in that merged root, and packages only the builder
+  `upper/data` as `510-browser-base.squashfs`.
+- The old empty-root closure remains available as
+  `sq-mkmod preset browser-base-raw`.
+- Module manifests are emitted both in-layer at
+  `/etc/sq-module/<name>.manifest.json` and as sidecars at
+  `<name>.squashfs.manifest.json`.
+- The Go manager performs warn-only compatibility checks from sidecar manifests
+  during sandbox creation.
+- A Docker/Rodney smoke test verified the live-built browser layer: noVNC loaded,
+  Chromium opened inside the desktop session, and `https://example.com` rendered.
+
+The sections below remain as the decision record that motivated those changes.
 
 The PorteuX-style "build inside a live merged root, package the upper as a delta"
 flow is **already mechanically supported** by `sq-mkmod from-sandbox`

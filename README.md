@@ -278,7 +278,8 @@ sandbox from `000-base-alpine + 500-gui-base`, installs browser packages into
 that live merged root, then packages only the upper-layer delta. This requires a
 running local squashd API with `000-base-alpine` and `500-gui-base` available.
 For debugging or offline hosts, `sq-mkmod preset browser-base-raw` keeps the old
-empty-root apk closure path.
+empty-root apk closure path. The live-built module prefers Chromium for normal
+browser launches and keeps Dillo available as a lightweight fallback.
 
 Create sandboxes with both features so the browser layer is activated into
 the same live desktop root:
@@ -310,7 +311,8 @@ Modules also carry manifests in two places: inside the layer at
 `/etc/sq-module/<name>.manifest.json`, and next to the squashfs as
 `<name>.squashfs.manifest.json`. The daemon uses the sidecar manifests for
 warn-only compatibility checks when composing layers, so stale S3-cached browser
-layers can be detected when their `500-gui-base` dependency changes.
+layers can be detected when their `500-gui-base` dependency changes without
+blocking sandbox startup.
 
 ### Autonomous Task Runner
 

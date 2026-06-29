@@ -90,6 +90,102 @@ but isolates processes through gVisor's Sentry — a user-space kernel that
 intercepts all syscalls without requiring `/dev/kvm`. This provides stronger
 isolation than plain namespaces without the overhead of a full microVM.
 
+## composefs LayerStore (experimental)
+
+Read-only layer assembly is abstracted behind a **LayerStore** seam, orthogonal
+to the exec `SQUASH_BACKEND` axis. It controls *how* module/snapshot images are
+mounted and stacked into the overlay lowerdir — not how the payload executes.
+
+| `SQUASH_LAYER_BACKEND` | How RO layers are assembled                                  |
+|------------------------|--------------------------------------------------------------|
+| `squashfs` (default)   | One squashfs image per layer, mounted with **squashfuse** (FUSE, zero loop devices). Portable lowest-common-denominator; this is also the fallback. |
+| `composefs`            | One **EROFS** metadata image per layer stacked over a shared, content-addressed **objects store** (`$SQUASH_DATA/cfs/objects`). |
+
+Both produce an identical overlay; only the primitives differ. squashfuse remains
+the default and the fallback — composefs is strictly opt-in.
+
+### Why composefs
+
+The real win is a **kernel-native read path**: layers mount as kernel EROFS
+instead of FUSE, avoiding squashfuse's per-I/O context-switch cost and the FUSE
+mount-visibility/propagation bugs seen in containerized (sidecar) deployments.
+Layers also share file *data* through a single content-addressed objects store,
+so identical content (across modules and sandboxes) is stored once; each `.cfs`
+image holds only metadata + redirect xattrs pointing into that store. Adding a
+layer (activate) or restoring a snapshot remounts the overlay without repacking
+the rest of the stack.
+
+> **Loop devices — not loop-free today.** The backend mounts each layer with
+> `mount -t erofs <file>`, which util-linux loop-wraps a regular-file source, so
+> you get **one loop device per layer** — *verified on Fly's 6.12.91-fly kernel,
+> which has `CONFIG_EROFS_FS_BACKED_BY_FILE=y` yet still loop-backs the plain
+> mount*. This is comparable to (not better than) squashfuse on mount/loop count;
+> the benefit is the kernel read path, not loop reduction. Genuinely loop-free
+> file-backed EROFS needs the fd-based mount API (`fsopen`/`fsconfig`/`fsmount`
+> with the image fd) — a tracked follow-up, not yet wired into `MountLayer`.
+
+### Kernel requirements
+
+composefs is **probe-gated**: every mount/pack first verifies support and, on any
+missing prerequisite, returns a clear error telling you to set
+`SQUASH_LAYER_BACKEND=squashfs`. It never silently produces a broken stack.
+
+- **EROFS** filesystem (`/proc/filesystems`). Loop-backed EROFS works on any
+  EROFS-capable kernel; loop-free file-backed EROFS needs `CONFIG_EROFS_FS_BACKED_BY_FILE`
+  (kernel **≥ 6.12**) *and* the fd-based mount API (see note above).
+- **overlayfs** with `redirect_dir` and `metacopy` (probed by the *presence* of
+  `/sys/module/overlay/parameters/*`; the per-mount `redirect_dir=on,metacopy=on`
+  options override the module default of `N`).
+- Data-only (`::`) lowerdirs require kernel **≥ 6.7**.
+- `mkcomposefs` / `composefs-info` binaries on the build/daemon host.
+- Validated end-to-end on Fly (`6.12.91-fly`): build → EROFS layer mount →
+  data-only-lower overlay → write-through → snapshot all pass. See
+  `test/composefs-validate.sh` and `test/Dockerfile.composefs`.
+
+### fs-verity (`SQUASH_COMPOSEFS_VERITY`)
+
+Off by default and **fail-open**. When set to `1`, mounts request verity
+enforcement *only* if the kernel and the objects-store filesystem actually
+support it (needs `CONFIG_FS_VERITY` + an ext4/btrfs/f2fs store with the verity
+feature, absent on stock Firecracker, Docker overlay2, and tmpfs). If
+unsupported, a warning is logged and the mount proceeds **unauthenticated**
+rather than failing. Never assume fs-verity is active. *Confirmed unavailable on
+Fly's `6.12.91-fly` kernel (`# CONFIG_FS_VERITY is not set`)* — on Fly this path
+always falls open, so verity there requires a custom kernel.
+
+### Building composefs layers
+
+`sq-mkmod` keeps mksquashfs as the default and additionally emits a `.cfs` layer
+when `SQUASH_LAYER_BACKEND=composefs`:
+
+```bash
+SQUASH_LAYER_BACKEND=composefs sq-mkmod preset python3.12
+# → modules/100-python312.squashfs        (default artifact + fallback)
+# → modules/100-python312.cfs             (EROFS metadata image)
+# → cfs/objects/<digest>…                 (shared content-addressed data)
+```
+
+The module manifest gains a non-breaking `composefs_digest` field (the image's
+fs-verity digest). Old readers ignore it.
+
+### Objects-store garbage collection
+
+Because the objects store is **shared**, objects must never be deleted
+per-sandbox. Instead a conservative **mark-and-sweep** keeps every object
+referenced by any reachable `.cfs` image (all module images + all per-sandbox
+snapshots) and sweeps the rest:
+
+```bash
+sq-ctl gc --dry-run     # report what would be swept, delete nothing
+sq-ctl gc               # sweep unreferenced objects locally
+sq-ctl gc --s3          # also delete from S3 (only after a clean local sweep)
+```
+
+Safety invariants: GC refuses while any sandbox is mid-create/destroy; if any
+image's referenced set cannot be read it aborts the whole sweep (fail closed);
+and S3 deletion is gated behind a fully successful local sweep. On
+squashfs-only deployments (no objects store) `gc` is a no-op.
+
 ## API
 
 All endpoints live under `/cgi-bin/`. If `SQUASH_AUTH_TOKEN` is set, include
@@ -112,6 +208,10 @@ POST   /cgi-bin/api/sandboxes/:id/restore           restore from checkpoint
 POST   /cgi-bin/api/sandboxes/:id/fork              clone sandbox state
 GET    /cgi-bin/api/sandboxes/:id/diff              upper-layer diff
 GET    /cgi-bin/api/sandboxes/:id/logs              execution history
+POST   /cgi-bin/api/sandboxes/:id/gui/enable        start GUI desktop (idempotent)
+POST   /cgi-bin/api/sandboxes/:id/gui/disable       stop GUI desktop (idempotent)
+GET    /cgi-bin/api/sandboxes/:id/gui/status        current GUI state + noVNC URL
+*      /cgi-bin/api/sandboxes/:id/novnc/...         noVNC reverse-proxy (session-token auth)
 POST   /cgi-bin/api/sandboxes/:id/task              start autonomous task
 GET    /cgi-bin/api/sandboxes/:id/task              task status
 GET    /cgi-bin/api/sandboxes/:id/task/events       SSE event stream
@@ -120,6 +220,7 @@ POST   /cgi-bin/api/sandboxes/:id/task/resume       resume turn loop
 POST   /cgi-bin/api/sandboxes/:id/task/kill         kill task
 POST   /cgi-bin/api/sandboxes/:id/task/snapshot     on-demand task snapshot
 GET    /cgi-bin/api/modules                         available modules
+POST   /cgi-bin/api/gc                               sweep unreferenced composefs objects
 ```
 
 ### Create
@@ -162,6 +263,153 @@ Only `id` and `layers` are required. Defaults: `cpu=2`, `memory_mb=1024`,
 // POST .../restore   — mount snapshot as layer, clear upper, remount
 {"label": "my-checkpoint"}
 ```
+
+### GUI Mode
+
+Sandboxes can run a full Linux desktop (XFCE) reachable through a browser
+via noVNC. GUI mode is opt-in: zero overhead when not requested, identical
+container image whether or not it's used.
+
+Set `features: ["gui"]` at create time and squashd auto-mounts the
+`500-gui-base` layer and starts Xvfb + the window manager + x11vnc +
+websockify in the sandbox network namespace:
+
+```json
+// POST /cgi-bin/api/sandboxes
+{
+    "id": "user-123",
+    "layers": "000-base-alpine,100-dev-tools",
+    "features": ["gui"],
+    "gui": {
+        "desktop": "xfce",
+        "resolution": "1920x1080",
+        "vnc_password": null
+    }
+}
+```
+
+Toggle on/off at runtime — sandbox state is preserved either way:
+
+```sh
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/enable \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  -d '{"resolution":"1280x720"}'
+# → {
+#     "enabled": true,
+#     "desktop": "xfce",
+#     "novnc_port": 6080,
+#     "session_token": "a1b2…(32 hex chars)",
+#     "novnc_url": "/cgi-bin/api/sandboxes/user-123/novnc/vnc.html?_token=a1b2…&autoconnect=true&path=..."
+#   }
+
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/disable \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN"
+# → {"enabled": false}
+
+curl -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  localhost:8080/cgi-bin/api/sandboxes/user-123/gui/status
+```
+
+`POST /gui/enable` is idempotent — call it again and you get the current
+state. `POST /gui/disable` kills the GUI processes inside the sandbox; the
+GUI layer stays mounted so re-enabling is fast.
+
+The GUI module ships a `/usr/local/bin/sq-gui-start` script that reads
+`/etc/sq-gui.conf` (written by squashd into the sandbox upper layer when
+GUI is enabled) for `DESKTOP`, `RESOLUTION`, `VNC_PORT`, `NOVNC_PORT`,
+and `VNC_PASSWORD`. Set `SQUASH_DEFAULT_FEATURES=gui` to make every new
+sandbox boot with GUI enabled, or `SQUASH_GUI_MODULE=510-gui-minimal` to
+swap the default desktop layer. Add `browser` to the features list when
+you want an in-desktop browser.
+
+#### How the desktop reaches the browser
+
+The noVNC websocket listens on port 6080 inside the sandbox network
+namespace. squashd ships a built-in reverse proxy that crosses into that
+netns (via `setns(2)` on the bwrap child PID) and forwards traffic from a
+public path on the daemon port:
+
+```
+https://<host>:8080/cgi-bin/api/sandboxes/<id>/novnc/vnc.html?_token=<session_token>
+```
+
+That single URL — returned as `novnc_url` from `/gui/enable` and
+`/gui/status` — is everything a browser needs. Open it; the noVNC web UI
+loads, opens a WebSocket back through the same proxy, and you get a
+desktop in the tab. **It works unchanged on Fly.io, OrbStack, PorteuX, or
+bare Linux** because there's only one externally exposed port (the daemon's),
+and TLS termination happens at the platform edge.
+
+Authentication is split:
+
+- The daemon-wide `SQUASH_AUTH_TOKEN` (Bearer header) protects everything
+  *except* the `/novnc/` subtree.
+- A per-sandbox `session_token` — fresh hex generated at `/gui/enable` time,
+  rotated on every re-enable — protects the `/novnc/` subtree.
+  Browsers use `?_token=…` on the first noVNC URL; squashd then sets a
+  scoped noVNC cookie so static assets and the WebSocket authenticate
+  without copying the token into every subrequest. HTTP/WS clients can use
+  either the query param or `Authorization: Bearer <session_token>`.
+
+Leaking a noVNC URL exposes one sandbox's desktop, never the API. The
+proxy also caps each sandbox at 4 concurrent noVNC connections, so a
+runaway client can't starve daemon goroutines.
+
+Build the GUI layer once, then S3-sync makes it available everywhere:
+
+```sh
+sq-mkmod preset gui-base                 # → 500-gui-base.squashfs (~120 MB)
+# pushed to S3 automatically when SQUASH_S3_BUCKET is set
+```
+
+#### Browser Launches Inside GUI
+
+Browser support is a separate layer because Chromium is large. Build it once:
+
+```sh
+sq-mkmod preset browser-base             # → 510-browser-base.squashfs
+```
+
+`browser-base` is built PorteuX-style: `sq-mkmod` creates a temporary builder
+sandbox from `000-base-alpine + 500-gui-base`, installs browser packages into
+that live merged root, then packages only the upper-layer delta. This requires a
+running local squashd API with `000-base-alpine` and `500-gui-base` available.
+For debugging or offline hosts, `sq-mkmod preset browser-base-raw` keeps the old
+empty-root apk closure path. The live-built module prefers Chromium for normal
+browser launches and keeps Dillo available as a lightweight fallback.
+
+Create sandboxes with both features so the browser layer is activated into
+the same live desktop root:
+
+```json
+{
+    "id": "user-123",
+    "layers": "000-base-alpine",
+    "features": ["gui", "browser"]
+}
+```
+
+Open a URL in the running desktop:
+
+```sh
+curl -X POST localhost:8080/cgi-bin/api/sandboxes/user-123/gui/browser/open \
+  -H "Authorization: Bearer $SQUASH_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com"}'
+```
+
+The API does not run a post-hoc sandbox exec for this. `sq-gui-start` owns
+`/var/lib/sq-gui/browser-open.fifo` inside the long-lived desktop session, and
+squashd writes browser-open requests into that channel. The browser inherits
+the GUI session's `DISPLAY`, DBus session, XDG runtime directory, and mounted
+rootfs.
+
+Modules also carry manifests in two places: inside the layer at
+`/etc/sq-module/<name>.manifest.json`, and next to the squashfs as
+`<name>.squashfs.manifest.json`. The daemon uses the sidecar manifests for
+warn-only compatibility checks when composing layers, so stale S3-cached browser
+layers can be detected when their `500-gui-base` dependency changes without
+blocking sandbox startup.
 
 ### Autonomous Task Runner
 
@@ -231,9 +479,10 @@ Adding an adapter is a single struct in `impl/go/runner/agents.go`.
 | 10x   | Language runtimes | python312, nodejs22, golang       |
 | 11x   | Build tools       | gcc, make, cmake, git             |
 | 20x   | Services/daemons  | tailscale, nginx, postgres        |
+| 50x   | Desktop/GUI       | gui-base (XFCE + noVNC)           |
 | 9xx   | Checkpoints       | (auto-generated from upper layer) |
 
-Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale`
+Build presets: `sq-mkmod preset python3.12|nodejs22|golang|tailscale|gui-base`
 
 Build from directory: `sq-mkmod from-dir /path/to/tree 110-my-tools`
 
@@ -350,8 +599,13 @@ etc. — anything that supports privileged containers.
 | `SQUASH_PROXY_HTTPS`  | `""` (disabled)               | HTTPS MITM proxy (set `1`)           |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
 | `SQUASH_SNAPSHOT_BACKEND` | `squashfs`                | Snapshot backend: `squashfs` or `irmin` |
+| `SQUASH_LAYER_BACKEND`    | `squashfs`                | RO-layer assembly: `squashfs` (squashfuse, default) or `composefs` (experimental) |
+| `SQUASH_COMPOSEFS_VERITY` | `""` (off)                | Opt-in fs-verity sealing for composefs (fail-open; set `1`) |
 | `SQUASH_STORE_SOCK`   | `$SQUASH_DATA/.sq-store.sock` | sq-store sidecar socket path         |
 | `SQUASH_STORE_DIR`    | `$SQUASH_DATA/.sq-store/`     | Irmin pack data directory            |
+| `SQUASH_GUI_MODULE`   | `500-gui-base`                | Default layer used when `features:["gui"]` is set |
+| `SQUASH_BROWSER_MODULE` | `510-browser-base`          | Default browser layer used when `features:["browser"]` is set |
+| `SQUASH_DEFAULT_FEATURES` | `""`                      | Comma-separated features applied to every new sandbox (e.g. `gui`) |
 
 ### Irmin Snapshot Backend
 

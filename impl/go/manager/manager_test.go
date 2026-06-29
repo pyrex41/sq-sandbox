@@ -5,9 +5,55 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"squashd/config"
 )
+
+func TestWriteAndReadMetaWithFeaturesAndGUI(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".meta"), 0755); err != nil {
+		t.Fatalf("mkdir meta: %v", err)
+	}
+	original := &Sandbox{
+		ID:           "demo",
+		Dir:          dir,
+		Owner:        "alice",
+		Layers:       []string{"000-base-alpine", "500-gui-base"},
+		Backend:      "chroot",
+		CPU:          2,
+		MemoryMB:     1024,
+		MaxLifetimeS: 600,
+		AllowNet:     []string{"api.anthropic.com"},
+		Features:     []string{"gui"},
+		GUI: &GUIState{
+			Enabled:    true,
+			Desktop:    "xfce",
+			Resolution: "1280x720",
+			Module:     "500-gui-base",
+			JobID:      7,
+			NoVNCPort:  6080,
+			VNCPort:    5900,
+			StartedAt:  time.Now().UTC().Format(time.RFC3339),
+		},
+		CreatedAt:    time.Now(),
+		LastActiveAt: time.Now(),
+	}
+	if err := writeMeta(dir, original); err != nil {
+		t.Fatalf("writeMeta: %v", err)
+	}
+	loaded, err := readMeta("demo", dir)
+	if err != nil {
+		t.Fatalf("readMeta: %v", err)
+	}
+	if len(loaded.Features) != 1 || loaded.Features[0] != "gui" {
+		t.Errorf("features round-trip: %v", loaded.Features)
+	}
+	if loaded.GUI == nil || !loaded.GUI.Enabled || loaded.GUI.Desktop != "xfce" ||
+		loaded.GUI.Resolution != "1280x720" || loaded.GUI.JobID != 7 {
+		t.Errorf("gui round-trip: %+v", loaded.GUI)
+	}
+}
 
 func TestInjectSecretsWritesPlaceholderExportsAndCABundle(t *testing.T) {
 	dataDir := t.TempDir()
@@ -84,5 +130,43 @@ func TestInjectSecretsWritesPlaceholderExportsAndCABundle(t *testing.T) {
 		if !strings.Contains(string(upperBundle), want) {
 			t.Fatalf("upper bundle missing %q:\n%s", want, string(upperBundle))
 		}
+	}
+}
+
+func TestModuleManifestRefs(t *testing.T) {
+	if got := moduleRefName("500-gui-base@sha256:abc"); got != "500-gui-base" {
+		t.Fatalf("moduleRefName = %q", got)
+	}
+	if got := moduleManifestRef("000-base-alpine", moduleManifest{Version: "2"}, "fallback"); got != "000-base-alpine@v2" {
+		t.Fatalf("moduleManifestRef version = %q", got)
+	}
+	if got := moduleManifestRef("500-gui-base", moduleManifest{SquashFSSHA256: "abc"}, "fallback"); got != "500-gui-base@sha256:abc" {
+		t.Fatalf("moduleManifestRef sha = %q", got)
+	}
+}
+
+func TestComputedModuleRefPrefersBaseVersion(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "000-base-alpine.version"), []byte("2\n"), 0644); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	if got := computedModuleRef(dir, "000-base-alpine", filepath.Join(dir, "000-base-alpine.squashfs")); got != "000-base-alpine@v2" {
+		t.Fatalf("computed base ref = %q", got)
+	}
+}
+
+func TestReadModuleManifest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "510-browser-base.squashfs.manifest.json")
+	if err := os.WriteFile(path, []byte(`{"name":"510-browser-base","built_against":["500-gui-base@sha256:abc"],"squashfs_sha256":"def"}`), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	manifest, ok := readModuleManifest(path)
+	if !ok {
+		t.Fatal("readModuleManifest ok=false")
+	}
+	if manifest.Name != "510-browser-base" || len(manifest.BuiltAgainst) != 1 ||
+		manifest.BuiltAgainst[0] != "500-gui-base@sha256:abc" ||
+		manifest.SquashFSSHA256 != "def" {
+		t.Fatalf("manifest = %+v", manifest)
 	}
 }

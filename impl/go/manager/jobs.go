@@ -3,8 +3,6 @@ package manager
 import (
 	"fmt"
 	"sync"
-
-	sqexec "squashd/exec"
 )
 
 // Job tracks a background command execution within a sandbox.
@@ -116,6 +114,17 @@ func (j *Job) finish(exitCode int) {
 
 // ExecBg starts a background command in the sandbox and returns the job ID.
 func (m *Manager) ExecBg(sandboxID, cmd, workdir string, timeoutS int) (int, error) {
+	return m.execBg(sandboxID, cmd, workdir, timeoutS, nil)
+}
+
+// ExecBgEnv is like ExecBg but lets the caller pass extra environment
+// variables for the spawned sq-exec process. Used by GUI mode to set
+// SQEXEC_PIDFILE so the bwrap child PID can be discovered.
+func (m *Manager) ExecBgEnv(sandboxID, cmd, workdir string, timeoutS int, extraEnv []string) (int, error) {
+	return m.execBg(sandboxID, cmd, workdir, timeoutS, extraEnv)
+}
+
+func (m *Manager) execBg(sandboxID, cmd, workdir string, timeoutS int, extraEnv []string) (int, error) {
 	m.mu.Lock()
 	s, exists := m.sandboxes[sandboxID]
 	m.mu.Unlock()
@@ -149,7 +158,9 @@ func (m *Manager) ExecBg(sandboxID, cmd, workdir string, timeoutS int) (int, err
 
 	s.updateLastActive()
 
-	cancelFn, exitCh := sqexec.RunBg(s.mergedDir(), cmd, workdir, timeoutS, job.addLine)
+	// Route through the per-sandbox backend so a memory checkpoint (gvisor)
+	// captures the agent loop, which runs exclusively via this ExecBg path.
+	cancelFn, exitCh := m.backendFor(s).RunBg(s, cmd, workdir, timeoutS, extraEnv, job.addLine)
 
 	job.mu.Lock()
 	job.cancel = cancelFn

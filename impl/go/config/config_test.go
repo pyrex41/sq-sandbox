@@ -22,6 +22,9 @@ func TestFromEnvDefaults(t *testing.T) {
 	if c.SnapshotBackend != "squashfs" {
 		t.Errorf("SnapshotBackend = %q, want squashfs", c.SnapshotBackend)
 	}
+	if c.LayerBackend != "squashfs" {
+		t.Errorf("LayerBackend = %q, want squashfs", c.LayerBackend)
+	}
 }
 
 func TestValidate(t *testing.T) {
@@ -51,6 +54,7 @@ func TestValidate(t *testing.T) {
 				UpperLimitMB:    512,
 				Backend:         "chroot",
 				SnapshotBackend: "squashfs",
+				LayerBackend:    "squashfs",
 			}
 			tt.mutate(&c)
 			err := c.Validate()
@@ -65,5 +69,46 @@ func TestModulesDir(t *testing.T) {
 	c := Config{DataDir: "/data"}
 	if got := c.ModulesDir(); got != "/data/modules" {
 		t.Errorf("ModulesDir() = %q, want /data/modules", got)
+	}
+}
+
+func TestGUIModuleDefault(t *testing.T) {
+	os.Setenv("SQUASH_DATA", "/data")
+	defer os.Unsetenv("SQUASH_DATA")
+	os.Unsetenv("SQUASH_GUI_MODULE")
+	os.Unsetenv("SQUASH_BROWSER_MODULE")
+	os.Unsetenv("SQUASH_DEFAULT_FEATURES")
+	c := FromEnv()
+	if c.GUIModule != "500-gui-base" {
+		t.Errorf("GUIModule default = %q, want 500-gui-base", c.GUIModule)
+	}
+	if c.BrowserModule != "510-browser-base" {
+		t.Errorf("BrowserModule default = %q, want 510-browser-base", c.BrowserModule)
+	}
+	if len(c.DefaultFeatures) != 0 {
+		t.Errorf("DefaultFeatures default = %v, want empty", c.DefaultFeatures)
+	}
+}
+
+func TestDefaultFeaturesParsesCommaList(t *testing.T) {
+	os.Setenv("SQUASH_DATA", "/data")
+	os.Setenv("SQUASH_DEFAULT_FEATURES", "gui, secret-proxy")
+	os.Setenv("SQUASH_GUI_MODULE", "510-gui-minimal")
+	os.Setenv("SQUASH_BROWSER_MODULE", "520-browser-custom")
+	defer os.Unsetenv("SQUASH_DATA")
+	defer os.Unsetenv("SQUASH_DEFAULT_FEATURES")
+	defer os.Unsetenv("SQUASH_GUI_MODULE")
+	defer os.Unsetenv("SQUASH_BROWSER_MODULE")
+
+	c := FromEnv()
+	if c.GUIModule != "510-gui-minimal" {
+		t.Errorf("GUIModule = %q, want 510-gui-minimal", c.GUIModule)
+	}
+	if c.BrowserModule != "520-browser-custom" {
+		t.Errorf("BrowserModule = %q, want 520-browser-custom", c.BrowserModule)
+	}
+	if len(c.DefaultFeatures) != 2 || c.DefaultFeatures[0] != "gui" ||
+		c.DefaultFeatures[1] != "secret-proxy" {
+		t.Errorf("DefaultFeatures = %v, want [gui secret-proxy]", c.DefaultFeatures)
 	}
 }

@@ -1,12 +1,10 @@
 package exec
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,11 +15,11 @@ const (
 
 // Result is the outcome of running a command in a sandbox.
 type Result struct {
-	ExitCode  int    `json:"exit_code"`
-	Stdout    string `json:"stdout"`
-	Stderr    string `json:"stderr"`
-	TimedOut  bool   `json:"timed_out"`
-	StartedAt time.Time
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	TimedOut   bool   `json:"timed_out"`
+	StartedAt  time.Time
 	FinishedAt time.Time
 }
 
@@ -31,12 +29,14 @@ type Result struct {
 // network namespace lookup, and seccomp — the daemon just orchestrates.
 //
 // argv: sq-exec <merged> <cmd> <workdir> <timeout_s> [net]
+//
+// Run is a thin wrapper over RunTool (see tool.go); the gvisor backend uses the
+// same launcher with a different argv.
 func Run(merged, cmd, workdir string, timeoutS int) (*Result, error) {
 	if timeoutS <= 0 {
 		timeoutS = 300
 	}
-
-	args := []string{
+	argv := []string{
 		"sq-exec",
 		merged,
 		cmd,
@@ -44,70 +44,28 @@ func Run(merged, cmd, workdir string, timeoutS int) (*Result, error) {
 		fmt.Sprintf("%d", timeoutS),
 		"1", // net=1: enable slirp4netns so sandbox can reach MITM proxy
 	}
+	return RunTool(argv, timeoutS, 5)
+}
 
-	c := exec.Command(args[0], args[1:]...)
-
-	stdoutPipe, err := c.StdoutPipe()
-	if err != nil {
-		return &Result{ExitCode: 126, Stderr: "pipe: " + err.Error()}, nil
+// RunBg starts a background execution of cmd inside the merged rootfs.
+// onLine is called for each line of stdout or stderr (merged).
+// extraEnv is appended to os.Environ() for the spawned sq-exec process; pass
+// nil for default environment.
+// Returns a cancel func (kills the process) and a channel that receives the
+// exit code when the process completes.
+func RunBg(merged, cmd, workdir string, timeoutS int, extraEnv []string, onLine func(string)) (cancel func(), exitCh <-chan int) {
+	if timeoutS <= 0 {
+		timeoutS = 7200
 	}
-	stderrPipe, err := c.StderrPipe()
-	if err != nil {
-		return &Result{ExitCode: 126, Stderr: "pipe: " + err.Error()}, nil
+	argv := []string{
+		"sq-exec",
+		merged,
+		cmd,
+		workdir,
+		fmt.Sprintf("%d", timeoutS),
+		"1", // net=1: enable slirp4netns so sandbox can reach MITM proxy
 	}
-
-	startedAt := time.Now()
-	if err := c.Start(); err != nil {
-		return &Result{
-			ExitCode:   126,
-			Stderr:     "spawn: " + err.Error(),
-			StartedAt:  startedAt,
-			FinishedAt: time.Now(),
-		}, nil
-	}
-
-	// Read stdout and stderr concurrently to prevent pipe buffer deadlock.
-	type readResult struct{ data string }
-	outCh := make(chan readResult, 1)
-	errCh := make(chan readResult, 1)
-
-	go func() { outCh <- readResult{readCapped(stdoutPipe, maxOutput)} }()
-	go func() { errCh <- readResult{readCapped(stderrPipe, maxOutput)} }()
-
-	// Safety-net: kill if sq-exec's own timeout doesn't fire within grace period.
-	gracePeriod := time.Duration(timeoutS+5) * time.Second
-	timer := time.AfterFunc(gracePeriod, func() {
-		_ = c.Process.Kill()
-	})
-
-	stdout := (<-outCh).data
-	stderr := (<-errCh).data
-
-	exitErr := c.Wait()
-	timer.Stop()
-	finishedAt := time.Now()
-
-	exitCode := 0
-	timedOut := false
-	if exitErr != nil {
-		if ee, ok := exitErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-			if exitCode == timeoutExitCode {
-				timedOut = true
-			}
-		} else {
-			exitCode = 1
-		}
-	}
-
-	return &Result{
-		ExitCode:   exitCode,
-		Stdout:     stdout,
-		Stderr:     stderr,
-		TimedOut:   timedOut,
-		StartedAt:  startedAt,
-		FinishedAt: finishedAt,
-	}, nil
+	return RunBgTool(argv, timeoutS, extraEnv, onLine)
 }
 
 // readCapped reads up to maxBytes from r, then drains the remainder so the
@@ -141,83 +99,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// RunBg starts a background execution of cmd inside the merged rootfs.
-// onLine is called for each line of stdout or stderr (merged).
-// Returns a cancel func (kills the process) and a channel that receives the
-// exit code when the process completes.
-func RunBg(merged, cmd, workdir string, timeoutS int, onLine func(string)) (cancel func(), exitCh <-chan int) {
-	if timeoutS <= 0 {
-		timeoutS = 7200
-	}
-
-	args := []string{
-		"sq-exec",
-		merged,
-		cmd,
-		workdir,
-		fmt.Sprintf("%d", timeoutS),
-		"1", // net=1: enable slirp4netns so sandbox can reach MITM proxy
-	}
-
-	c := exec.Command(args[0], args[1:]...)
-	ch := make(chan int, 1)
-
-	stdoutPipe, err := c.StdoutPipe()
-	if err != nil {
-		go func() { ch <- 126 }()
-		return func() {}, ch
-	}
-	stderrPipe, err := c.StderrPipe()
-	if err != nil {
-		go func() { ch <- 126 }()
-		return func() {}, ch
-	}
-
-	if err := c.Start(); err != nil {
-		stdoutPipe.Close()
-		stderrPipe.Close()
-		onLine("spawn error: " + err.Error())
-		go func() { ch <- 126 }()
-		return func() {}, ch
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	scanPipe := func(r io.Reader) {
-		defer wg.Done()
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			onLine(sc.Text())
-		}
-	}
-	go scanPipe(stdoutPipe)
-	go scanPipe(stderrPipe)
-
-	// Safety-net kill after timeout + grace.
-	timer := time.AfterFunc(time.Duration(timeoutS+10)*time.Second, func() {
-		_ = c.Process.Kill()
-	})
-
-	go func() {
-		wg.Wait()
-		exitErr := c.Wait()
-		timer.Stop()
-		exitCode := 0
-		if exitErr != nil {
-			if ee, ok := exitErr.(*exec.ExitError); ok {
-				exitCode = ee.ExitCode()
-			} else {
-				exitCode = 1
-			}
-		}
-		ch <- exitCode
-	}()
-
-	return func() { _ = c.Process.Kill() }, ch
 }
 
 // MountLayer mounts a squashfs file at mountPoint using sq-mount-layer.

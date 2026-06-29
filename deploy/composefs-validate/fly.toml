@@ -1,0 +1,7 @@
+# TEMPORARY — throwaway app to validate the composefs LayerStore. Destroy after.
+app = 'sq-cfs-validate-tmp'
+primary_region = 'iad'
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = 2048

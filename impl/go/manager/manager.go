@@ -2,8 +2,11 @@ package manager
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,25 +15,26 @@ import (
 	"sync"
 	"time"
 
-	sqexec "squashd/exec"
 	"squashd/config"
 	"squashd/store"
 )
 
 // SandboxInfo is the JSON-serializable view of a sandbox returned by the API.
 type SandboxInfo struct {
-	ID           string   `json:"id"`
-	State        string   `json:"state"`
-	Owner        string   `json:"owner"`
-	Task         string   `json:"task,omitempty"`
-	Layers       []string `json:"layers"`
-	Backend      string   `json:"backend"`
-	CreatedAt    string   `json:"created"`
-	LastActiveAt string   `json:"last_active"`
-	CPULimit     float64  `json:"cpu"`
-	MemoryMB     int      `json:"memory_mb"`
-	MaxLifetimeS int      `json:"max_lifetime_s"`
-	AllowNet     []string `json:"allow_net,omitempty"`
+	ID           string    `json:"id"`
+	State        string    `json:"state"`
+	Owner        string    `json:"owner"`
+	Task         string    `json:"task,omitempty"`
+	Layers       []string  `json:"layers"`
+	Backend      string    `json:"backend"`
+	CreatedAt    string    `json:"created"`
+	LastActiveAt string    `json:"last_active"`
+	CPULimit     float64   `json:"cpu"`
+	MemoryMB     int       `json:"memory_mb"`
+	MaxLifetimeS int       `json:"max_lifetime_s"`
+	AllowNet     []string  `json:"allow_net,omitempty"`
+	Features     []string  `json:"features,omitempty"`
+	GUI          *GUIState `json:"gui,omitempty"`
 }
 
 // CreateOpts holds the parameters for creating a new sandbox.
@@ -42,6 +46,40 @@ type CreateOpts struct {
 	MemoryMB     int
 	MaxLifetimeS int
 	AllowNet     []string
+	Features     []string
+	GUI          *GUIOpts
+}
+
+// GUIOpts is the user-supplied GUI configuration (from the create body or
+// gui/enable endpoint). All fields are optional; missing values use defaults.
+type GUIOpts struct {
+	Desktop     string `json:"desktop,omitempty"`      // "xfce" (default), "minimal"
+	Resolution  string `json:"resolution,omitempty"`   // "1920x1080" (default)
+	VNCPassword string `json:"vnc_password,omitempty"` // unset = no password
+	Module      string `json:"module,omitempty"`       // override default GUI layer
+}
+
+// GUIState reflects the runtime state of GUI mode for a sandbox.
+type GUIState struct {
+	Enabled    bool   `json:"enabled"`
+	Desktop    string `json:"desktop,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+	Module     string `json:"module,omitempty"`
+	JobID      int    `json:"job_id,omitempty"`     // background sq-gui-start job
+	NoVNCPort  int    `json:"novnc_port,omitempty"` // typically 6080 (in-sandbox netns)
+	VNCPort    int    `json:"vnc_port,omitempty"`   // typically 5900
+	StartedAt  string `json:"started_at,omitempty"`
+
+	// SessionToken authorises requests to the /novnc/ reverse-proxy. Distinct
+	// from the daemon-wide auth token: leaking the noVNC URL leaks access to
+	// only this sandbox's desktop, not the whole API.
+	SessionToken string `json:"session_token,omitempty"`
+
+	// BwrapPID is the host PID of the bwrap child that owns the sandbox netns.
+	// The /novnc/ proxy uses /proc/<pid>/ns/net + setns(2) to dial the
+	// in-sandbox websockify on 127.0.0.1:6080. Zero until the GUI job has
+	// started and SQEXEC_PIDFILE has been read.
+	BwrapPID int `json:"bwrap_pid,omitempty"`
 }
 
 // ExecOpts holds the parameters for executing a command in a sandbox.
@@ -52,16 +90,16 @@ type ExecOpts struct {
 
 // ExecResult is the stored record of a command execution.
 type ExecResult struct {
-	Seq       int    `json:"seq"`
-	Cmd       string `json:"cmd"`
-	WorkDir   string `json:"workdir"`
-	ExitCode  int    `json:"exit_code"`
-	Started   int64  `json:"started"`   // Unix timestamp (matches Janet/shell format)
-	Finished  int64  `json:"finished"`  // Unix timestamp
-	DurMS     int64  `json:"duration_ms"`
-	Stdout    string `json:"stdout"`
-	Stderr    string `json:"stderr"`
-	TimedOut  bool   `json:"timed_out"`
+	Seq      int    `json:"seq"`
+	Cmd      string `json:"cmd"`
+	WorkDir  string `json:"workdir"`
+	ExitCode int    `json:"exit_code"`
+	Started  int64  `json:"started"`  // Unix timestamp (matches Janet/shell format)
+	Finished int64  `json:"finished"` // Unix timestamp
+	DurMS    int64  `json:"duration_ms"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	TimedOut bool   `json:"timed_out"`
 }
 
 // SnapshotResult is returned after a snapshot operation.
@@ -75,6 +113,15 @@ type Manager struct {
 	mu        sync.Mutex
 	sandboxes map[string]*Sandbox // nil entry = slot reserved (creating)
 	cfg       *config.Config
+
+	// objWriteMu serializes shared-composefs-objects-store WRITERS against the
+	// GC mark+sweep. Snapshot (the only runtime path that writes new objects, via
+	// mkcomposefs) holds it for READ; GCObjects holds it for WRITE across its
+	// entire mark+sweep so the point-in-time live set can't be invalidated by a
+	// concurrent writer (an object written mid-sweep but whose owning image isn't
+	// yet persisted would otherwise look dead and be deleted). Many snapshots may
+	// run concurrently; GC excludes them all.
+	objWriteMu sync.RWMutex
 
 	jobMu  sync.Mutex
 	jobSeq int
@@ -258,7 +305,7 @@ func (m *Manager) Exec(id, cmd string, opts ExecOpts) (ExecResult, error) {
 	seq := s.nextSeq()
 	s.updateLastActive()
 
-	res, err := sqexec.Run(s.mergedDir(), cmd, opts.WorkDir, opts.TimeoutS)
+	res, err := m.backendFor(s).Run(s, cmd, opts.WorkDir, opts.TimeoutS)
 	if err != nil {
 		return ExecResult{}, fmt.Errorf("exec: %w", err)
 	}
@@ -299,6 +346,8 @@ func (m *Manager) Activate(id, moduleName string) (SandboxInfo, error) {
 		return SandboxInfo{}, fmt.Errorf("sandbox not found: %s", id)
 	}
 
+	ls := m.layerStoreFor(s)
+
 	modPath := filepath.Join(m.cfg.ModulesDir(), moduleName+".squashfs")
 	if _, err := os.Stat(modPath); os.IsNotExist(err) {
 		// Try S3 pull
@@ -314,22 +363,22 @@ func (m *Manager) Activate(id, moduleName string) (SandboxInfo, error) {
 	if err := os.MkdirAll(mp, 0755); err != nil {
 		return SandboxInfo{}, fmt.Errorf("mkdir %s: %w", mp, err)
 	}
-	if err := sqexec.MountLayer(modPath, mp); err != nil {
+	if err := ls.MountLayer(modPath, mp); err != nil {
 		os.Remove(mp)
 		return SandboxInfo{}, err
 	}
 
 	// Remount overlay with the new layer.
-	lower, err := buildLowerDirs(s.imagesDir())
+	lower, err := ls.BuildLowerDirs(s.imagesDir())
 	if err != nil {
-		_ = sqexec.UnmountLayer(mp)
+		_ = ls.UnmountLayer(mp)
 		return SandboxInfo{}, err
 	}
-	if err := sqexec.UnmountOverlay(s.mergedDir()); err != nil {
-		_ = sqexec.UnmountLayer(mp)
+	if err := ls.UnmountOverlay(s.mergedDir()); err != nil {
+		_ = ls.UnmountLayer(mp)
 		return SandboxInfo{}, err
 	}
-	if err := sqexec.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
+	if err := ls.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
 		return SandboxInfo{}, err
 	}
 
@@ -361,6 +410,27 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 		return SnapshotResult{}, fmt.Errorf("label: alphanumeric/dash/underscore/dot only")
 	}
 
+	// gvisor backend: capture PROCESS MEMORY via runsc checkpoint (the durable
+	// resume path). Note: this captures RAM; the writable filesystem upper is a
+	// separate concern. For full FS+RAM coherence the caller should pair this
+	// with an upper/data snapshot taken at the same instant (TODO: single
+	// generation barrier — see tier2b design doc).
+	if s.Backend == "gvisor" {
+		imgDir := filepath.Join(s.checkpointsDir(), label)
+		if _, err := os.Stat(imgDir); err == nil {
+			return SnapshotResult{}, fmt.Errorf("checkpoint exists: %s", label)
+		}
+		if err := os.MkdirAll(filepath.Dir(imgDir), 0755); err != nil {
+			return SnapshotResult{}, fmt.Errorf("mkdir checkpoints: %w", err)
+		}
+		if err := m.backendFor(s).Checkpoint(s, imgDir); err != nil {
+			return SnapshotResult{}, err
+		}
+		// TODO: tar(imgDir) + s3PushBg for off-host restore (cross-host needs a
+		// pinned CPU template; see design doc).
+		return SnapshotResult{Snapshot: label, Size: dirSize(imgDir)}, nil
+	}
+
 	// Irmin backend: delegate to store sidecar.
 	if m.cfg.SnapshotBackend == "irmin" {
 		c := store.New(m.cfg.StoreSockPath)
@@ -378,6 +448,13 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 	}
 	snapFile := filepath.Join(snapDir, label+".squashfs")
 
+	// Participate in the GC writer barrier (read side) across the whole region
+	// that writes new objects into the shared composefs store. While held, GC
+	// cannot run its mark+sweep, so an object written here (and its not-yet-
+	// persisted snapshot image) can never be observed as "dead" and swept.
+	m.objWriteMu.RLock()
+	defer m.objWriteMu.RUnlock()
+
 	// Hold per-sandbox lock around the existence check + mksquashfs to prevent
 	// two concurrent snapshot requests with the same label from racing.
 	s.mu.Lock()
@@ -386,11 +463,9 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 		return SnapshotResult{}, fmt.Errorf("snapshot exists: %s", label)
 	}
 
-	args := []string{"mksquashfs", s.upperDataDir(), snapFile,
-		"-comp", "gzip", "-b", "256K", "-noappend", "-quiet"}
-	if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+	if err := m.layerStoreFor(s).Snapshot(s.upperDataDir(), snapFile); err != nil {
 		s.mu.Unlock()
-		return SnapshotResult{}, fmt.Errorf("mksquashfs: %w: %s", err, strings.TrimSpace(string(out)))
+		return SnapshotResult{}, err
 	}
 	s.mu.Unlock()
 
@@ -419,6 +494,18 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 		return SandboxInfo{}, fmt.Errorf("label: alphanumeric/dash/underscore/dot only")
 	}
 
+	// gvisor backend: restore PROCESS MEMORY via runsc restore.
+	if s.Backend == "gvisor" {
+		imgDir := filepath.Join(s.checkpointsDir(), label)
+		if _, err := os.Stat(imgDir); err != nil {
+			return SandboxInfo{}, fmt.Errorf("checkpoint not found: %s", label)
+		}
+		if err := m.backendFor(s).Restore(s, imgDir); err != nil {
+			return SandboxInfo{}, err
+		}
+		return s.ToInfo(), nil
+	}
+
 	// Irmin backend: restore via sidecar (materialises files into upper_data).
 	if m.cfg.SnapshotBackend == "irmin" {
 		c := store.New(m.cfg.StoreSockPath)
@@ -439,10 +526,11 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 	}
 
 	// Unmount overlay, clear upper, mount snapshot, remount overlay.
+	ls := m.layerStoreFor(s)
 	snapMP := filepath.Join(s.imagesDir(), "_snapshot")
 
 	// Unmount overlay.
-	_ = sqexec.UnmountOverlay(s.mergedDir())
+	_ = ls.UnmountOverlay(s.mergedDir())
 
 	// Unmount previous snapshot if any.
 	s.mu.Lock()
@@ -450,7 +538,7 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 	s.snapshotMounted = false
 	s.mu.Unlock()
 	if wasMounted {
-		_ = sqexec.UnmountLayer(snapMP)
+		_ = ls.UnmountLayer(snapMP)
 	}
 
 	// Clear upper layer.
@@ -461,7 +549,7 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 
 	// Mount the snapshot as the top read-only layer.
 	_ = os.MkdirAll(snapMP, 0755)
-	if err := sqexec.MountLayer(snapFile, snapMP); err != nil {
+	if err := ls.MountLayer(snapFile, snapMP); err != nil {
 		return SandboxInfo{}, fmt.Errorf("mount snapshot: %w", err)
 	}
 	s.mu.Lock()
@@ -469,16 +557,16 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 	s.mu.Unlock()
 
 	// Rebuild lower dirs with snapshot first.
-	moduleLowers, err := buildLowerDirsExcluding(s.imagesDir(), "_snapshot")
+	moduleLowers, err := ls.BuildLowerDirsExcluding(s.imagesDir(), "_snapshot")
 	if err != nil {
 		return SandboxInfo{}, err
 	}
 	lower := append([]string{snapMP}, moduleLowers...)
 
 	// Remount overlay.
-	if err := sqexec.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
+	if err := ls.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
 		// Degraded recovery: remount without snapshot so sandbox remains usable.
-		_ = sqexec.MountOverlay(moduleLowers, s.upperDataDir(), s.upperWorkDir(), s.mergedDir())
+		_ = ls.MountOverlay(moduleLowers, s.upperDataDir(), s.upperWorkDir(), s.mergedDir())
 		return SandboxInfo{}, fmt.Errorf("remount overlay: %w", err)
 	}
 
@@ -575,10 +663,10 @@ func (m *Manager) SetupWireGuard(id string, peers []map[string]any) (map[string]
 	pubKey := strings.TrimSpace(string(pubKeyBytes))
 
 	return map[string]any{
-		"status":      "ok",
-		"publicKey":   pubKey,
-		"listenPort":  51820,
-		"peersAdded":  len(peers),
+		"status":     "ok",
+		"publicKey":  pubKey,
+		"listenPort": 51820,
+		"peersAdded": len(peers),
 	}, nil
 }
 
@@ -606,6 +694,34 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		opts.Layers = []string{"000-base-alpine"}
 	}
 
+	// Merge daemon-wide default features (e.g. SQUASH_DEFAULT_FEATURES=gui) into
+	// the per-sandbox features list.
+	opts.Features = mergeFeatures(opts.Features, m.cfg.DefaultFeatures)
+	if hasFeature(opts.Features, "browser") {
+		opts.Features = mergeFeatures(opts.Features, []string{"gui"})
+	}
+
+	// If "gui" is in features, auto-append the GUI module so it mounts as part
+	// of the initial overlay (no second remount needed at startup).
+	if hasFeature(opts.Features, "gui") {
+		mod := guiModule(m.cfg, opts.GUI)
+		if !validModuleName(mod) {
+			return nil, fmt.Errorf("invalid module: %s", mod)
+		}
+		if !contains(opts.Layers, mod) {
+			opts.Layers = append(opts.Layers, mod)
+		}
+	}
+	if hasFeature(opts.Features, "browser") {
+		mod := browserModule(m.cfg)
+		if !validModuleName(mod) {
+			return nil, fmt.Errorf("invalid module: %s", mod)
+		}
+		if !contains(opts.Layers, mod) {
+			opts.Layers = append(opts.Layers, mod)
+		}
+	}
+
 	// Create directory tree.
 	for _, d := range []string{
 		filepath.Join(sdir, "images"),
@@ -627,21 +743,25 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		Task:         opts.Task,
 		Layers:       opts.Layers,
 		Backend:      m.cfg.Backend,
+		LayerStore:   m.cfg.LayerBackend,
 		CPU:          opts.CPU,
 		MemoryMB:     opts.MemoryMB,
 		MaxLifetimeS: opts.MaxLifetimeS,
 		AllowNet:     opts.AllowNet,
+		Features:     opts.Features,
 		Dir:          sdir,
 		CreatedAt:    time.Now(),
 		LastActiveAt: time.Now(),
 	}
 
+	ls := m.layerStoreFor(s)
+
 	// Track mounted layers for rollback.
 	var mountedLayers []string
 	rollback := func() {
-		_ = sqexec.UnmountOverlay(s.mergedDir())
+		_ = ls.UnmountOverlay(s.mergedDir())
 		for i := len(mountedLayers) - 1; i >= 0; i-- {
-			_ = sqexec.UnmountLayer(mountedLayers[i])
+			_ = ls.UnmountLayer(mountedLayers[i])
 		}
 	}
 
@@ -654,27 +774,32 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 				return nil, fmt.Errorf("module not found: %s", layer)
 			}
 		}
+		manifestPath := modPath + ".manifest.json"
+		if _, err := os.Stat(manifestPath); os.IsNotExist(err) && m.cfg.S3Bucket != "" {
+			_ = s3Pull(m.cfg, "modules/"+layer+".squashfs.manifest.json", manifestPath)
+		}
 		mp := filepath.Join(sdir, "images", layer+".squashfs")
 		if err := os.MkdirAll(mp, 0755); err != nil {
 			rollback()
 			return nil, fmt.Errorf("mkdir layer mp: %w", err)
 		}
-		if err := sqexec.MountLayer(modPath, mp); err != nil {
+		if err := ls.MountLayer(modPath, mp); err != nil {
 			rollback()
 			return nil, err
 		}
 		mountedLayers = append(mountedLayers, mp)
 	}
+	m.warnModuleManifestCompatibility(opts.Layers)
 
 	// Build lower dirs (highest numeric prefix = highest priority).
-	lower, err := buildLowerDirs(s.imagesDir())
+	lower, err := ls.BuildLowerDirs(s.imagesDir())
 	if err != nil {
 		rollback()
 		return nil, err
 	}
 
 	// Mount overlay.
-	if err := sqexec.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
+	if err := ls.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
 		rollback()
 		return nil, err
 	}
@@ -689,16 +814,34 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 	}
 
 	s.State = "ready"
+
+	// Auto-start GUI if requested. Failures are non-fatal — the sandbox is
+	// usable without the desktop, and /gui/enable can retry.
+	if hasFeature(opts.Features, "gui") {
+		m.mu.Lock()
+		if current, exists := m.sandboxes[id]; exists && current == nil {
+			m.sandboxes[id] = s
+		}
+		m.mu.Unlock()
+
+		s.guiMu.Lock()
+		if err := m.startGUI(s, opts.GUI); err != nil {
+			slog.Warn("gui auto-start failed", "id", id, "err", err)
+		}
+		s.guiMu.Unlock()
+	}
+
 	return s, nil
 }
 
 func (m *Manager) destroySandbox(s *Sandbox) {
 	// Unmount overlay, then each squashfs layer.
-	_ = sqexec.UnmountOverlay(s.mergedDir())
+	ls := m.layerStoreFor(s)
+	_ = ls.UnmountOverlay(s.mergedDir())
 	entries, _ := os.ReadDir(s.imagesDir())
 	for i := len(entries) - 1; i >= 0; i-- {
 		mp := filepath.Join(s.imagesDir(), entries[i].Name())
-		_ = sqexec.UnmountLayer(mp)
+		_ = ls.UnmountLayer(mp)
 	}
 	// Remove the sandbox directory.
 	_ = os.RemoveAll(s.Dir)
@@ -814,6 +957,125 @@ func s3Pull(cfg *config.Config, s3Key, localPath string) error {
 		return fmt.Errorf("sq-s3 pull %s: %w: %s", s3Key, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+type moduleManifest struct {
+	Name           string   `json:"name"`
+	Version        string   `json:"version,omitempty"`
+	BuiltAgainst   []string `json:"built_against,omitempty"`
+	SquashFSSHA256 string   `json:"squashfs_sha256,omitempty"`
+	// ComposefsDigest is the fs-verity digest of the composefs (EROFS) layer
+	// image, populated only for composefs-built modules. Non-breaking: omitempty
+	// keeps old manifests/JSON valid, and json.Unmarshal ignores it when absent.
+	ComposefsDigest string `json:"composefs_digest,omitempty"`
+}
+
+func (m *Manager) warnModuleManifestCompatibility(layers []string) {
+	active := make(map[string]bool, len(layers))
+	refs := make(map[string]string, len(layers))
+	manifests := make(map[string]moduleManifest, len(layers))
+
+	for _, layer := range layers {
+		active[layer] = true
+		modPath := filepath.Join(m.cfg.ModulesDir(), layer+".squashfs")
+		ref := computedModuleRef(m.cfg.ModulesDir(), layer, modPath)
+		manifest, ok := readModuleManifest(modPath + ".manifest.json")
+		if !ok {
+			slog.Info("module manifest missing; compatibility check is best-effort", "module", layer)
+			refs[layer] = ref
+			continue
+		}
+		if manifest.Name == "" {
+			manifest.Name = layer
+		}
+		if manifest.Name != layer {
+			slog.Warn("module manifest name mismatch", "module", layer, "manifest_name", manifest.Name)
+		}
+		refs[layer] = moduleManifestRef(layer, manifest, ref)
+		manifests[layer] = manifest
+	}
+
+	for layer, manifest := range manifests {
+		for _, expected := range manifest.BuiltAgainst {
+			dep := moduleRefName(expected)
+			if dep == "" {
+				continue
+			}
+			current, ok := refs[dep]
+			if !ok {
+				if active[dep] {
+					slog.Info("module dependency manifest missing; compatibility check is best-effort", "module", layer, "dependency", dep)
+				} else {
+					slog.Warn("module built against dependency that is not active", "module", layer, "expected", expected)
+				}
+				continue
+			}
+			if expected != current {
+				slog.Warn("module compatibility mismatch", "module", layer, "expected", expected, "current", current)
+			}
+		}
+	}
+}
+
+func readModuleManifest(path string) (moduleManifest, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return moduleManifest{}, false
+	}
+	var manifest moduleManifest
+	if err := json.Unmarshal(b, &manifest); err != nil {
+		slog.Warn("module manifest unreadable", "path", path, "err", err)
+		return moduleManifest{}, false
+	}
+	return manifest, true
+}
+
+func moduleManifestRef(layer string, manifest moduleManifest, fallback string) string {
+	if manifest.Version != "" {
+		return layer + "@v" + manifest.Version
+	}
+	if manifest.SquashFSSHA256 != "" {
+		return layer + "@sha256:" + manifest.SquashFSSHA256
+	}
+	return fallback
+}
+
+func computedModuleRef(modulesDir, layer, modPath string) string {
+	if layer == "000-base-alpine" {
+		if b, err := os.ReadFile(filepath.Join(modulesDir, "000-base-alpine.version")); err == nil {
+			v := strings.TrimSpace(string(b))
+			if v != "" {
+				return layer + "@v" + v
+			}
+		}
+	}
+	if sha, err := fileSHA256(modPath); err == nil && sha != "" {
+		return layer + "@sha256:" + sha
+	}
+	return layer + "@unknown"
+}
+
+func moduleRefName(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	if i := strings.IndexByte(ref, '@'); i >= 0 {
+		return ref[:i]
+	}
+	return ref
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // injectSecrets writes placeholder env vars to the sandbox upper layer.

@@ -59,8 +59,24 @@ case "${1:-help}" in
         ;;
     restore)   _curl POST "sandboxes/$2/restore" "$(jq -n --arg l "$3" '{label:$l}')" | jq . ;;
     logs)      _curl GET "sandboxes/$2/logs" | jq . ;;
+    browser-open)
+        [ $# -lt 3 ] && { echo "usage: $0 browser-open <id> <url>" >&2; exit 1; }
+        _curl POST "sandboxes/$2/gui/browser/open" "$(jq -n --arg url "$3" '{url:$url}')" | jq .
+        ;;
     destroy)   _curl DELETE "sandboxes/$2" && echo "destroyed: $2" ;;
     modules)   _curl GET modules | jq . ;;
+    gc)
+        # gc [--dry-run] [--s3]   sweep unreferenced composefs objects
+        dry=false; s3=false
+        shift
+        for arg in "$@"; do
+            case "$arg" in
+                --dry-run|-n) dry=true ;;
+                --s3) s3=true ;;
+            esac
+        done
+        _curl POST gc "$(jq -n --argjson d "$dry" --argjson s "$s3" '{dry_run:$d,include_s3:$s}')" | jq .
+        ;;
     health)    _curl GET ../health | jq . ;;
     push)
         [ -z "${SQUASH_S3_BUCKET:-}" ] && { echo "SQUASH_S3_BUCKET not set" >&2; exit 1; }
@@ -170,8 +186,10 @@ usage: sq-ctl <command> [args]
   snapshot <id> [label] [--local]         checkpoint (--local: btrfs-only fast snapshot)
   restore  <id> <label>                   restore checkpoint
   logs     <id>                           execution history
+  browser-open <id> <url>                 open URL in GUI browser
   destroy  <id>                           remove sandbox
   modules                                 available modules
+  gc       [--dry-run] [--s3]             sweep unreferenced composefs objects
   health                                  status
 
 storage:
@@ -187,6 +205,7 @@ wireguard:
 examples:
   sq-ctl create dev alice 000-base-alpine,100-python312 "dev env"
   sq-ctl exec dev "python3 --version"
+  sq-ctl browser-open dev https://example.com
   sq-ctl snapshot dev clean-state
   sq-ctl snapshot dev fast-snap --local     # instant btrfs snapshot
   sq-ctl sync --background                  # drain sync queue

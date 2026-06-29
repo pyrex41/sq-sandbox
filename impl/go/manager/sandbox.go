@@ -13,7 +13,8 @@ import (
 
 // Sandbox represents a running sandbox instance.
 type Sandbox struct {
-	mu sync.Mutex // protects per-sandbox mutable state (LastActiveAt, ExecCount)
+	mu    sync.Mutex // protects per-sandbox mutable state (LastActiveAt, ExecCount)
+	guiMu sync.Mutex // serializes GUI enable/disable lifecycle operations
 
 	ID           string
 	State        string // "creating", "ready", "destroying", "destroyed"
@@ -21,15 +22,18 @@ type Sandbox struct {
 	Task         string
 	Layers       []string
 	Backend      string // "chroot", "firecracker", "gvisor"
+	LayerStore   string // "squashfs" (RO-layer assembly axis; default "squashfs")
 	CPU          float64
 	MemoryMB     int
 	MaxLifetimeS int
 	AllowNet     []string
+	Features     []string
+	GUI          *GUIState
 	CreatedAt    time.Time
 	LastActiveAt time.Time
 	Dir          string // abs path to sandbox directory
 	ExecCount    int
-	CID          int    // Firecracker vsock CID (0 if unused)
+	CID          int // Firecracker vsock CID (0 if unused)
 
 	// snapshotMounted tracks whether a snapshot squashfs is currently
 	// loop-mounted at images/_snapshot (chroot backend only).
@@ -40,6 +44,12 @@ type Sandbox struct {
 func (s *Sandbox) ToInfo() SandboxInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var gui *GUIState
+	if s.GUI != nil {
+		copy := *s.GUI
+		gui = &copy
+	}
+	features := append([]string(nil), s.Features...)
 	return SandboxInfo{
 		ID:           s.ID,
 		State:        s.State,
@@ -53,6 +63,8 @@ func (s *Sandbox) ToInfo() SandboxInfo {
 		MemoryMB:     s.MemoryMB,
 		MaxLifetimeS: s.MaxLifetimeS,
 		AllowNet:     s.AllowNet,
+		Features:     features,
+		GUI:          gui,
 	}
 }
 
@@ -70,6 +82,12 @@ func (s *Sandbox) imagesDir() string { return filepath.Join(s.Dir, "images") }
 
 // snapshotsDir returns the directory where squashfs snapshots are stored.
 func (s *Sandbox) snapshotsDir() string { return filepath.Join(s.Dir, "snapshots") }
+
+// gvisorRoot returns the per-sandbox runsc state dir (passed as `runsc --root`).
+func (s *Sandbox) gvisorRoot() string { return filepath.Join(s.Dir, "gvisor") }
+
+// checkpointsDir returns the directory where gvisor memory checkpoints are kept.
+func (s *Sandbox) checkpointsDir() string { return filepath.Join(s.Dir, "checkpoints") }
 
 // metaDir returns the metadata directory.
 func (s *Sandbox) metaDir() string { return filepath.Join(s.Dir, ".meta") }
@@ -92,6 +110,7 @@ func writeMeta(sdir string, s *Sandbox) error {
 		"memory_mb":      strconv.Itoa(s.MemoryMB),
 		"max_lifetime_s": strconv.Itoa(s.MaxLifetimeS),
 		"backend":        s.Backend,
+		"layer_store":    s.LayerStore,
 	}
 	for name, val := range writes {
 		if err := os.WriteFile(filepath.Join(m, name), []byte(val), 0644); err != nil {
@@ -104,6 +123,24 @@ func writeMeta(sdir string, s *Sandbox) error {
 		if err := os.WriteFile(filepath.Join(m, "allow_net"), b, 0644); err != nil {
 			return fmt.Errorf("write meta allow_net: %w", err)
 		}
+	}
+	// features as JSON array
+	if len(s.Features) > 0 {
+		b, _ := json.Marshal(s.Features)
+		if err := os.WriteFile(filepath.Join(m, "features"), b, 0644); err != nil {
+			return fmt.Errorf("write meta features: %w", err)
+		}
+	} else {
+		_ = os.Remove(filepath.Join(m, "features"))
+	}
+	// gui state as JSON object
+	if s.GUI != nil {
+		b, _ := json.Marshal(s.GUI)
+		if err := os.WriteFile(filepath.Join(m, "gui"), b, 0644); err != nil {
+			return fmt.Errorf("write meta gui: %w", err)
+		}
+	} else {
+		_ = os.Remove(filepath.Join(m, "gui"))
 	}
 	return nil
 }
@@ -124,10 +161,14 @@ func readMeta(id, sdir string) (*Sandbox, error) {
 		Dir:     sdir,
 		Owner:   readFile("owner"),
 		Task:    readFile("task"),
-		Backend: readFile("backend"),
+		Backend:    readFile("backend"),
+		LayerStore: readFile("layer_store"),
 	}
 	if s.Backend == "" {
 		s.Backend = "chroot"
+	}
+	if s.LayerStore == "" {
+		s.LayerStore = "squashfs"
 	}
 
 	// Layers: newline-separated
@@ -178,6 +219,19 @@ func readMeta(id, sdir string) (*Sandbox, error) {
 	// allow_net: JSON array
 	if b, err := os.ReadFile(filepath.Join(m, "allow_net")); err == nil {
 		json.Unmarshal(b, &s.AllowNet)
+	}
+
+	// features: JSON array
+	if b, err := os.ReadFile(filepath.Join(m, "features")); err == nil {
+		json.Unmarshal(b, &s.Features)
+	}
+
+	// gui: JSON object
+	if b, err := os.ReadFile(filepath.Join(m, "gui")); err == nil {
+		gs := &GUIState{}
+		if json.Unmarshal(b, gs) == nil {
+			s.GUI = gs
+		}
 	}
 
 	// ExecCount: count log files

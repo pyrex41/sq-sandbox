@@ -15,7 +15,6 @@ import (
 	"squashd/manager"
 )
 
-
 // Handler holds the API dependencies.
 type Handler struct {
 	cfg *config.Config
@@ -34,6 +33,9 @@ func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
 
 	// Modules
 	mux.HandleFunc("GET /cgi-bin/api/modules", h.handleListModules)
+
+	// Objects-store garbage collection (composefs layer store)
+	mux.HandleFunc("POST /cgi-bin/api/gc", h.handleGC)
 
 	// Sandboxes collection
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes", h.handleListSandboxes)
@@ -57,6 +59,20 @@ func NewHandler(cfg *config.Config, mgr *manager.Manager) http.Handler {
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/restore", h.handleRestore)
 	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/logs", h.handleLogs)
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/wg/peers", h.handleWGPeers)
+
+	// GUI mode — native desktop toggle (noVNC + websockify + Xvfb)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/enable", h.handleGUIEnable)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/disable", h.handleGUIDisable)
+	mux.HandleFunc("GET /cgi-bin/api/sandboxes/{id}/gui/status", h.handleGUIStatus)
+	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/gui/browser/open", h.handleGUIBrowserOpen)
+
+	// /novnc/ reverse-proxy. Authenticated by the per-sandbox session token
+	// (NOT the daemon-wide auth token), so we mount it on the proxy directly.
+	// Both GET and CONNECT-style upgrades land here; net/http's mux pattern
+	// without an explicit method matches all verbs.
+	gp := newGUIProxy(h)
+	mux.Handle("/cgi-bin/api/sandboxes/{id}/novnc/{path...}", gp)
+	mux.Handle("/cgi-bin/api/sandboxes/{id}/novnc", gp)
 
 	// Task runner — autonomous agent execution
 	mux.HandleFunc("POST /cgi-bin/api/sandboxes/{id}/task", h.handleStartTask)
@@ -121,6 +137,33 @@ func (h *Handler) handleListModules(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, resp{Modules: mods})
 }
 
+// handleGC runs a conservative mark-and-sweep over the shared composefs objects
+// store. Body (all optional): {"dry_run":bool,"include_s3":bool,"assume_single_host":bool}.
+// assume_single_host is REQUIRED to enable include_s3 (the live set is local-only).
+func (h *Handler) handleGC(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	opts := manager.GCOptions{}
+	if body != nil {
+		if v, ok := body["dry_run"].(bool); ok {
+			opts.DryRun = v
+		}
+		if v, ok := body["include_s3"].(bool); ok {
+			opts.IncludeS3 = v
+		}
+		if v, ok := body["assume_single_host"].(bool); ok {
+			opts.AssumeSingleHost = v
+		}
+	}
+	res, err := h.mgr.GCObjects(opts)
+	if err != nil {
+		// Transitional-sandbox refusal is the expected retryable condition.
+		jsonError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	jsonOK(w, res)
+}
+
 func listModules(dir string) ([]string, error) {
 	var names []string
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -168,11 +211,11 @@ func (h *Handler) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := manager.CreateOpts{
-		Owner:  stringOr(body["owner"], "anon"),
-		Task:   stringOr(body["task"], ""),
-		Layers: layers,
-		CPU:    floatOr(body["cpu"], 2),
-		MemoryMB: intOr(body["memory_mb"], 1024),
+		Owner:        stringOr(body["owner"], "anon"),
+		Task:         stringOr(body["task"], ""),
+		Layers:       layers,
+		CPU:          floatOr(body["cpu"], 2),
+		MemoryMB:     intOr(body["memory_mb"], 1024),
 		MaxLifetimeS: intOr(body["max_lifetime_s"], 0),
 	}
 	if allow, ok := body["allow_net"].([]any); ok {
@@ -182,6 +225,26 @@ func (h *Handler) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	features, fok := parseFeatures(body["features"])
+	if !fok {
+		jsonError(w, "features must be an array of strings", http.StatusBadRequest)
+		return
+	}
+	for _, f := range features {
+		if !validFeature(f) {
+			jsonError(w, "invalid feature: "+f, http.StatusBadRequest)
+			return
+		}
+	}
+	opts.Features = features
+
+	gui, gerr := parseGUIOpts(body["gui"])
+	if gerr != nil {
+		jsonError(w, "invalid gui: "+gerr.Error(), http.StatusBadRequest)
+		return
+	}
+	opts.GUI = gui
 
 	info, err := h.mgr.Create(id, opts)
 	if err != nil {
@@ -681,6 +744,78 @@ func clampTimeout(v int, min, max int) int {
 		return max
 	}
 	return v
+}
+
+// parseFeatures accepts a JSON array of strings or a comma-separated string.
+// Returns (nil, true) when the field is missing.
+func parseFeatures(raw any) ([]string, bool) {
+	switch v := raw.(type) {
+	case nil:
+		return nil, true
+	case string:
+		if v == "" {
+			return nil, true
+		}
+		out := make([]string, 0, 4)
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out, true
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// validFeature constrains feature names to short alphanumeric tokens.
+func validFeature(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// parseGUIOpts pulls the optional "gui" object out of a create-body map.
+func parseGUIOpts(raw any) (*manager.GUIOpts, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	g := &manager.GUIOpts{}
+	if v, ok := m["desktop"].(string); ok {
+		g.Desktop = strings.TrimSpace(v)
+	}
+	if v, ok := m["resolution"].(string); ok {
+		g.Resolution = strings.TrimSpace(v)
+	}
+	if v, ok := m["vnc_password"].(string); ok {
+		g.VNCPassword = v
+	}
+	if v, ok := m["module"].(string); ok {
+		g.Module = strings.TrimSpace(v)
+	}
+	return g, nil
 }
 
 // parseLayers accepts either a comma-separated string or a JSON array

@@ -117,8 +117,23 @@ func TestComposefsMountRoundTripPrivileged(t *testing.T) {
 
 	// Assemble the overlay: the layer mountpoint as a normal lower, the objects
 	// store appended as a data-only ('::') lower, redirect_dir/metacopy on.
-	upper := filepath.Join(dataDir, "upper")
-	work := filepath.Join(dataDir, "work")
+	//
+	// The upperdir/workdir MUST live on a filesystem overlayfs accepts as an upper
+	// (ext4/xfs/tmpfs/btrfs) — NOT on an overlayfs itself. On a container rootfs
+	// that is already overlayfs (Docker, Fly), t.TempDir() would put the upper on
+	// overlayfs and the mount fails with "not supported as upperdir". The real
+	// daemon sidesteps this via SQUASH_UPPER_BACKEND (tmpfs default); we mirror
+	// that here by mounting a dedicated tmpfs for the upper+work.
+	upperBase := filepath.Join(dataDir, "upperfs")
+	if err := os.MkdirAll(upperBase, 0755); err != nil {
+		t.Fatalf("mkdir upperfs: %v", err)
+	}
+	if out, err := exec.Command("mount", "-t", "tmpfs", "tmpfs", upperBase).CombinedOutput(); err != nil {
+		t.Skipf("cannot mount tmpfs for overlay upper (need it on a non-overlayfs): %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	t.Cleanup(func() { _ = exec.Command("umount", "-l", upperBase).Run() })
+	upper := filepath.Join(upperBase, "upper")
+	work := filepath.Join(upperBase, "work")
 	merged := filepath.Join(dataDir, "merged")
 	for _, d := range []string{upper, work, merged} {
 		if err := os.MkdirAll(d, 0755); err != nil {

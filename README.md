@@ -106,12 +106,23 @@ the default and the fallback — composefs is strictly opt-in.
 
 ### Why composefs
 
-Layers share file *data* through a single content-addressed objects store, so
-identical content (across modules and sandboxes) is stored once. Each `.cfs`
-image holds only metadata + redirect xattrs pointing into that store. On a
-file-backed-EROFS kernel this mounts **without loop devices**, and adding a layer
-(activate) or restoring a snapshot remounts the overlay without repacking the
-rest of the stack.
+The real win is a **kernel-native read path**: layers mount as kernel EROFS
+instead of FUSE, avoiding squashfuse's per-I/O context-switch cost and the FUSE
+mount-visibility/propagation bugs seen in containerized (sidecar) deployments.
+Layers also share file *data* through a single content-addressed objects store,
+so identical content (across modules and sandboxes) is stored once; each `.cfs`
+image holds only metadata + redirect xattrs pointing into that store. Adding a
+layer (activate) or restoring a snapshot remounts the overlay without repacking
+the rest of the stack.
+
+> **Loop devices — not loop-free today.** The backend mounts each layer with
+> `mount -t erofs <file>`, which util-linux loop-wraps a regular-file source, so
+> you get **one loop device per layer** — *verified on Fly's 6.12.91-fly kernel,
+> which has `CONFIG_EROFS_FS_BACKED_BY_FILE=y` yet still loop-backs the plain
+> mount*. This is comparable to (not better than) squashfuse on mount/loop count;
+> the benefit is the kernel read path, not loop reduction. Genuinely loop-free
+> file-backed EROFS needs the fd-based mount API (`fsopen`/`fsconfig`/`fsmount`
+> with the image fd) — a tracked follow-up, not yet wired into `MountLayer`.
 
 ### Kernel requirements
 
@@ -119,13 +130,17 @@ composefs is **probe-gated**: every mount/pack first verifies support and, on an
 missing prerequisite, returns a clear error telling you to set
 `SQUASH_LAYER_BACKEND=squashfs`. It never silently produces a broken stack.
 
-- **EROFS** filesystem (`/proc/filesystems`); file-backed/loop-free mounts need
-  kernel **≥ 6.12** (e.g. the Fly guest kernel). Older kernels fall back to a
-  loop device per image, reintroducing the scarcity squashfuse avoids.
-- **overlayfs** with `redirect_dir=on` and `metacopy=on`
-  (`/sys/module/overlay/parameters/*`).
+- **EROFS** filesystem (`/proc/filesystems`). Loop-backed EROFS works on any
+  EROFS-capable kernel; loop-free file-backed EROFS needs `CONFIG_EROFS_FS_BACKED_BY_FILE`
+  (kernel **≥ 6.12**) *and* the fd-based mount API (see note above).
+- **overlayfs** with `redirect_dir` and `metacopy` (probed by the *presence* of
+  `/sys/module/overlay/parameters/*`; the per-mount `redirect_dir=on,metacopy=on`
+  options override the module default of `N`).
 - Data-only (`::`) lowerdirs require kernel **≥ 6.7**.
 - `mkcomposefs` / `composefs-info` binaries on the build/daemon host.
+- Validated end-to-end on Fly (`6.12.91-fly`): build → EROFS layer mount →
+  data-only-lower overlay → write-through → snapshot all pass. See
+  `test/composefs-validate.sh` and `test/Dockerfile.composefs`.
 
 ### fs-verity (`SQUASH_COMPOSEFS_VERITY`)
 
@@ -134,7 +149,9 @@ enforcement *only* if the kernel and the objects-store filesystem actually
 support it (needs `CONFIG_FS_VERITY` + an ext4/btrfs/f2fs store with the verity
 feature, absent on stock Firecracker, Docker overlay2, and tmpfs). If
 unsupported, a warning is logged and the mount proceeds **unauthenticated**
-rather than failing. Never assume fs-verity is active.
+rather than failing. Never assume fs-verity is active. *Confirmed unavailable on
+Fly's `6.12.91-fly` kernel (`# CONFIG_FS_VERITY is not set`)* — on Fly this path
+always falls open, so verity there requires a custom kernel.
 
 ### Building composefs layers
 

@@ -23,10 +23,21 @@ import (
 // the primitive operations differ:
 //
 //   - MountLayer:  mount one EROFS image read-only at its per-layer mountpoint
-//     (`mount -t erofs -o ro`). On kernels >= 6.12 this is file-backed and needs
-//     no loop device. Because each layer is its own EROFS mount, Activate and
-//     Restore add a single layer + remount the overlay WITHOUT rebuilding or
-//     repacking the rest of the stack (see BuildLowerDirs reuse below).
+//     (`mount -t erofs -o ro`). Because each layer is its own EROFS mount,
+//     Activate and Restore add a single layer + remount the overlay WITHOUT
+//     rebuilding or repacking the rest of the stack (see BuildLowerDirs reuse
+//     below).
+//
+//     LOOP NOTE (verified on Fly kernel 6.12.91-fly): `mount -t erofs <file>`
+//     via util-linux allocates ONE loop device per layer — it is NOT loop-free,
+//     despite the kernel having CONFIG_EROFS_FS_BACKED_BY_FILE=y. Loop-free
+//     file-backed EROFS requires the fd-based mount API (fsopen/fsconfig/fsmount
+//     with the image fd), which util-linux's mount(8) does not trigger for EROFS.
+//     The win this backend actually delivers is therefore a KERNEL-NATIVE read
+//     path (no FUSE context-switch / mount-visibility bugs), not a reduction in
+//     loop/mount count vs squashfuse. Switching MountLayer to the fd-based API to
+//     reclaim the loop-free path is a tracked follow-up (the kernel supports it;
+//     the exact fsconfig parameter wiring still needs to be pinned down).
 //   - MountOverlay: the same ordered layer mountpoints become overlay lowerdirs,
 //     but a data-only ('::') lower carrying the shared objects store is appended
 //     and redirect_dir=on,metacopy=on are set so the EROFS metadata can redirect
@@ -79,7 +90,7 @@ func (c *composefsLayerStore) MountLayer(image, mountpoint string) error {
 	img := resolveComposefsImage(image)
 	// Read-only EROFS metadata mount (loop-free on file-backed EROFS, kernel >=6.12).
 	if out, err := exec.Command("mount", "-t", "erofs", "-o", "ro", img, mountpoint).CombinedOutput(); err != nil {
-		return fmt.Errorf("composefs mount erofs %s -> %s: %w: %s (kernel may lack file-backed EROFS, requires >=6.12)%s",
+		return fmt.Errorf("composefs mount erofs %s -> %s: %w: %s (kernel may lack EROFS, or loop devices are exhausted — this mount is loop-backed)%s",
 			img, mountpoint, err, strings.TrimSpace(string(out)), composefsFallbackHint)
 	}
 	return nil

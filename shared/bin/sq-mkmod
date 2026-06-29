@@ -14,6 +14,10 @@ set -eu
 
 DATA="${SQUASH_DATA:-/data}"
 MODULES="$DATA/modules"
+# Shared, content-addressed composefs objects store (only used when
+# SQUASH_LAYER_BACKEND=composefs). Mirrors the daemon's DataDir/cfs/objects.
+CFS_OBJECTS="${SQUASH_CFS_OBJECTS:-$DATA/cfs/objects}"
+LAYER_BACKEND="${SQUASH_LAYER_BACKEND:-squashfs}"
 WORK="/tmp/sq-mkmod.$$"
 API="${SQUASH_API:-http://localhost:${SQUASH_PORT:-8080}}"
 TOKEN="${SQUASH_AUTH_TOKEN:-}"
@@ -91,7 +95,7 @@ json_apk_repos_array() {
 }
 
 write_module_manifest() {
-    local dest="$1" name="$2" squashfs_sha="${3:-}"
+    local dest="$1" name="$2" squashfs_sha="${3:-}" composefs_digest="${4:-}"
     local built_at base version
     built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     base="${SQ_MODULE_BASE:-$(module_ref 000-base-alpine 2>/dev/null || true)}"
@@ -114,9 +118,49 @@ write_module_manifest() {
         printf '  "apk_added": '
         json_words_array "${SQ_MODULE_APK_ADDED:-}"
         printf ',\n'
-        printf '  "squashfs_sha256": "%s"\n' "$(json_escape "$squashfs_sha")"
+        printf '  "squashfs_sha256": "%s"' "$(json_escape "$squashfs_sha")"
+        # composefs_digest is additive/non-breaking: emitted only for composefs
+        # builds. Old readers (json.Unmarshal) ignore unknown fields.
+        if [ -n "$composefs_digest" ]; then
+            printf ',\n  "composefs_digest": "%s"\n' "$(json_escape "$composefs_digest")"
+        else
+            printf '\n'
+        fi
         printf '}\n'
     } > "$dest"
+}
+
+# build_composefs — produce a per-layer EROFS metadata image alongside the
+# default squashfs artifact, writing file DATA into the shared content-addressed
+# objects store. This is OPT-IN (SQUASH_LAYER_BACKEND=composefs); squashfs stays
+# the default + portable fallback. mkcomposefs has no compression flag — metadata
+# lives in the EROFS image, data lives reflinked/de-duplicated in CFS_OBJECTS.
+build_composefs() {
+    local src="$1" name="$2" out="$MODULES/$name.cfs"
+    if ! command -v mkcomposefs >/dev/null 2>&1; then
+        die "SQUASH_LAYER_BACKEND=composefs but mkcomposefs not found (install composefs, or unset to use squashfs)"
+    fi
+    mkdir -p "$CFS_OBJECTS" "$MODULES"
+    # --use-epoch zeroes mtimes for reproducible, content-addressable output.
+    # --print-digest writes the image AND prints its fs-verity digest on stdout.
+    local digest
+    digest="$(mkcomposefs --digest-store="$CFS_OBJECTS" --use-epoch --print-digest "$src" "$out" 2>/dev/null | tail -1 || true)"
+    [ -f "$out" ] || die "mkcomposefs failed for $name"
+    # Record composefs_digest into the .cfs manifest (cross-reference the sibling
+    # squashfs sha when present so a single name resolves either artifact).
+    write_module_manifest "$out.manifest.json" "$name" \
+        "$(sha256_file "$MODULES/$name.squashfs" 2>/dev/null || echo '')" "$digest"
+    log "built: $name.cfs (digest ${digest:-unknown})"
+    if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
+        sq-s3 push-bg "$out" "modules/$name.cfs"
+        sq-s3 push-bg "$out.manifest.json" "modules/$name.cfs.manifest.json"
+        # Push the content-addressed objects this layer references. Objects are
+        # immutable and de-duplicated, so re-pushing an existing key is a no-op.
+        find "$CFS_OBJECTS" -type f 2>/dev/null | while read -r obj; do
+            rel="${obj#"$CFS_OBJECTS"/}"
+            sq-s3 push-bg "$obj" "cfs/objects/$rel"
+        done
+    fi
 }
 
 squash_it() {
@@ -133,6 +177,12 @@ squash_it() {
     if [ -n "${SQUASH_S3_BUCKET:-}" ] && command -v sq-s3 >/dev/null 2>&1; then
         sq-s3 push-bg "$out" "modules/$name.squashfs"
         sq-s3 push-bg "$out.manifest.json" "modules/$name.squashfs.manifest.json"
+    fi
+    # Opt-in: also emit a composefs (EROFS + shared objects) layer. Note the
+    # composefs build operates on the original $src tree (preserving xattrs the
+    # squashfs build strips via -no-xattrs), which composefs requires.
+    if [ "$LAYER_BACKEND" = "composefs" ]; then
+        build_composefs "$src" "$name"
     fi
 }
 

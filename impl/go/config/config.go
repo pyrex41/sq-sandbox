@@ -27,6 +27,8 @@ type Config struct {
 	LocalCacheDir         string
 	BusSockPath           string
 	SnapshotBackend       string // "squashfs", "irmin"
+	LayerBackend          string // "squashfs", "composefs" (RO-layer assembly axis; default squashfs)
+	ComposefsVerity       bool   // opt-in fs-verity enforcement for composefs (fail-open)
 	StoreSockPath         string
 	GUIModule             string   // default GUI layer (e.g. "500-gui-base")
 	BrowserModule         string   // default browser layer (e.g. "510-browser-base")
@@ -67,7 +69,9 @@ func FromEnv() Config {
 		ProxyHTTPS:      envBool("SQUASH_PROXY_HTTPS"),
 		UpperBackend:    envOr("SQUASH_UPPER_BACKEND", "tmpfs"),
 		SnapshotBackend: envOr("SQUASH_SNAPSHOT_BACKEND", "squashfs"),
+		LayerBackend:    envOr("SQUASH_LAYER_BACKEND", "squashfs"),
 	}
+	c.ComposefsVerity = envBool("SQUASH_COMPOSEFS_VERITY")
 	c.LocalCacheDir = envOr("SQUASH_LOCAL_CACHE_DIR", filepath.Join(dataDir, "cache"))
 	c.BusSockPath = envOr("SQUASH_BUS_SOCK", filepath.Join(dataDir, ".sq-bus.sock"))
 	c.StoreSockPath = envOr("SQUASH_STORE_SOCK", filepath.Join(dataDir, ".sq-store.sock"))
@@ -122,6 +126,11 @@ func (c *Config) Validate() error {
 	case "squashfs", "irmin":
 	default:
 		return fmt.Errorf("SQUASH_SNAPSHOT_BACKEND must be squashfs or irmin, got %q", c.SnapshotBackend)
+	}
+	switch c.LayerBackend {
+	case "squashfs", "composefs":
+	default:
+		return fmt.Errorf("SQUASH_LAYER_BACKEND must be squashfs or composefs, got %q", c.LayerBackend)
 	}
 	return nil
 }

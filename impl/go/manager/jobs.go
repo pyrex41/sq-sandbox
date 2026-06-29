@@ -3,8 +3,6 @@ package manager
 import (
 	"fmt"
 	"sync"
-
-	sqexec "squashd/exec"
 )
 
 // Job tracks a background command execution within a sandbox.
@@ -160,7 +158,9 @@ func (m *Manager) execBg(sandboxID, cmd, workdir string, timeoutS int, extraEnv 
 
 	s.updateLastActive()
 
-	cancelFn, exitCh := sqexec.RunBg(s.mergedDir(), cmd, workdir, timeoutS, extraEnv, job.addLine)
+	// Route through the per-sandbox backend so a memory checkpoint (gvisor)
+	// captures the agent loop, which runs exclusively via this ExecBg path.
+	cancelFn, exitCh := m.backendFor(s).RunBg(s, cmd, workdir, timeoutS, extraEnv, job.addLine)
 
 	job.mu.Lock()
 	job.cancel = cancelFn

@@ -90,6 +90,85 @@ but isolates processes through gVisor's Sentry — a user-space kernel that
 intercepts all syscalls without requiring `/dev/kvm`. This provides stronger
 isolation than plain namespaces without the overhead of a full microVM.
 
+## composefs LayerStore (experimental)
+
+Read-only layer assembly is abstracted behind a **LayerStore** seam, orthogonal
+to the exec `SQUASH_BACKEND` axis. It controls *how* module/snapshot images are
+mounted and stacked into the overlay lowerdir — not how the payload executes.
+
+| `SQUASH_LAYER_BACKEND` | How RO layers are assembled                                  |
+|------------------------|--------------------------------------------------------------|
+| `squashfs` (default)   | One squashfs image per layer, mounted with **squashfuse** (FUSE, zero loop devices). Portable lowest-common-denominator; this is also the fallback. |
+| `composefs`            | One **EROFS** metadata image per layer stacked over a shared, content-addressed **objects store** (`$SQUASH_DATA/cfs/objects`). |
+
+Both produce an identical overlay; only the primitives differ. squashfuse remains
+the default and the fallback — composefs is strictly opt-in.
+
+### Why composefs
+
+Layers share file *data* through a single content-addressed objects store, so
+identical content (across modules and sandboxes) is stored once. Each `.cfs`
+image holds only metadata + redirect xattrs pointing into that store. On a
+file-backed-EROFS kernel this mounts **without loop devices**, and adding a layer
+(activate) or restoring a snapshot remounts the overlay without repacking the
+rest of the stack.
+
+### Kernel requirements
+
+composefs is **probe-gated**: every mount/pack first verifies support and, on any
+missing prerequisite, returns a clear error telling you to set
+`SQUASH_LAYER_BACKEND=squashfs`. It never silently produces a broken stack.
+
+- **EROFS** filesystem (`/proc/filesystems`); file-backed/loop-free mounts need
+  kernel **≥ 6.12** (e.g. the Fly guest kernel). Older kernels fall back to a
+  loop device per image, reintroducing the scarcity squashfuse avoids.
+- **overlayfs** with `redirect_dir=on` and `metacopy=on`
+  (`/sys/module/overlay/parameters/*`).
+- Data-only (`::`) lowerdirs require kernel **≥ 6.7**.
+- `mkcomposefs` / `composefs-info` binaries on the build/daemon host.
+
+### fs-verity (`SQUASH_COMPOSEFS_VERITY`)
+
+Off by default and **fail-open**. When set to `1`, mounts request verity
+enforcement *only* if the kernel and the objects-store filesystem actually
+support it (needs `CONFIG_FS_VERITY` + an ext4/btrfs/f2fs store with the verity
+feature, absent on stock Firecracker, Docker overlay2, and tmpfs). If
+unsupported, a warning is logged and the mount proceeds **unauthenticated**
+rather than failing. Never assume fs-verity is active.
+
+### Building composefs layers
+
+`sq-mkmod` keeps mksquashfs as the default and additionally emits a `.cfs` layer
+when `SQUASH_LAYER_BACKEND=composefs`:
+
+```bash
+SQUASH_LAYER_BACKEND=composefs sq-mkmod preset python3.12
+# → modules/100-python312.squashfs        (default artifact + fallback)
+# → modules/100-python312.cfs             (EROFS metadata image)
+# → cfs/objects/<digest>…                 (shared content-addressed data)
+```
+
+The module manifest gains a non-breaking `composefs_digest` field (the image's
+fs-verity digest). Old readers ignore it.
+
+### Objects-store garbage collection
+
+Because the objects store is **shared**, objects must never be deleted
+per-sandbox. Instead a conservative **mark-and-sweep** keeps every object
+referenced by any reachable `.cfs` image (all module images + all per-sandbox
+snapshots) and sweeps the rest:
+
+```bash
+sq-ctl gc --dry-run     # report what would be swept, delete nothing
+sq-ctl gc               # sweep unreferenced objects locally
+sq-ctl gc --s3          # also delete from S3 (only after a clean local sweep)
+```
+
+Safety invariants: GC refuses while any sandbox is mid-create/destroy; if any
+image's referenced set cannot be read it aborts the whole sweep (fail closed);
+and S3 deletion is gated behind a fully successful local sweep. On
+squashfs-only deployments (no objects store) `gc` is a no-op.
+
 ## API
 
 All endpoints live under `/cgi-bin/`. If `SQUASH_AUTH_TOKEN` is set, include
@@ -124,6 +203,7 @@ POST   /cgi-bin/api/sandboxes/:id/task/resume       resume turn loop
 POST   /cgi-bin/api/sandboxes/:id/task/kill         kill task
 POST   /cgi-bin/api/sandboxes/:id/task/snapshot     on-demand task snapshot
 GET    /cgi-bin/api/modules                         available modules
+POST   /cgi-bin/api/gc                               sweep unreferenced composefs objects
 ```
 
 ### Create
@@ -503,6 +583,8 @@ etc. — anything that supports privileged containers.
 | `SQUASH_PROXY_HTTPS`  | `""` (disabled)               | HTTPS MITM proxy (set `1`)           |
 | `TAILSCALE_AUTHKEY`   | —                             | Tailscale auth key (enables VPN)     |
 | `SQUASH_SNAPSHOT_BACKEND` | `squashfs`                | Snapshot backend: `squashfs` or `irmin` |
+| `SQUASH_LAYER_BACKEND`    | `squashfs`                | RO-layer assembly: `squashfs` (squashfuse, default) or `composefs` (experimental) |
+| `SQUASH_COMPOSEFS_VERITY` | `""` (off)                | Opt-in fs-verity sealing for composefs (fail-open; set `1`) |
 | `SQUASH_STORE_SOCK`   | `$SQUASH_DATA/.sq-store.sock` | sq-store sidecar socket path         |
 | `SQUASH_STORE_DIR`    | `$SQUASH_DATA/.sq-store/`     | Irmin pack data directory            |
 | `SQUASH_GUI_MODULE`   | `500-gui-base`                | Default layer used when `features:["gui"]` is set |

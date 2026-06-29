@@ -1,0 +1,29 @@
+# Self-contained environment to validate the composefs LayerStore.
+#
+# Fedora is used because it packages `composefs` (mkcomposefs / composefs-info)
+# and recent erofs/fsverity userspace reliably — unlike Ubuntu LTS, where
+# composefs is not consistently in the default repos.
+#
+# The KERNEL is the host's (containers share it), so the loop-free EROFS check
+# only passes when the *host* runs kernel >= 6.12. Run privileged:
+#
+#   docker build -t sq-composefs-validate -f test/Dockerfile.composefs .
+#   docker run --rm --privileged sq-composefs-validate
+#
+# On a host kernel < 6.12, correctness still validates loop-backed:
+#   docker run --rm --privileged -e COMPOSEFS_ALLOW_OLD_KERNEL=1 sq-composefs-validate
+FROM fedora:41
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        golang composefs erofs-utils fsverity-utils util-linux kmod \
+    && dnf clean all
+
+WORKDIR /src
+# Prime the Go module cache on the dependency set first for faster rebuilds.
+COPY impl/go/go.mod impl/go/go.sum ./impl/go/
+RUN cd impl/go && go mod download
+
+COPY . .
+RUN cd impl/go && go build ./... && GOOS=linux go vet ./manager/ ./config/
+
+ENTRYPOINT ["/src/test/composefs-validate.sh"]

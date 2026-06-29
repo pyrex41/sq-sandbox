@@ -141,3 +141,18 @@ jobs:
             experimental-features = nix-command flakes
       - name: Build Go proxy
         run: nix build .#sq-secret-proxy -L
+
+  # Validates the composefs LayerStore against real erofs/overlay mounts +
+  # mkcomposefs/composefs-info, inside a privileged Fedora container (Fedora
+  # packages composefs reliably). The runner's host kernel is typically < 6.12,
+  # so COMPOSEFS_ALLOW_OLD_KERNEL=1 validates correctness loop-backed and skips
+  # the loop-free assertion; run test/composefs-validate.sh on a >= 6.12 host
+  # (e.g. a Fly machine) WITHOUT that flag to confirm the loop-free claim.
+  composefs-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build validation image
+        run: docker build -t sq-composefs-validate -f test/Dockerfile.composefs .
+      - name: Run composefs LayerStore validation (privileged)
+        run: docker run --rm --privileged -e COMPOSEFS_ALLOW_OLD_KERNEL=1 sq-composefs-validate

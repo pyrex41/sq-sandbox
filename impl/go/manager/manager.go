@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"squashd/config"
-	sqexec "squashd/exec"
 	"squashd/store"
 )
 
@@ -114,6 +113,15 @@ type Manager struct {
 	mu        sync.Mutex
 	sandboxes map[string]*Sandbox // nil entry = slot reserved (creating)
 	cfg       *config.Config
+
+	// objWriteMu serializes shared-composefs-objects-store WRITERS against the
+	// GC mark+sweep. Snapshot (the only runtime path that writes new objects, via
+	// mkcomposefs) holds it for READ; GCObjects holds it for WRITE across its
+	// entire mark+sweep so the point-in-time live set can't be invalidated by a
+	// concurrent writer (an object written mid-sweep but whose owning image isn't
+	// yet persisted would otherwise look dead and be deleted). Many snapshots may
+	// run concurrently; GC excludes them all.
+	objWriteMu sync.RWMutex
 
 	jobMu  sync.Mutex
 	jobSeq int
@@ -297,7 +305,7 @@ func (m *Manager) Exec(id, cmd string, opts ExecOpts) (ExecResult, error) {
 	seq := s.nextSeq()
 	s.updateLastActive()
 
-	res, err := sqexec.Run(s.mergedDir(), cmd, opts.WorkDir, opts.TimeoutS)
+	res, err := m.backendFor(s).Run(s, cmd, opts.WorkDir, opts.TimeoutS)
 	if err != nil {
 		return ExecResult{}, fmt.Errorf("exec: %w", err)
 	}
@@ -338,6 +346,8 @@ func (m *Manager) Activate(id, moduleName string) (SandboxInfo, error) {
 		return SandboxInfo{}, fmt.Errorf("sandbox not found: %s", id)
 	}
 
+	ls := m.layerStoreFor(s)
+
 	modPath := filepath.Join(m.cfg.ModulesDir(), moduleName+".squashfs")
 	if _, err := os.Stat(modPath); os.IsNotExist(err) {
 		// Try S3 pull
@@ -353,22 +363,22 @@ func (m *Manager) Activate(id, moduleName string) (SandboxInfo, error) {
 	if err := os.MkdirAll(mp, 0755); err != nil {
 		return SandboxInfo{}, fmt.Errorf("mkdir %s: %w", mp, err)
 	}
-	if err := sqexec.MountLayer(modPath, mp); err != nil {
+	if err := ls.MountLayer(modPath, mp); err != nil {
 		os.Remove(mp)
 		return SandboxInfo{}, err
 	}
 
 	// Remount overlay with the new layer.
-	lower, err := buildLowerDirs(s.imagesDir())
+	lower, err := ls.BuildLowerDirs(s.imagesDir())
 	if err != nil {
-		_ = sqexec.UnmountLayer(mp)
+		_ = ls.UnmountLayer(mp)
 		return SandboxInfo{}, err
 	}
-	if err := sqexec.UnmountOverlay(s.mergedDir()); err != nil {
-		_ = sqexec.UnmountLayer(mp)
+	if err := ls.UnmountOverlay(s.mergedDir()); err != nil {
+		_ = ls.UnmountLayer(mp)
 		return SandboxInfo{}, err
 	}
-	if err := sqexec.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
+	if err := ls.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
 		return SandboxInfo{}, err
 	}
 
@@ -400,6 +410,27 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 		return SnapshotResult{}, fmt.Errorf("label: alphanumeric/dash/underscore/dot only")
 	}
 
+	// gvisor backend: capture PROCESS MEMORY via runsc checkpoint (the durable
+	// resume path). Note: this captures RAM; the writable filesystem upper is a
+	// separate concern. For full FS+RAM coherence the caller should pair this
+	// with an upper/data snapshot taken at the same instant (TODO: single
+	// generation barrier — see tier2b design doc).
+	if s.Backend == "gvisor" {
+		imgDir := filepath.Join(s.checkpointsDir(), label)
+		if _, err := os.Stat(imgDir); err == nil {
+			return SnapshotResult{}, fmt.Errorf("checkpoint exists: %s", label)
+		}
+		if err := os.MkdirAll(filepath.Dir(imgDir), 0755); err != nil {
+			return SnapshotResult{}, fmt.Errorf("mkdir checkpoints: %w", err)
+		}
+		if err := m.backendFor(s).Checkpoint(s, imgDir); err != nil {
+			return SnapshotResult{}, err
+		}
+		// TODO: tar(imgDir) + s3PushBg for off-host restore (cross-host needs a
+		// pinned CPU template; see design doc).
+		return SnapshotResult{Snapshot: label, Size: dirSize(imgDir)}, nil
+	}
+
 	// Irmin backend: delegate to store sidecar.
 	if m.cfg.SnapshotBackend == "irmin" {
 		c := store.New(m.cfg.StoreSockPath)
@@ -417,6 +448,13 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 	}
 	snapFile := filepath.Join(snapDir, label+".squashfs")
 
+	// Participate in the GC writer barrier (read side) across the whole region
+	// that writes new objects into the shared composefs store. While held, GC
+	// cannot run its mark+sweep, so an object written here (and its not-yet-
+	// persisted snapshot image) can never be observed as "dead" and swept.
+	m.objWriteMu.RLock()
+	defer m.objWriteMu.RUnlock()
+
 	// Hold per-sandbox lock around the existence check + mksquashfs to prevent
 	// two concurrent snapshot requests with the same label from racing.
 	s.mu.Lock()
@@ -425,11 +463,9 @@ func (m *Manager) Snapshot(id, label string) (SnapshotResult, error) {
 		return SnapshotResult{}, fmt.Errorf("snapshot exists: %s", label)
 	}
 
-	args := []string{"mksquashfs", s.upperDataDir(), snapFile,
-		"-comp", "gzip", "-b", "256K", "-noappend", "-quiet"}
-	if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+	if err := m.layerStoreFor(s).Snapshot(s.upperDataDir(), snapFile); err != nil {
 		s.mu.Unlock()
-		return SnapshotResult{}, fmt.Errorf("mksquashfs: %w: %s", err, strings.TrimSpace(string(out)))
+		return SnapshotResult{}, err
 	}
 	s.mu.Unlock()
 
@@ -458,6 +494,18 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 		return SandboxInfo{}, fmt.Errorf("label: alphanumeric/dash/underscore/dot only")
 	}
 
+	// gvisor backend: restore PROCESS MEMORY via runsc restore.
+	if s.Backend == "gvisor" {
+		imgDir := filepath.Join(s.checkpointsDir(), label)
+		if _, err := os.Stat(imgDir); err != nil {
+			return SandboxInfo{}, fmt.Errorf("checkpoint not found: %s", label)
+		}
+		if err := m.backendFor(s).Restore(s, imgDir); err != nil {
+			return SandboxInfo{}, err
+		}
+		return s.ToInfo(), nil
+	}
+
 	// Irmin backend: restore via sidecar (materialises files into upper_data).
 	if m.cfg.SnapshotBackend == "irmin" {
 		c := store.New(m.cfg.StoreSockPath)
@@ -478,10 +526,11 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 	}
 
 	// Unmount overlay, clear upper, mount snapshot, remount overlay.
+	ls := m.layerStoreFor(s)
 	snapMP := filepath.Join(s.imagesDir(), "_snapshot")
 
 	// Unmount overlay.
-	_ = sqexec.UnmountOverlay(s.mergedDir())
+	_ = ls.UnmountOverlay(s.mergedDir())
 
 	// Unmount previous snapshot if any.
 	s.mu.Lock()
@@ -489,7 +538,7 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 	s.snapshotMounted = false
 	s.mu.Unlock()
 	if wasMounted {
-		_ = sqexec.UnmountLayer(snapMP)
+		_ = ls.UnmountLayer(snapMP)
 	}
 
 	// Clear upper layer.
@@ -500,7 +549,7 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 
 	// Mount the snapshot as the top read-only layer.
 	_ = os.MkdirAll(snapMP, 0755)
-	if err := sqexec.MountLayer(snapFile, snapMP); err != nil {
+	if err := ls.MountLayer(snapFile, snapMP); err != nil {
 		return SandboxInfo{}, fmt.Errorf("mount snapshot: %w", err)
 	}
 	s.mu.Lock()
@@ -508,16 +557,16 @@ func (m *Manager) Restore(id, label string) (SandboxInfo, error) {
 	s.mu.Unlock()
 
 	// Rebuild lower dirs with snapshot first.
-	moduleLowers, err := buildLowerDirsExcluding(s.imagesDir(), "_snapshot")
+	moduleLowers, err := ls.BuildLowerDirsExcluding(s.imagesDir(), "_snapshot")
 	if err != nil {
 		return SandboxInfo{}, err
 	}
 	lower := append([]string{snapMP}, moduleLowers...)
 
 	// Remount overlay.
-	if err := sqexec.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
+	if err := ls.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
 		// Degraded recovery: remount without snapshot so sandbox remains usable.
-		_ = sqexec.MountOverlay(moduleLowers, s.upperDataDir(), s.upperWorkDir(), s.mergedDir())
+		_ = ls.MountOverlay(moduleLowers, s.upperDataDir(), s.upperWorkDir(), s.mergedDir())
 		return SandboxInfo{}, fmt.Errorf("remount overlay: %w", err)
 	}
 
@@ -694,6 +743,7 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		Task:         opts.Task,
 		Layers:       opts.Layers,
 		Backend:      m.cfg.Backend,
+		LayerStore:   m.cfg.LayerBackend,
 		CPU:          opts.CPU,
 		MemoryMB:     opts.MemoryMB,
 		MaxLifetimeS: opts.MaxLifetimeS,
@@ -704,12 +754,14 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 		LastActiveAt: time.Now(),
 	}
 
+	ls := m.layerStoreFor(s)
+
 	// Track mounted layers for rollback.
 	var mountedLayers []string
 	rollback := func() {
-		_ = sqexec.UnmountOverlay(s.mergedDir())
+		_ = ls.UnmountOverlay(s.mergedDir())
 		for i := len(mountedLayers) - 1; i >= 0; i-- {
-			_ = sqexec.UnmountLayer(mountedLayers[i])
+			_ = ls.UnmountLayer(mountedLayers[i])
 		}
 	}
 
@@ -731,7 +783,7 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 			rollback()
 			return nil, fmt.Errorf("mkdir layer mp: %w", err)
 		}
-		if err := sqexec.MountLayer(modPath, mp); err != nil {
+		if err := ls.MountLayer(modPath, mp); err != nil {
 			rollback()
 			return nil, err
 		}
@@ -740,14 +792,14 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 	m.warnModuleManifestCompatibility(opts.Layers)
 
 	// Build lower dirs (highest numeric prefix = highest priority).
-	lower, err := buildLowerDirs(s.imagesDir())
+	lower, err := ls.BuildLowerDirs(s.imagesDir())
 	if err != nil {
 		rollback()
 		return nil, err
 	}
 
 	// Mount overlay.
-	if err := sqexec.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
+	if err := ls.MountOverlay(lower, s.upperDataDir(), s.upperWorkDir(), s.mergedDir()); err != nil {
 		rollback()
 		return nil, err
 	}
@@ -784,11 +836,12 @@ func (m *Manager) createSandbox(id string, opts CreateOpts) (*Sandbox, error) {
 
 func (m *Manager) destroySandbox(s *Sandbox) {
 	// Unmount overlay, then each squashfs layer.
-	_ = sqexec.UnmountOverlay(s.mergedDir())
+	ls := m.layerStoreFor(s)
+	_ = ls.UnmountOverlay(s.mergedDir())
 	entries, _ := os.ReadDir(s.imagesDir())
 	for i := len(entries) - 1; i >= 0; i-- {
 		mp := filepath.Join(s.imagesDir(), entries[i].Name())
-		_ = sqexec.UnmountLayer(mp)
+		_ = ls.UnmountLayer(mp)
 	}
 	// Remove the sandbox directory.
 	_ = os.RemoveAll(s.Dir)
@@ -911,6 +964,10 @@ type moduleManifest struct {
 	Version        string   `json:"version,omitempty"`
 	BuiltAgainst   []string `json:"built_against,omitempty"`
 	SquashFSSHA256 string   `json:"squashfs_sha256,omitempty"`
+	// ComposefsDigest is the fs-verity digest of the composefs (EROFS) layer
+	// image, populated only for composefs-built modules. Non-breaking: omitempty
+	// keeps old manifests/JSON valid, and json.Unmarshal ignores it when absent.
+	ComposefsDigest string `json:"composefs_digest,omitempty"`
 }
 
 func (m *Manager) warnModuleManifestCompatibility(layers []string) {

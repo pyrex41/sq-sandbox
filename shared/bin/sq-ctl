@@ -65,6 +65,18 @@ case "${1:-help}" in
         ;;
     destroy)   _curl DELETE "sandboxes/$2" && echo "destroyed: $2" ;;
     modules)   _curl GET modules | jq . ;;
+    gc)
+        # gc [--dry-run] [--s3]   sweep unreferenced composefs objects
+        dry=false; s3=false
+        shift
+        for arg in "$@"; do
+            case "$arg" in
+                --dry-run|-n) dry=true ;;
+                --s3) s3=true ;;
+            esac
+        done
+        _curl POST gc "$(jq -n --argjson d "$dry" --argjson s "$s3" '{dry_run:$d,include_s3:$s}')" | jq .
+        ;;
     health)    _curl GET ../health | jq . ;;
     push)
         [ -z "${SQUASH_S3_BUCKET:-}" ] && { echo "SQUASH_S3_BUCKET not set" >&2; exit 1; }
@@ -177,6 +189,7 @@ usage: sq-ctl <command> [args]
   browser-open <id> <url>                 open URL in GUI browser
   destroy  <id>                           remove sandbox
   modules                                 available modules
+  gc       [--dry-run] [--s3]             sweep unreferenced composefs objects
   health                                  status
 
 storage:

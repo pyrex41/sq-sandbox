@@ -22,6 +22,7 @@ type Sandbox struct {
 	Task         string
 	Layers       []string
 	Backend      string // "chroot", "firecracker", "gvisor"
+	LayerStore   string // "squashfs" (RO-layer assembly axis; default "squashfs")
 	CPU          float64
 	MemoryMB     int
 	MaxLifetimeS int
@@ -82,6 +83,12 @@ func (s *Sandbox) imagesDir() string { return filepath.Join(s.Dir, "images") }
 // snapshotsDir returns the directory where squashfs snapshots are stored.
 func (s *Sandbox) snapshotsDir() string { return filepath.Join(s.Dir, "snapshots") }
 
+// gvisorRoot returns the per-sandbox runsc state dir (passed as `runsc --root`).
+func (s *Sandbox) gvisorRoot() string { return filepath.Join(s.Dir, "gvisor") }
+
+// checkpointsDir returns the directory where gvisor memory checkpoints are kept.
+func (s *Sandbox) checkpointsDir() string { return filepath.Join(s.Dir, "checkpoints") }
+
 // metaDir returns the metadata directory.
 func (s *Sandbox) metaDir() string { return filepath.Join(s.Dir, ".meta") }
 
@@ -103,6 +110,7 @@ func writeMeta(sdir string, s *Sandbox) error {
 		"memory_mb":      strconv.Itoa(s.MemoryMB),
 		"max_lifetime_s": strconv.Itoa(s.MaxLifetimeS),
 		"backend":        s.Backend,
+		"layer_store":    s.LayerStore,
 	}
 	for name, val := range writes {
 		if err := os.WriteFile(filepath.Join(m, name), []byte(val), 0644); err != nil {
@@ -153,10 +161,14 @@ func readMeta(id, sdir string) (*Sandbox, error) {
 		Dir:     sdir,
 		Owner:   readFile("owner"),
 		Task:    readFile("task"),
-		Backend: readFile("backend"),
+		Backend:    readFile("backend"),
+		LayerStore: readFile("layer_store"),
 	}
 	if s.Backend == "" {
 		s.Backend = "chroot"
+	}
+	if s.LayerStore == "" {
+		s.LayerStore = "squashfs"
 	}
 
 	// Layers: newline-separated

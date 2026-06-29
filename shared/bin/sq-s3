@@ -58,6 +58,15 @@ _awscli_exists() {
     fi
 }
 
+_awscli_rm() {
+    local key="$1"
+    if [ -n "$ENDPOINT" ]; then
+        aws s3 rm "s3://$BUCKET/${PREFIX}$key" --endpoint-url "$ENDPOINT" --region "$REGION" --quiet 2>&1
+    else
+        aws s3 rm "s3://$BUCKET/${PREFIX}$key" --region "$REGION" --quiet 2>&1
+    fi
+}
+
 _awscli_list() {
     local prefix="$1" raw
     if [ -n "$ENDPOINT" ]; then
@@ -214,6 +223,13 @@ _curl_s3() {
                 -H "x-amz-date: $datetime" \
                 "$full_url" >/dev/null 2>&1
             ;;
+        DELETE)
+            curl -s -f -X DELETE \
+                -H "Authorization: $auth_header" \
+                -H "x-amz-content-sha256: $content_hash" \
+                -H "x-amz-date: $datetime" \
+                "$full_url" 2>/dev/null
+            ;;
     esac
 }
 
@@ -237,6 +253,11 @@ _curl_list() {
     local prefix="$1"
     local xml=$(_curl_s3 LIST "$prefix")
     echo "$xml" | sed -n 's/.*<Key>\([^<]*\)<\/Key>.*/\1/gp' | sed "s|^${PREFIX}||"
+}
+
+_curl_rm() {
+    local key="$1"
+    _curl_s3 DELETE "$key"
 }
 
 # ── Public API ──────────────────────────────────────────────────────
@@ -299,6 +320,16 @@ s3_list() {
     case "$_transport" in
         awscli) _awscli_list "$prefix" ;;
         curl)   _curl_list "$prefix" ;;
+    esac
+}
+
+s3_rm() {
+    local key="$1"
+    _detect_transport
+    log "rm: $key"
+    case "$_transport" in
+        awscli) _awscli_rm "$key" ;;
+        curl)   _curl_rm "$key" ;;
     esac
 }
 
@@ -389,6 +420,11 @@ case "${1:-help}" in
         _s3_disabled && exit 0
         s3_list "$2"
         ;;
+    rm|delete)
+        [ $# -lt 2 ] && { echo "usage: sq-s3 rm <s3-key>" >&2; exit 1; }
+        _s3_disabled && exit 0
+        s3_rm "$2"
+        ;;
     push-bg)
         [ $# -lt 3 ] && { echo "usage: sq-s3 push-bg <local-path> <s3-key>" >&2; exit 1; }
         _s3_disabled && exit 0
@@ -411,6 +447,7 @@ usage: sq-s3 <command> [args]
   pull     <s3-key> <local-path>        download file from S3
   exists   <s3-key>                     check if key exists (exit 0/1)
   list     <s3-prefix>                  list keys under prefix
+  rm       <s3-key>                     delete a key
   push-bg  <local-path> <s3-key>        background upload (non-blocking)
   sync-modules                          bi-directional module sync
   sync-snapshots <sandbox-id>           bi-directional snapshot sync

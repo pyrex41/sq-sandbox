@@ -46,6 +46,9 @@ func NewHandlerWithControlPlane(cfg *config.Config, mgr *manager.Manager, cp *co
 	// Modules
 	mux.HandleFunc("GET /cgi-bin/api/modules", h.handleListModules)
 
+	// Objects-store garbage collection (composefs layer store)
+	mux.HandleFunc("POST /cgi-bin/api/gc", h.handleGC)
+
 	// Hosted control-plane MVP
 	mux.HandleFunc("GET /cgi-bin/api/control-plane/summary", h.handleControlPlaneSummary)
 	mux.HandleFunc("GET /cgi-bin/api/control-plane/usage", h.handleControlPlaneUsage)
@@ -153,6 +156,33 @@ func (h *Handler) handleListModules(w http.ResponseWriter, r *http.Request) {
 		Modules []string `json:"modules"`
 	}
 	jsonOK(w, resp{Modules: mods})
+}
+
+// handleGC runs a conservative mark-and-sweep over the shared composefs objects
+// store. Body (all optional): {"dry_run":bool,"include_s3":bool,"assume_single_host":bool}.
+// assume_single_host is REQUIRED to enable include_s3 (the live set is local-only).
+func (h *Handler) handleGC(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	opts := manager.GCOptions{}
+	if body != nil {
+		if v, ok := body["dry_run"].(bool); ok {
+			opts.DryRun = v
+		}
+		if v, ok := body["include_s3"].(bool); ok {
+			opts.IncludeS3 = v
+		}
+		if v, ok := body["assume_single_host"].(bool); ok {
+			opts.AssumeSingleHost = v
+		}
+	}
+	res, err := h.mgr.GCObjects(opts)
+	if err != nil {
+		// Transitional-sandbox refusal is the expected retryable condition.
+		jsonError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	jsonOK(w, res)
 }
 
 func listModules(dir string) ([]string, error) {

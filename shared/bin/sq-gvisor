@@ -1,0 +1,101 @@
+#!/bin/sh
+# sq-gvisor — runsc (gVisor) backend helper for squashd.
+#
+# Mirrors sq-exec's role for the chroot backend. gVisor's systrap platform needs
+# no /dev/kvm, so this works nested inside Firecracker/Fly guests.
+#
+# C/R model (the key design point): gVisor checkpoint/restore resumes only the
+# container's INIT process tree — `runsc exec` children are NOT restored. So the
+# durable, long-running workload (the agent loop, started via the daemon's
+# ExecBg) is launched as the container INIT via `runsc run`; checkpoint/restore
+# then resumes it. Short synchronous commands (Exec) run as `runsc exec` into the
+# live container, or as a throwaway one-shot if no container is running yet.
+#
+# Subcommands (argv from impl/go/manager/backend_gvisor.go):
+#   run-init <root> <merged> <cmd> <workdir> <timeout> <cid>   # ExecBg: cmd IS init
+#   exec     <root> <merged> <cmd> <workdir> <timeout> <cid>   # Exec: into live cid
+#   checkpoint <root> <cid> <imgPath>
+#   restore    <root> <cid> <imgPath> [merged]
+#   destroy    <root> <cid>
+#
+# NOTE: --network=none for now (TODO: slirp4netns + MITM-proxy wiring, per sq-exec).
+# Do NOT add --overlay2=none — it breaks restore ("inconsistent private memory
+# files on restore").
+set -u
+
+RUNSC="${SQ_RUNSC_BIN:-runsc}"
+F="--platform=systrap --network=none --ignore-cgroups"
+
+bundle_dir() { echo "$1/bundle"; }
+
+# write_bundle <root> <merged> <cmd> <workdir> — OCI bundle whose rootfs is the
+# existing merged/ overlay and whose init process is the given command.
+write_bundle() {
+    root="$1"; merged="$2"; ucmd="$3"; workdir="${4:-/}"
+    b="$(bundle_dir "$root")"; mkdir -p "$b"
+    ( cd "$b" && "$RUNSC" spec >/dev/null 2>&1 || true )
+    cfg="$b/config.json"; [ -f "$cfg" ] || { echo "sq-gvisor: spec gen failed" >&2; return 1; }
+    tmp="$b/config.new"
+    jq --arg root "$merged" --arg cmd "$ucmd" --arg wd "$workdir" \
+       '.root.path=$root | .root.readonly=false | .process.terminal=false | .process.cwd=$wd | .process.args=["/bin/sh","-c",$cmd]' \
+       "$cfg" > "$tmp" 2>/dev/null && mv "$tmp" "$cfg"
+    echo "$b"
+}
+
+state_status() { "$RUNSC" --root "$1" $F state "$2" 2>/dev/null | jq -r .status 2>/dev/null; }
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+  run-init)
+    root="$1"; merged="$2"; ucmd="$3"; workdir="${4:-/}"; timeout="${5:-7200}"; cid="$6"
+    mkdir -p "$root"
+    b="$(write_bundle "$root" "$merged" "$ucmd" "$workdir")" || exit 126
+    # The command IS the container init -> checkpoint/restore resumes it.
+    # Foreground so the daemon (RunBgTool) streams stdout and learns the exit.
+    exec timeout "$timeout" "$RUNSC" --root "$root" $F run -bundle "$b" "$cid"
+    ;;
+  exec)
+    root="$1"; merged="$2"; ucmd="$3"; workdir="${4:-/}"; timeout="${5:-300}"; cid="$6"
+    if [ "$(state_status "$root" "$cid")" = "running" ]; then
+        exec timeout "$timeout" "$RUNSC" --root "$root" $F exec --cwd "$workdir" "$cid" /bin/sh -c "$ucmd"
+    fi
+    # No live container: throwaway one-shot init (isolated id), then delete.
+    tid="${cid}__t$$"
+    b="$(write_bundle "$root" "$merged" "$ucmd" "$workdir")" || exit 126
+    timeout "$timeout" "$RUNSC" --root "$root" $F run -bundle "$b" "$tid"; rc=$?
+    "$RUNSC" --root "$root" $F delete -force "$tid" >/dev/null 2>&1
+    exit $rc
+    ;;
+  checkpoint)
+    root="$1"; cid="$2"; img="$3"; mkdir -p "$(dirname "$img")"
+    # Suspend semantics: stop the sandbox at the cut so it can be restored.
+    exec "$RUNSC" --root "$root" $F checkpoint --image-path="$img" "$cid"
+    ;;
+  restore)
+    root="$1"; cid="$2"; img="$3"
+    b="$(bundle_dir "$root")"
+    "$RUNSC" --root "$root" $F delete -force "$cid" >/dev/null 2>&1
+    # runsc restore runs the sandbox in the foreground (like run); background it
+    # and poll for "running" so this call returns promptly and reliably.
+    nohup "$RUNSC" --root "$root" $F restore --image-path="$img" -bundle "$b" "$cid" \
+        >"$root/restore.log" 2>&1 &
+    n=0
+    while [ "$n" -lt 30 ]; do
+        [ "$(state_status "$root" "$cid")" = "running" ] && { echo "restored: running"; exit 0; }
+        n=$((n+1)); sleep 1
+    done
+    echo "sq-gvisor: restore not running after wait" >&2
+    cat "$root/restore.log" >&2 2>/dev/null
+    exit 1
+    ;;
+  destroy)
+    root="$1"; cid="$2"
+    "$RUNSC" --root "$root" $F kill "$cid" KILL >/dev/null 2>&1
+    "$RUNSC" --root "$root" $F delete -force "$cid" >/dev/null 2>&1
+    exit 0
+    ;;
+  *)
+    echo "sq-gvisor: unknown subcommand: $cmd" >&2
+    exit 2
+    ;;
+esac

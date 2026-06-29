@@ -23,6 +23,9 @@ func TestFromEnvDefaults(t *testing.T) {
 	if c.SnapshotBackend != "squashfs" {
 		t.Errorf("SnapshotBackend = %q, want squashfs", c.SnapshotBackend)
 	}
+	if c.LayerBackend != "squashfs" {
+		t.Errorf("LayerBackend = %q, want squashfs", c.LayerBackend)
+	}
 	if c.USDCWatchInterval != 30*time.Second {
 		t.Errorf("USDCWatchInterval = %s, want 30s", c.USDCWatchInterval)
 	}
@@ -58,6 +61,7 @@ func TestValidate(t *testing.T) {
 				UpperLimitMB:    512,
 				Backend:         "chroot",
 				SnapshotBackend: "squashfs",
+				LayerBackend:    "squashfs",
 			}
 			tt.mutate(&c)
 			err := c.Validate()

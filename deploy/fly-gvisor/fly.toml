@@ -1,0 +1,13 @@
+# sq-sandbox daemon with the gVisor backend, for the Phase-2 C/R-via-API milestone.
+# Deploy from repo root:
+#   fly apps create sq-gvisor-daemon --org personal
+#   fly deploy --config deploy/fly-gvisor/fly.toml --remote-only --ha=false
+# Test: fly ssh console, then curl localhost:8080 (no auth token set).
+# No [mounts] — /data is ephemeral so the baked base module is visible.
+# No [http_service] — SSH in and hit localhost; the daemon keeps the machine up.
+app = 'sq-gvisor-daemon'
+primary_region = 'iad'
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = 2048
